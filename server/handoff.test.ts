@@ -96,8 +96,14 @@ describe("starting the new agent", () => {
       ...(workspaceId ? { workspaceId } : {}), currentModeId: "auto", labels: { "paseo.parent-agent-id": "lead" },
     };
     const created: Array<{ via: "workspace" | "folder"; request: Record<string, unknown> }> = [];
+    let modelLookups = 0;
     const paseo = {
-      providers: { listModels: async () => ({ models: [{ id: "gpt-test", isDefault: true }] }) },
+      providers: {
+        listModels: async () => {
+          modelLookups += 1;
+          return { models: [{ id: "gpt-test", isDefault: true }] };
+        },
+      },
       workspaces: { ref: () => ({ agents: { create: async (request: Record<string, unknown>) => void created.push({ via: "workspace", request }) } }) },
       agents: {
         create: async (request: Record<string, unknown>) => void created.push({ via: "folder", request }),
@@ -107,7 +113,7 @@ describe("starting the new agent", () => {
         }),
       },
     } as unknown as PluginHookContext["paseo"];
-    return { paseo, created };
+    return { paseo, created, modelLookups: () => modelLookups };
   }
 
   it("makes it a sub-agent of the given parent by label, and still hands over in its own prompt", async () => {
@@ -136,5 +142,35 @@ describe("starting the new agent", () => {
     const { paseo, created } = fake("ws-1");
     await continueInNewAgent({ paseo, sourceAgentId: "sub", why: "a limit", deferPrompt: true, bind: async () => {} });
     expect(created[0]!.request.labels).toEqual({ "zerosub.continued-from": "sub" });
+  });
+
+  it("uses the target's model and thinking option when a fork picks them", async () => {
+    const { paseo, created, modelLookups } = fake("ws-1");
+    await continueInNewAgent({
+      paseo,
+      sourceAgentId: "sub",
+      why: "a limit",
+      bind: async () => {},
+      target: { provider: "opencode", label: "OpenCode", modeId: "build", model: "opencode/glm-5p3-flash", thinkingOptionId: "high" },
+    });
+    expect(created[0]!.request.config).toEqual({
+      provider: "opencode/opencode/glm-5p3-flash",
+      modeId: "build",
+      thinkingOptionId: "high",
+    });
+    expect(modelLookups()).toBe(0); // a catalog model was picked: no default lookup
+    expect(created[0]!.request.title).toBe("Write the parser (continued on OpenCode)");
+  });
+
+  it("falls back to the provider's default model when the target picks none", async () => {
+    const { paseo, created } = fake("ws-1");
+    await continueInNewAgent({
+      paseo,
+      sourceAgentId: "sub",
+      why: "a limit",
+      bind: async () => {},
+      target: { provider: "codex", label: "ChatGPT", modeId: "auto" },
+    });
+    expect(created[0]!.request.config).toEqual({ provider: "codex/gpt-test", modeId: "auto" });
   });
 });

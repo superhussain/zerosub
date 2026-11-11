@@ -130,7 +130,7 @@ export function continuationPrompt(transcript: string, why: string, previous = "
   ].join("\n");
 }
 
-async function defaultModel(paseo: PaseoApi, provider: string): Promise<string | null> {
+export async function defaultModel(paseo: PaseoApi, provider: string): Promise<string | null> {
   try {
     const { models } = await paseo.providers.listModels(provider);
     return (models?.find((entry) => entry.isDefault) ?? models?.[0])?.id ?? null;
@@ -152,6 +152,10 @@ export interface ContinuationTarget {
   label: string;
   /** A mode no more permissive than the source agent's. */
   modeId: string;
+  /** A model from the host's catalog for this provider. Empty uses the provider's default. */
+  model?: string;
+  /** A thinking option that model offers. Empty uses the model's default. */
+  thinkingOptionId?: string;
 }
 
 /**
@@ -196,7 +200,7 @@ export async function continueInNewAgent(options: {
   const { target } = options;
   const provider = target?.provider ?? source.provider;
   const model = target
-    ? await defaultModel(paseo, provider)
+    ? (target.model ?? (await defaultModel(paseo, provider)))
     : (source.model ?? source.runtimeInfo?.model ?? (await defaultModel(paseo, provider)));
   if (!model) throw new Error(`Couldn't tell which ${provider} model to use for the new agent.`);
 
@@ -207,7 +211,11 @@ export async function continueInNewAgent(options: {
     : `${source.title?.trim() || "Codex task"} (continued)`;
   // Modes and thinking options are provider-specific: only carry them over within one provider.
   const config = target
-    ? { provider: `${provider}/${model}`, modeId: target.modeId }
+    ? {
+        provider: `${provider}/${model}`,
+        modeId: target.modeId,
+        ...(target.thinkingOptionId ? { thinkingOptionId: target.thinkingOptionId } : {}),
+      }
     : {
         provider: `${provider}/${model}`,
         ...(source.currentModeId ? { modeId: source.currentModeId } : {}),
