@@ -15,6 +15,7 @@ import {
   type ReopenSummary,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { ForkDestinationRows } from "./fork-settings";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -704,11 +705,12 @@ function AutomationSettings({ theme }: { theme: Theme }) {
         />
         <SettingsSwitch
           label="When every account is out, fork the chat to the other provider"
-          hint="A stopped Claude chat carries on in a new ChatGPT agent, or the other way round, with the conversation so far. The new agent gets no more permissions than the original; the original stays as it was."
+          hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far and no more permissions than the original. The original stays as it was."
           value={settings.values.forkOtherProvider}
           disabled={settings.saving || !settings.values.autoSwitch}
           onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
         />
+        <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
       </SettingsCard>
       {settings.saveError ? <Text style={text.danger}>{settings.saveError}</Text> : null}
     </View>
