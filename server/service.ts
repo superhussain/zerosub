@@ -1308,7 +1308,14 @@ export class Service {
       delta = await readUpdates(paseo, agentId, seen);
     } catch {
       // A gap means what the fork has can't be proven; refuse honestly instead of guessing.
-      return this.openCodeFound(fork);
+      return {
+        fork: { agentId: fork.id, title: fork.title ?? `${OPENCODE_LABEL} agent` },
+        to: OPENCODE_LABEL,
+        toFamily: null,
+        toProvider: OPENCODE_PROVIDER,
+        delivery: "found",
+        detail: HISTORY_GAP_DETAIL,
+      };
     }
     // Only this plugin's own message IDs mark a transfer receipt: prose that merely looks like a
     // handoff is an instruction like any other.
