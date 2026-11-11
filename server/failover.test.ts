@@ -734,6 +734,7 @@ describe("forking to the other provider", () => {
       await limitTurn();
       expect(created).toHaveLength(0);
       expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+      expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's \(“Bypass”\)/);
   });
   });
 });

@@ -37,6 +37,7 @@ export function ForkDestinationRows({
     let live = true;
     paseo.providers
       .listModels(OPENCODE_PROVIDER)
+      // A response with no models field and one with an empty list both mean: nothing to pick from.
       .then((result) => {
         if (live) setCatalog((result.models ?? []).length > 0 ? { status: "ready", models: result.models ?? [] } : { status: "empty" });
       })
@@ -53,7 +54,11 @@ export function ForkDestinationRows({
     <SettingsSelect
       key="destination"
       label="Fork a stopped Claude chat to"
-      hint="Applies when every Claude account is out. ChatGPT uses the account with the most room left."
+      hint={
+        values.claudeForkDestination === "opencode"
+          ? "Applies when every Claude account is out. Pick the model and thinking below."
+          : "Applies when every Claude account is out. ChatGPT uses the account with the most room left."
+      }
       value={values.claudeForkDestination}
       options={[
         { label: "ChatGPT", value: "codex" },
@@ -103,6 +108,8 @@ export function ForkDestinationRows({
       }}
     />,
   );
+  // The thinking select waits for a specifically picked model: with "Host default" the options depend
+  // on which model the host resolves to, so there'd be nothing honest to list.
   if (values.forkOpenCodeModel) {
     rows.push(
       <SettingsSelect

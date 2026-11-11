@@ -747,7 +747,7 @@ export class Service {
         // the host's OpenCode, when a stopped Claude chat was pointed there in the settings.
         const toOpenCode = family === "claude" && this.prefs.claudeForkDestination === "opencode";
         const result = await (toOpenCode
-          ? this.forkToOpenCode(paseo, agentId, family, timeline)
+          ? this.forkToOpenCode(paseo, agentId, timeline)
           : this.forkToOtherProvider(paseo, agentId, family, timeline, "auto")
         ).catch((error: unknown) => ({
           skipped: `Couldn't continue on ${toOpenCode ? OPENCODE_LABEL : FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
@@ -1148,7 +1148,6 @@ export class Service {
   private async forkToOpenCode(
     paseo: PaseoApi,
     agentId: string,
-    family: Family,
     timeline: readonly AgentTimelineItem[] | undefined,
   ): Promise<ForkOutcome> {
     // Prompting the original again while it's still out mustn't start a second copy of the work.
@@ -1199,8 +1198,8 @@ export class Service {
       paseo,
       sourceAgentId: agentId,
       timeline,
-      why: `every ${FAMILY_LABEL[family]} account reached its usage limit`,
-      previous: PROVIDER_NAME[family],
+      why: "every Claude account reached its usage limit",
+      previous: PROVIDER_NAME.claude,
       target: {
         provider: OPENCODE_PROVIDER,
         label: OPENCODE_LABEL,

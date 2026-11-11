@@ -21,6 +21,7 @@ const strings = [
   "A stopped Claude chat carries on in a new ChatGPT or OpenCode agent",
   "Fork a stopped Claude chat to",
   "Applies when every Claude account is out. ChatGPT uses the account with the most room left.",
+  "Applies when every Claude account is out. Pick the model and thinking below.",
   "ChatGPT",
   "OpenCode",
   "OpenCode model",
@@ -47,10 +48,15 @@ const themes = {
   dark: { bg: "#17181a", card: "#1f2124", border: "#33363b", text: "#e8e8e4", muted: "#9a9a94", accent: "#7fd0a2", row: "#26282c" },
 };
 
-const select = (label, hint, value) => `
+const select = (label, hint, value, disabled = false) => `
   <div class="row">
     <div class="labels"><div class="label">${label}</div>${hint ? `<div class="hint">${hint}</div>` : ""}</div>
-    <div class="select"><span>${value}</span><span class="chev">▾</span></div>
+    <div class="select ${disabled ? "disabled" : ""}"><span>${value}</span><span class="chev">▾</span></div>
+  </div>`;
+
+const catalogRow = (label, hint) => `
+  <div class="row">
+    <div class="labels"><div class="label">${label}</div><div class="hint">${hint}</div></div>
   </div>`;
 
 const toggle = (label, hint, on, disabled = false) => `
@@ -61,51 +67,39 @@ const toggle = (label, hint, on, disabled = false) => `
 
 const card = (inner) => `<div class="card">${inner}</div>`;
 
+// The component renders one toggle hint on both surfaces (round-1 review): this is that string.
+const TOGGLE_HINT =
+  "A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far and no more permissions than the original. The original stays as it was.";
+const TOGGLE = "When every account is out, fork the chat to the other provider";
+const forkToggle = (on) => toggle(TOGGLE, TOGGLE_HINT, on);
+
 const pages = {
   "settings-before": {
     theme: "light",
-    body: card(
-      toggle(
-        "When every account is out, fork the chat to the other provider",
-        "A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far and no more permissions than the original. The original stays as it was.",
-        false,
-      ),
-    ),
+    // The destination row renders disabled while the fork toggle is off (forkOtherProvider=false).
+    body: card(forkToggle(false) + select("Fork a stopped Claude chat to", "Applies when every Claude account is out. ChatGPT uses the account with the most room left.", "ChatGPT", true)),
   },
   "settings-after-chatgpt": {
     theme: "light",
-    body: card(
-      toggle(
-        "When every account is out, fork the chat to the other provider",
-        "A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far and no more permissions than the original. The original stays as it was.",
-        true,
-      ) +
-        select("Fork a stopped Claude chat to", "Applies when every Claude account is out. ChatGPT uses the account with the most room left.", "ChatGPT"),
-    ),
+    body: card(forkToggle(true) + select("Fork a stopped Claude chat to", "Applies when every Claude account is out. ChatGPT uses the account with the most room left.", "ChatGPT")),
   },
   "settings-after-opencode": {
     theme: "dark",
     body: card(
-      toggle(
-        "When every account is out, fork the chat to the other provider",
-        "A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far. The new agent gets no more permissions than the original; the original stays as it was.",
-        true,
-      ) +
-        select("Fork a stopped Claude chat to", "Applies when every Claude account is out. ChatGPT uses the account with the most room left.", "OpenCode") +
+      forkToggle(true) +
+        select("Fork a stopped Claude chat to", "Applies when every Claude account is out. Pick the model and thinking below.", "OpenCode") +
         select("OpenCode model", "Used by the OpenCode fork agent on this host. Empty uses the host's default.", "GLM 5.3 Flash") +
         select("OpenCode thinking", "How hard the model thinks on the fork. Empty uses the model's default.", "High"),
     ),
   },
   "settings-after-refused": {
     theme: "light",
+    // The real component renders a label-only SettingsRow here: no control to show while the
+    // catalog can't be read, so the replica draws no select widget either.
     body: card(
-      toggle(
-        "When every account is out, fork the chat to the other provider",
-        "A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far. The new agent gets no more permissions than the original; the original stays as it was.",
-        true,
-      ) +
-        select("Fork a stopped Claude chat to", "Applies when every Claude account is out. ChatGPT uses the account with the most room left.", "OpenCode") +
-        select("OpenCode model", "Couldn't read this host's OpenCode models: The daemon went away.", ""),
+      forkToggle(true) +
+        select("Fork a stopped Claude chat to", "Applies when every Claude account is out. Pick the model and thinking below.", "OpenCode") +
+        catalogRow("OpenCode model", "Couldn't read this host's OpenCode models: The daemon went away."),
     ),
   },
 };
@@ -132,6 +126,7 @@ const css = (t) => `
   .select { flex-shrink: 0; display: flex; align-items: center; gap: 6px; font-size: 13px;
             border: 1px solid ${t.border}; border-radius: 8px; padding: 7px 10px;
             background: ${t.card}; max-width: 170px; }
+  .select.disabled { opacity: 0.4; }
   .select span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chev { color: ${t.muted}; }
 `;

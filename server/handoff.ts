@@ -210,6 +210,8 @@ export async function continueInNewAgent(options: {
     ? `${source.title?.trim() || "Task"} (continued on ${target.label})`
     : `${source.title?.trim() || "Codex task"} (continued)`;
   // Modes and thinking options are provider-specific: only carry them over within one provider.
+  // `provider/model` is Paseo's config shape: the OpenCode provider id plus the catalog's full model
+  // id (which itself may carry a catalog prefix, e.g. `opencode/bifrost-fireworks/…/glm-5p3-flash`).
   const config = target
     ? {
         provider: `${provider}/${model}`,

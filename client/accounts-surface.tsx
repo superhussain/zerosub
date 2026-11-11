@@ -705,7 +705,7 @@ function AutomationSettings({ theme }: { theme: Theme }) {
         />
         <SettingsSwitch
           label="When every account is out, fork the chat to the other provider"
-          hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far. The new agent gets no more permissions than the original; the original stays as it was."
+          hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent — pick the destination below — with the conversation so far and no more permissions than the original. The original stays as it was."
           value={settings.values.forkOtherProvider}
           disabled={settings.saving || !settings.values.autoSwitch}
           onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
