@@ -35,7 +35,7 @@ import {
 } from "./adapter";
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity } from "./account-identity";
-import { CodexContinuations, MESSAGE_PREFIX, busy, fitInstructions, matchesTransfer, readUpdates, ready, samePlace, sentDigestOf, transferMarker, type Agent } from "./continuations";
+import { CodexContinuations, MESSAGE_PREFIX, busy, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, transferMarker, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, updatePrompt, type Continuation } from "./handoff";
 import { removeHome } from "./homes";
 import { Mutex } from "./json-file";
@@ -160,6 +160,15 @@ const HISTORY_GAP_DETAIL =
   "ZeroSub couldn't read this agent's handoff history, so it can't prove what the continuation has. Nothing was sent; check both chats.";
 const uncertainDetail = (title: string, messageId: string): string =>
   `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send a second copy.`;
+
+/**
+ * The same place for a fork on another provider: the same workspace, or the same directory when
+ * neither sits in one. (`samePlace` also demands the same provider, which a fork never shares.)
+ */
+function sameWorkspace(left: Agent, right: Agent): boolean {
+  if (left.workspaceId !== right.workspaceId) return false;
+  return Boolean(left.workspaceId) || left.cwd === right.cwd;
+}
 
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
@@ -1195,7 +1204,8 @@ export class Service {
       return { skipped: "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode." };
     }
 
-    const record = (await this.store.read()).opencodeForks[agentId];
+    const recordRead = await this.store.read();
+    let record = recordRead.opencodeForks[agentId];
     // Prompting the original again while it's still out must reuse its fork, not start a second one.
     const forkId =
       record?.forkAgentId ??
@@ -1232,13 +1242,13 @@ export class Service {
       if (pending.sentDigest !== undefined && (await this.hasReceipt(paseo, forkId, pending.messageId, pending.sentDigest))) {
         await this.settleOpenCode(agentId, pending.messageId);
         fork = (await paseo.agents.ref(forkId).refresh())?.agent;
-        delete record.pending;
+        record = (await this.store.read()).opencodeForks[agentId];
       } else {
         return this.openCodeUncertain(forkId, fork.title, pending.messageId);
       }
     }
 
-    if (!fork) {
+    if (!fork || fork.archivedAt) {
       // A settled fork that is gone or archived may be replaced by a new one.
       return this.createOpenCodeFork(paseo, agentId, original, source);
     }
@@ -1250,7 +1260,7 @@ export class Service {
     // Fresh checks before sending: same place, same parent, not working, nobody waiting on it.
     const expectedParent = await this.continuations.parentFor(paseo, agentId);
     if (
-      fork.provider !== OPENCODE_PROVIDER || !samePlace(original, fork) || busy(fork) || fork.pendingPermissions?.length ||
+      fork.provider !== OPENCODE_PROVIDER || !sameWorkspace(original, fork) || busy(fork) || fork.pendingPermissions?.length ||
       fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent
     ) {
       return {

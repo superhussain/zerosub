@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -507,8 +508,25 @@ describe("forking to the other provider", () => {
       labels,
     };
     const agents: Array<Record<string, unknown>> = [source, ...others];
-    const created: Array<{ agentId: string; config: { provider: string; modeId?: string }; title: string; prompt: string; labels: Record<string, string> }> = [];
+    const byId = new Map(agents.map((agent) => [agent.id as string, agent]));
+    const created: Array<{ agentId: string; idempotencyKey?: string; config: { provider: string; modeId?: string }; title: string; prompt?: string; labels: Record<string, string> }> = [];
     const notes: Array<{ to: string; outcome: string; toFamily: string | null; toProvider: string | null; detail: string | null; continuedIn: { agentId: string } | null }> = [];
+    /** Every prompt the plugin sent, and the message ID it was sent under. */
+    const sends: Array<{ agentId: string; text: string; messageId?: string }> = [];
+    /** Per-agent timelines in Paseo's canonical projection; the fake tags every turn it accepts. */
+    const timelines = new Map<string, Array<{ item: AgentTimelineItem; turnId?: string; seqEnd: number }>>();
+    let seq = 0;
+    const setTimeline = (id: string, rows: readonly Row[]) =>
+      timelines.set(id, rows.map((row) => ({ ...row, seqEnd: ++seq })));
+    setTimeline(AGENT, conversation);
+    /** Adds one turn to an agent's timeline, as Paseo would when the user types. */
+    const addTurn = (id: string, item: AgentTimelineItem, clientMessageId?: string) => {
+      const rows = timelines.get(id) ?? [];
+      rows.push({ item: clientMessageId ? { ...item, clientMessageId } : item, turnId: `turn-${++seq}`, seqEnd: ++seq });
+      timelines.set(id, rows);
+    };
+    /** Makes the next source read fail, as a history gap does. */
+    const gap = { source: false };
     const modes: Record<string, Array<{ id: string; label: string; colorTier?: string }>> = {
       ...MODES,
       opencode: options.opencodeModes ?? [
@@ -537,14 +555,17 @@ describe("forking to the other provider", () => {
           agents: {
             create: async (request: (typeof created)[number]) => {
               created.push(request);
-              agents.push({
+              const agent = {
                 id: request.agentId,
                 provider: request.config.provider.split("/")[0],
-                status: "running",
+                status: "idle",
                 title: request.title,
+                workspaceId: "ws-1",
                 archivedAt: null,
                 labels: request.labels,
-              });
+              };
+              agents.push(agent);
+              byId.set(agent.id, agent);
             },
           },
         }),
@@ -552,11 +573,26 @@ describe("forking to the other provider", () => {
       agents: {
         list: async () => ({ entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } }),
         ref: (id: string) => ({
-          refresh: async () => ({ agent: others.find((agent) => agent.id === id) ?? source }),
-          send: async () => undefined,
+          refresh: async () => ({ agent: byId.get(id) ?? null }),
+          send: async (text: string, options: { messageId?: string } = {}) => {
+            sends.push({ agentId: id, text, messageId: options.messageId });
+            addTurn(id, { type: "user_message", text }, options.messageId);
+          },
           timeline: {
             append: async (item: { data: (typeof notes)[number] }) => void notes.push(item.data),
-            refetch: async ({ limit = 0 }: { limit?: number } = {}) => ({ entries: limit > 0 ? conversation.slice(-limit) : conversation }),
+            refetch: async () => {
+              if (gap.source && id === AGENT) return { entries: [], gap: true, staleCursor: false, epoch: "epoch-1", window: { maxSeq: 0 }, hasOlder: false, startCursor: null };
+              const rows = timelines.get(id) ?? [];
+              return {
+                entries: rows,
+                gap: false,
+                staleCursor: false,
+                epoch: "epoch-1",
+                window: { maxSeq: rows.reduce((max, row) => Math.max(max, row.seqEnd), 0) },
+                hasOlder: false,
+                startCursor: null,
+              };
+            },
           },
         }),
       },
@@ -577,7 +613,7 @@ describe("forking to the other provider", () => {
         { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
         context,
       );
-    return { service, store, created, notes, limitTurn, paseo: paseo as never };
+    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents };
   }
 
   it("carries the work on with the other provider, at the same permission level", async () => {
@@ -647,7 +683,7 @@ describe("forking to the other provider", () => {
     };
 
     it("continues a stopped Claude chat on OpenCode with the saved model, thinking, and no account", async () => {
-      const { store, created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      const { store, created, notes, sends, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
       await limitTurn();
       expect(created).toHaveLength(1);
       const fork = created[0];
@@ -658,7 +694,14 @@ describe("forking to the other provider", () => {
       });
       expect(fork?.title).toBe("Fix the build (continued on OpenCode)");
       expect(fork?.labels).toEqual({ "zerosub.continued-from": AGENT });
-      expect(fork?.prompt).toMatch(/earlier Claude Code session that stopped because every Claude account reached its usage limit/);
+      expect(fork?.idempotencyKey).toBe(fork?.agentId);
+      // The fork is created promptless; the handoff is delivered afterwards under a reserved ID.
+      expect(created[0]?.prompt).toBeUndefined();
+      expect(sends).toHaveLength(1);
+      expect(sends[0]?.agentId).toBe(fork?.agentId);
+      expect(sends[0]?.text).toMatch(/earlier Claude Code session that stopped because every Claude account reached its usage limit/);
+      expect(sends[0]?.messageId).toMatch(/^zerosub-handoff-/);
+      expect(sends[0]?.text).toContain(`zerosub transfer ${sends[0]?.messageId}`);
       // OpenCode is a harness, not an account provider: no binding, so no account store entry.
       expect((await store.read()).bindings[fork?.agentId ?? ""]).toBeUndefined();
       expect(notes.at(-1)).toMatchObject({
@@ -684,6 +727,209 @@ describe("forking to the other provider", () => {
       await limitTurn();
       await limitTurn();
       expect(created).toHaveLength(1);
+    });
+
+    const RESERVED = { targetId: "fork-reserved", messageId: "zerosub-handoff-reserved" };
+    const MARK = { epoch: "epoch-1", seq: 0 };
+    const opencodeAgent = (id: string, overrides: Record<string, unknown> = {}) => ({
+      id,
+      provider: "opencode",
+      status: "idle",
+      title: "Fix the build (continued on OpenCode)",
+      workspaceId: "ws-1",
+      archivedAt: null,
+      labels: { "zerosub.continued-from": AGENT },
+      ...overrides,
+    });
+    const digestOf = (text: string) => createHash("sha256").update(text).digest("hex");
+    /** A harness with an existing, settled fork record and its live target agent. */
+    const setUpReuse = async (fork: Record<string, unknown> = {}, record: Record<string, unknown> = {}) => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId, ...record };
+      });
+      setup.byId.set(RESERVED.targetId, opencodeAgent(RESERVED.targetId, fork));
+      return setup;
+    };
+    const seededPending = (pending: Record<string, unknown>) => ({ forkAgentId: RESERVED.targetId, pending });
+
+    it("sends new instructions to the existing fork exactly once, then nothing new on a third fork", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      const forkId = setup.created[0]!.agentId;
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      const updates = setup.sends.filter((send) => send.text.includes("Now also update the CHANGELOG"));
+      expect(updates).toHaveLength(1);
+      expect(updates[0]!.agentId).toBe(forkId);
+      expect(updates[0]!.messageId).toMatch(/^zerosub-handoff-/);
+      expect(updates[0]!.text).toContain(`zerosub transfer ${updates[0]!.messageId}`);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "continued", continuedIn: { agentId: forkId } });
+      // Nothing new on the source: nothing is sent, and the row says so instead of claiming a handoff.
+      await setup.limitTurn();
+      expect(setup.sends).toHaveLength(2);
+      expect(setup.notes.at(-1)).toMatchObject({
+        outcome: "stayed",
+        detail: "No update was sent: the OpenCode continuation already has everything from this agent.",
+        continuedIn: { agentId: forkId },
+      });
+    });
+
+    it("retries a lost create acknowledgement with the same target, idempotency key, and message ID", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = seededPending({
+          stage: "creating",
+          targetId: RESERVED.targetId,
+          messageId: RESERVED.messageId,
+          seen: MARK,
+          config: { provider: "opencode/opencode/glm-5p3-flash", modeId: "code", thinkingOptionId: "high" },
+        });
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({ agentId: RESERVED.targetId, idempotencyKey: RESERVED.targetId });
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("re-reads the persisted reservation after a restart-shaped rebuild of the service", async () => {
+      const first = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await first.store.update((draft) => {
+        draft.opencodeForks[AGENT] = seededPending({
+          stage: "creating",
+          targetId: RESERVED.targetId,
+          messageId: RESERVED.messageId,
+          seen: MARK,
+          config: { provider: "opencode/opencode/glm-5p3-flash", modeId: "code", thinkingOptionId: "high" },
+        });
+      });
+      // A second service over the same state file: what a worker restart re-reads.
+      const second = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      const done = await second.service.forkAgent(second.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(first.created).toHaveLength(0);
+      expect(second.created).toHaveLength(1);
+      expect(second.created[0]!.agentId).toBe(RESERVED.targetId);
+    });
+
+    it("settles a pending send by marker and digest when a reload dropped the message ID", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // A provider reload changed the epoch and dropped clientMessageId and turnId from the row.
+      setup.timelines.set(RESERVED.targetId, [{ item: { type: "user_message", text: sent }, seqEnd: 1 }]);
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.pending).toBeUndefined();
+      // The settled reservation's mark, then the update's mark on top of it.
+      expect(record.seen).toEqual({ epoch: "epoch-1", seq: 2 });
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("Now also update the CHANGELOG");
+    });
+
+    it("keeps an unconfirmed send reserved and reports uncertainty instead of resending", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // The fork's timeline holds no marker: no trustworthy receipt either way.
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("found");
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", continuedIn: { agentId: RESERVED.targetId } });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't be confirmed \(transfer zerosub-handoff-m1\)/);
+    });
+
+    it("keeps the pending reservation when the target is archived, instead of starting another fork", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        { archivedAt: "2026-09-23T08:00:00.000Z" },
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("found");
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
+    });
+
+    it("reuses the same message ID when an update's acknowledgement was lost", async () => {
+      const sent = "The update text.\nzerosub transfer zerosub-handoff-u1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-u1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // The send arrived; the service stopped before it could record the receipt.
+      setup.timelines.set(RESERVED.targetId, [
+        { item: { type: "user_message", text: sent, clientMessageId: "zerosub-handoff-u1" }, turnId: "turn-x", seqEnd: 1 },
+      ]);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(0); // reconciled, not resent
+      const rows = setup.timelines.get(RESERVED.targetId)!;
+      expect(rows.filter((row) => row.item.type === "user_message" && row.item.clientMessageId === "zerosub-handoff-u1")).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("replaces a settled fork that was archived later", async () => {
+      const setup = await setUpReuse({ archivedAt: "2026-09-23T08:00:00.000Z" }, { seen: MARK });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).not.toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.forkAgentId).toBe(done.agentId);
+    });
+
+    it("transfers an imported handoff as instructions, filtering only its own message IDs", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.limitTurn();
+      setup.addTurn(
+        AGENT,
+        { type: "user_message", text: "This task is continuing from an earlier session that stopped because it hit its limit." },
+        "user-2",
+      );
+      setup.addTurn(AGENT, { type: "user_message", text: "Old reserved copy" }, "zerosub-handoff-old");
+      await setup.limitTurn();
+      const update = setup.sends.at(-1)!;
+      expect(update.text).toContain("This task is continuing from an earlier session");
+      expect(update.text).not.toContain("Old reserved copy");
+    });
+
+    it("reports found for an earlier fork without a state record and sends nothing", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [opencodeAgent("fork-old")], { prefs: PREFS });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done).toMatchObject({ agentId: "fork-old", delivery: "found" });
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", continuedIn: { agentId: "fork-old" } });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't tell what it has already received/);
+    });
+
+    it("refuses to send into a fork that moved, is working, changed parent, or waits for permission", async () => {
+      const refused = async (overrides: Record<string, unknown>) => {
+        const setup = await setUpReuse(overrides, { seen: MARK });
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved, is working or is waiting for permission/);
+        expect(setup.sends).toHaveLength(0);
+      };
+      await refused({ workspaceId: "ws-2" });
+      await refused({ status: "running" });
+      await refused({ labels: { "zerosub.continued-from": AGENT, "paseo.parent-agent-id": "elsewhere" } });
+      await refused({ pendingPermissions: [{ id: "p1" }] });
+    });
+
+    it("refuses honestly when the source's handoff history has a gap", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.gap.source = true;
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", continuedIn: { agentId: RESERVED.targetId } });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't read this agent's handoff history/);
     });
 
     const refusalCases: Array<{
@@ -755,17 +1001,17 @@ describe("forking to the other provider", () => {
     };
 
     it("continues a stopped Claude chat on OpenCode with every toggle off and no ChatGPT accounts", async () => {
-      const { store, created, notes, fork } = await manually({ prefs: PREFS, noChatGPT: true });
+      const { store, created, notes, sends, fork } = await manually({ prefs: PREFS, noChatGPT: true });
       const done = await fork();
       expect(created).toHaveLength(1);
-      expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)" });
+      expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)", delivery: "sent" });
       expect(created[0]?.config).toEqual({
         provider: "opencode/opencode/glm-5p3-flash",
         modeId: "code", // no more permissive than Bypass
         thinkingOptionId: "high",
       });
       expect(created[0]?.title).toBe("Fix the build (continued on OpenCode)");
-      expect(created[0]?.prompt).toMatch(/stopped because the work was moved to OpenCode/);
+      expect(sends[0]?.text).toMatch(/stopped because the work was moved to OpenCode/);
       // OpenCode is a harness, not an account provider: no binding, so no account store entry.
       expect((await store.read()).bindings[done.agentId]).toBeUndefined();
       expect(notes.at(-1)).toMatchObject({
