@@ -1,0 +1,21 @@
+=== npm run typecheck ===
+
+> @kapybara/zerosub@1.5.1 typecheck
+> tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json
+
+exit: 0
+=== npm test ===
+ Test Files  28 passed (28)
+      Tests  325 passed (325)
+   Start at  13:54:22
+   Duration  6.20s (transform 1.54s, setup 0ms, collect 4.49s, tests 10.67s, environment 3ms, prepare 1.44s)
+
+=== npm run audit:mobile ===
+
+exit: 0
+=== criterion 6 ===
+grep exit: 1 (1 = no matches, good)
+-rw-r--r--@ 1 hussain.abbas  staff  34867 Nov 11 13:54 /Users/hussain.abbas/.config/huss-skills/factory/jobs/zerosub/1233-opencode-exhaustion-fork/settings-after-chatgpt.png
+-rw-r--r--@ 1 hussain.abbas  staff  52568 Nov 11 13:54 /Users/hussain.abbas/.config/huss-skills/factory/jobs/zerosub/1233-opencode-exhaustion-fork/settings-after-opencode.png
+-rw-r--r--@ 1 hussain.abbas  staff  42705 Nov 11 13:54 /Users/hussain.abbas/.config/huss-skills/factory/jobs/zerosub/1233-opencode-exhaustion-fork/settings-after-refused.png
+-rw-r--r--@ 1 hussain.abbas  staff  24128 Nov 11 13:54 /Users/hussain.abbas/.config/huss-skills/factory/jobs/zerosub/1233-opencode-exhaustion-fork/settings-before.png
