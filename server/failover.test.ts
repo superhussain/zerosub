@@ -477,19 +477,27 @@ describe("forking to the other provider", () => {
       catalog?: Array<Record<string, unknown>>;
       /** OpenCode's modes. */
       opencodeModes?: Array<{ id: string; label: string; colorTier?: string }>;
+      /** No ChatGPT account is configured at all. */
+      noChatGPT?: boolean;
+      /** The source agent's status, for refusals the manual path checks before anything else. */
+      sourceStatus?: string;
+      /** The source agent's provider, for a source outside the Claude family. */
+      sourceProvider?: string;
     } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) =>
       Object.assign(draft, {
-        accounts: [account(MAIN, "marketing", "main"), { ...account(CODEX_MAIN, "hello", "main"), family: "codex" }],
-        defaults: { claude: MAIN, codex: CODEX_MAIN },
+        accounts: options.noChatGPT
+          ? [account(MAIN, "marketing", "main")]
+          : [account(MAIN, "marketing", "main"), { ...account(CODEX_MAIN, "hello", "main"), family: "codex" }],
+        defaults: { claude: MAIN, codex: options.noChatGPT ? null : CODEX_MAIN },
       }),
     );
     const source = {
       id: AGENT,
-      provider: "claude",
-      status: "idle",
+      provider: options.sourceProvider ?? "claude",
+      status: options.sourceStatus ?? "idle",
       title: "Fix the build",
       model: "claude-opus-5-5",
       currentModeId: modeId,
@@ -569,7 +577,7 @@ describe("forking to the other provider", () => {
         { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
         context,
       );
-    return { store, created, notes, limitTurn };
+    return { service, store, created, notes, limitTurn, paseo: paseo as never };
   }
 
   it("carries the work on with the other provider, at the same permission level", async () => {
@@ -736,6 +744,83 @@ describe("forking to the other provider", () => {
       expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
       expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's \(“Bypass”\)/);
   });
+  });
+
+  describe("manual OpenCode continuation", () => {
+    const PREFS = { autoSwitch: false, forkOtherProvider: false, forkOpenCodeModel: "opencode/glm-5p3-flash", forkOpenCodeThinking: "high" };
+    const manually = async (options: { modeId?: string } & Parameters<typeof setUpFork>[4] = {}) => {
+      const { modeId = "bypassPermissions", ...rest } = options;
+      const setup = await setUpFork(modeId, [], {}, [], rest);
+      return { ...setup, fork: () => setup.service.forkAgent(setup.paseo, AGENT, "opencode") };
+    };
+
+    it("continues a stopped Claude chat on OpenCode with every toggle off and no ChatGPT accounts", async () => {
+      const { store, created, notes, fork } = await manually({ prefs: PREFS, noChatGPT: true });
+      const done = await fork();
+      expect(created).toHaveLength(1);
+      expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)" });
+      expect(created[0]?.config).toEqual({
+        provider: "opencode/opencode/glm-5p3-flash",
+        modeId: "code", // no more permissive than Bypass
+        thinkingOptionId: "high",
+      });
+      expect(created[0]?.title).toBe("Fix the build (continued on OpenCode)");
+      expect(created[0]?.prompt).toMatch(/stopped because the work was moved to OpenCode/);
+      // OpenCode is a harness, not an account provider: no binding, so no account store entry.
+      expect((await store.read()).bindings[done.agentId]).toBeUndefined();
+      expect(notes.at(-1)).toMatchObject({
+        reason: "manual",
+        continued: true,
+        to: "OpenCode",
+        toFamily: null,
+        toProvider: "opencode",
+        continuedIn: { agentId: done.agentId },
+      });
+    });
+
+    it("points a second manual call at the earlier OpenCode fork instead of starting another", async () => {
+      const { created, fork } = await manually({ prefs: PREFS });
+      const first = await fork();
+      const second = await fork();
+      expect(created).toHaveLength(1);
+      expect(second.agentId).toBe(first.agentId);
+    });
+
+    it("refuses when the saved model has left the catalog", async () => {
+      const { created, fork } = await manually({
+        prefs: PREFS,
+        catalog: [{ id: "opencode/other", label: "Other", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] }],
+      });
+      await expect(fork()).rejects.toThrow(/saved OpenCode model is no longer in this host's catalog/);
+      expect(created).toHaveLength(0);
+    });
+
+    it("refuses when the saved thinking option is gone from the model", async () => {
+      const { created, fork } = await manually({
+        prefs: PREFS,
+        catalog: [{ id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "low", label: "Low" }] }],
+      });
+      await expect(fork()).rejects.toThrow(/GLM 5.3 Flash” no longer offers the saved thinking option/);
+      expect(created).toHaveLength(0);
+    });
+
+    it("refuses when OpenCode has no mode as careful as the original's", async () => {
+      const { created, fork } = await manually({ prefs: PREFS, opencodeModes: [{ id: "yolo", label: "Yolo", colorTier: "dangerous" }], modeId: "default" });
+      await expect(fork()).rejects.toThrow(/no mode as careful as this agent's \(“Always Ask”\)/);
+      expect(created).toHaveLength(0);
+    });
+
+    it("refuses a running agent", async () => {
+      const { created, fork } = await manually({ prefs: PREFS, sourceStatus: "running" });
+      await expect(fork()).rejects.toThrow("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
+      expect(created).toHaveLength(0);
+    });
+
+    it("refuses a Codex source", async () => {
+      const { created, fork } = await manually({ prefs: PREFS, sourceProvider: "codex" });
+      await expect(fork()).rejects.toThrow("Only Claude agents can continue on OpenCode.");
+      expect(created).toHaveLength(0);
+    });
   });
 });
 
