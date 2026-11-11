@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { sameAccountIdentity } from "./account-identity";
 import type { AgentTimelineItem } from "./adapter";
@@ -8,30 +8,31 @@ import { isUsable } from "./routing";
 import { findAccount, MAIN_ACCOUNT_ID, StateStore, type ContinuationChain, type StoredAccount, type StoredState } from "./state";
 
 type PaseoApi = PluginHookContext["paseo"];
-type Agent = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
+export type Agent = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
 type Member = ContinuationChain["members"][string];
 type Pending = NonNullable<ContinuationChain["pending"]>;
 type Mark = Member["seen"][string];
 type Source = "auto" | "user";
 type Update = { item: AgentTimelineItem; timestamp: string };
-const MESSAGE_PREFIX = "zerosub-handoff-";
+/** Every handoff prompt of ours carries a caller message ID with this prefix. */
+export const MESSAGE_PREFIX = "zerosub-handoff-";
 const MAX_PAGES = 100;
 const MAX_INSTRUCTIONS = 60_000;
 const MAX_ORIGIN = 6_000;
 const OMITTED = "[… part of this message omitted to fit this update …]";
 
 /** The same checkout. Paseo starts a workspace's new agents in its directory, not the source's subfolder. */
-function samePlace(left: Agent, right: Agent): boolean {
+export function samePlace(left: Agent, right: Agent): boolean {
   if (left.provider !== right.provider || left.workspaceId !== right.workspaceId) return false;
   return Boolean(left.workspaceId) || left.cwd === right.cwd;
 }
 
-function ready(agent: Agent): boolean {
+export function ready(agent: Agent): boolean {
   return !agent.archivedAt && !agent.providerUnavailable && !agent.activeTurn &&
     !agent.pendingPermissions?.length && (agent.status === "idle" || agent.status === "closed" || agent.status === "error");
 }
 
-function busy(agent: Agent): boolean {
+export function busy(agent: Agent): boolean {
   return agent.status === "running" || agent.status === "initializing" || Boolean(agent.activeTurn);
 }
 
@@ -616,12 +617,37 @@ function composePrompt(chain: ContinuationChain, destination: Destination, gathe
 }
 
 /** The daemon accepted this message as a turn: it carries our ID and a turn. */
-function delivered(entry: { item: AgentTimelineItem; turnId?: string }, messageId: string): boolean {
+export function delivered(entry: { item: AgentTimelineItem; turnId?: string }, messageId: string): boolean {
   return Boolean(entry.turnId) && entry.item.type === "user_message" && entry.item.clientMessageId === messageId;
 }
 
+/** The marker line that ends every OpenCode-path prompt, so a receipt can be found after a reload. */
+export function transferMarker(messageId: string): string {
+  return `zerosub transfer ${messageId}`;
+}
+
+function digestOf(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/** Digest of the exact sent text, stored with the reservation so a receipt can be matched later. */
+export function sentDigestOf(prompt: string): string {
+  return digestOf(prompt);
+}
+
+/**
+ * Whether a timeline row proves this exact message arrived. The fast path is our caller message ID on
+ * a turn. A provider reload changes the timeline's epoch and drops that ID, so the marker line inside
+ * the exact text, hashed, settles it too.
+ */
+export function matchesTransfer(entry: { item: AgentTimelineItem; turnId?: string }, messageId: string, digest: string): boolean {
+  if (delivered(entry, messageId)) return true;
+  return entry.item.type === "user_message" && entry.item.text.includes(transferMarker(messageId)) &&
+    digestOf(entry.item.text) === digest;
+}
+
 /** Canonical sequence cursors avoid re-sending projected messages that merge across a watermark. */
-async function readUpdates(paseo: PaseoApi, agentId: string, since?: Mark, receiptId?: string) {
+export async function readUpdates(paseo: PaseoApi, agentId: string, since?: Mark, receiptId?: string) {
   const timeline = paseo.agents.ref(agentId).timeline;
   let page = await timeline.refetch({ direction: "tail", limit: 500, projection: "canonical" });
   if (page.gap || page.staleCursor) throw new Error("The task's handoff history has a gap. Check its timeline before continuing.");

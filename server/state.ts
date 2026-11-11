@@ -55,7 +55,41 @@ export const LiveSessionSchema = z.object({
 });
 export type LiveSession = z.infer<typeof LiveSessionSchema>;
 
-const TimelineMarkSchema = z.object({ epoch: z.string(), seq: z.number().int().nonnegative() });
+export const TimelineMarkSchema = z.object({ epoch: z.string(), seq: z.number().int().nonnegative() });
+export type TimelineMark = z.infer<typeof TimelineMarkSchema>;
+
+/** An OpenCode fork of one source agent: where the work continues and how much of the source it has. */
+export const OpenCodeForkSchema = z.object({
+  /** The OpenCode agent carrying the source's work. */
+  forkAgentId: z.string(),
+  /** How much of the source the fork has already received. */
+  seen: TimelineMarkSchema.optional(),
+  /**
+   * Written before a create or a send. An uncertain dispatch must never start a second fork or send
+   * a second copy: retry it exactly, or reconcile its receipt. Only IDs, marks, digests and the
+   * create configuration are stored; no transcript text or credentials.
+   */
+  pending: z
+    .object({
+      stage: z.enum(["creating", "sending"]),
+      targetId: z.string(),
+      messageId: z.string(),
+      seen: TimelineMarkSchema,
+      /** The exact create configuration (`provider` is Paseo's `provider/model` string). */
+      config: z
+        .object({
+          provider: z.string(),
+          modeId: z.string(),
+          thinkingOptionId: z.string().optional(),
+        })
+        .optional(),
+      /** SHA-256 of the exact sent text, so a receipt survives a provider reload. */
+      sentDigest: z.string().optional(),
+    })
+    .optional(),
+});
+export type OpenCodeFork = z.infer<typeof OpenCodeForkSchema>;
+
 const ContinuationMemberSchema = z.object({
   accountId: z.string(),
   identity: z.string().nullable(),
@@ -94,6 +128,8 @@ export const StoredStateSchema = z.object({
   /** Which account each agent's live provider session was opened with. */
   sessions: z.record(z.string(), LiveSessionSchema).default({}),
   continuations: z.record(z.string(), ContinuationChainSchema).default({}),
+  /** Per-source OpenCode fork records. OpenCode is a harness, not an account provider. */
+  opencodeForks: z.record(z.string(), OpenCodeForkSchema).default({}),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -138,6 +174,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       bindings: records(BindingSchema, source.bindings),
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
+      opencodeForks: records(OpenCodeForkSchema, source.opencodeForks),
     },
     dropped: true,
   };

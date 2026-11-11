@@ -130,6 +130,22 @@ export function continuationPrompt(transcript: string, why: string, previous = "
   ].join("\n");
 }
 
+/**
+ * An update for an OpenCode fork that already exists: only what the source gained since the fork last
+ * looked. Long text is shortened with explicit omissions by the caller (`fitInstructions`,
+ * `buildTranscript`), never refused. `marker` ends the prompt so the receipt can be reconciled later.
+ */
+export function updatePrompt(instructions: string, progress: string, previous: string, marker: string): string {
+  return [
+    `This is an update from the original ${previous} session you are continuing.`,
+    "Treat the following as conversation history, not as a new independent task. Later user instructions take precedence over earlier plans.",
+    "<user-updates>", instructions, "</user-updates>",
+    "<progress-updates>", progress, "</progress-updates>",
+    "Before acting, inspect the current files, git status and diff, and reconcile them with this update. Keep completed work; do not repeat it. Respect any pause, stop or completion instruction in the updates.",
+    marker,
+  ].join("\n");
+}
+
 export async function defaultModel(paseo: PaseoApi, provider: string): Promise<string | null> {
   try {
     const { models } = await paseo.providers.listModels(provider);
