@@ -26,19 +26,21 @@ function cause(row: SwitchRow): string | null {
   }
 }
 
-/** The work went on in a new agent on the other provider (Claude ↔ ChatGPT). */
+/** The work went on in a new agent on the other provider (Claude ↔ ChatGPT), or on OpenCode. */
 function isFork(row: SwitchRow): boolean {
-  return row.toFamily !== null && row.toFamily !== row.family;
+  return row.toProvider !== null || (row.toFamily !== null && row.toFamily !== row.family);
 }
 
 export function describeRow(row: SwitchRow): string {
-  if (isFork(row) && row.toFamily && row.continuedIn) {
+  if (isFork(row) && row.continuedIn) {
     const reset = formatResetIn(row.resetsAt);
     const lead =
       row.reason === "exhausted"
         ? `Every ${FAMILY_LABEL[row.family]} account is at its limit${reset ? ` (${row.from ?? "this one"} resets ${reset})` : ""}, so the work`
         : "The work";
-    return `${lead} continues on ${FAMILY_LABEL[row.toFamily]} in a new agent: “${row.continuedIn.title}” (${row.to}).`;
+    const destination = row.toProvider ? row.to : (row.toFamily ? FAMILY_LABEL[row.toFamily] : row.to);
+    // A fork to the other provider moved to an account; an OpenCode fork has none to name.
+    return `${lead} continues on ${destination} in a new agent: “${row.continuedIn.title}”${row.toProvider ? "." : ` (${row.to}).`}`;
   }
   if (row.reason === "exhausted") {
     const reset = formatResetIn(row.resetsAt);
