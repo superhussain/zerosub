@@ -94,6 +94,7 @@ ZeroSub tries these in order, and a timeline note says which one happened:
    - Its permission mode matches the original's level. Bypass becomes Full Access, and Accept File Edits becomes Default Permissions. Codex has no read-only or ask-first mode, so a Claude agent in Plan Mode or Always Ask isn't forked. ZeroSub never gives a fork more freedom than you gave the original.
    - The original agent stays as it was, and prompting it again while its provider is still out points to the same fork rather than starting another.
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
+   - By hand, a stopped Claude chat can also continue on OpenCode at any time: its account button offers **Continue on OpenCode (new agent)…**, with or without the automatic fork turned on, using the OpenCode model and thinking option picked in the settings.
 3. **Stop and say so**, with the time the account frees up.
 
 ## Several hosts
