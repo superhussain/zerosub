@@ -34,6 +34,8 @@ export const SwitchRowSchema = z.object({
   continuedIn: z.object({ agentId: z.string(), title: z.string() }).nullable().default(null),
   /** Set when `continuedIn` runs on the other provider (a fork from Claude to ChatGPT, or back). */
   toFamily: FamilySchema.nullable().default(null),
+  /** Set when the fork went to a provider outside the account families, e.g. OpenCode. It has no account. */
+  toProvider: z.string().nullable().default(null),
   /**
    * `switched`: the agent now runs on `to`. `pending`: it moves when its session next starts.
    * `continued`: the work goes on in `continuedIn`. `stayed`: it remains on `from` (see `detail`).
