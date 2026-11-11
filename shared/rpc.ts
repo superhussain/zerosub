@@ -112,10 +112,10 @@ export const setAccountEnabled = defineRpc({
   }),
 });
 
-/** Carries an agent's work on in a new agent on the other provider (Claude ↔ ChatGPT). */
+/** Carries an agent's work on in a new agent on the other provider (Claude ↔ ChatGPT), or on this host's OpenCode. */
 export const forkAgent = defineRpc({
   name: "zerosub.agents.fork",
-  input: z.object({ agentId: z.string() }),
+  input: z.object({ agentId: z.string(), destination: z.enum(["other", "opencode"]).default("other") }),
   output: z.object({ agentId: z.string(), title: z.string() }),
 });
 

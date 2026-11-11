@@ -8,6 +8,8 @@ import type {
 } from "@getpaseo/plugin/server";
 import {
   FAMILY_LABEL,
+  OPENCODE_LABEL,
+  OPENCODE_PROVIDER,
   type AccountView,
   type AgentRoute,
   type Family,
@@ -101,6 +103,9 @@ const DEFAULT_PREFERENCES: Preferences = {
   autoRedeem: false,
   useCredits: false,
   forkOtherProvider: false,
+  claudeForkDestination: "codex",
+  forkOpenCodeModel: "",
+  forkOpenCodeThinking: "",
 };
 
 interface LoginSession {
@@ -126,6 +131,11 @@ interface AgentInfo {
   /** The agent this one carries on from, when ZeroSub started it as a continuation. */
   continuedFrom: string | null;
 }
+
+/** What a fork attempt settles on: the new (or found) continuation and where the row says it went, or `skipped` with the reason nothing was started. */
+type ForkOutcome =
+  | { fork: Continuation; to: string; toFamily: Family | null; toProvider: string | null }
+  | { skipped: string };
 
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
@@ -671,6 +681,7 @@ export class Service {
       continued: false,
       continuedIn: null,
       toFamily: null,
+      toProvider: null,
       detail: null,
       at: new Date(now).toISOString(),
     };
@@ -732,16 +743,22 @@ export class Service {
       if (reason !== "limit") return;
       let detail: string | null = null;
       if (this.prefs.forkOtherProvider) {
-        // Opt-in: every account of this provider is out, so carry on with the other provider.
-        const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto").catch((error: unknown) => ({
-          skipped: `Couldn't continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
+        // Opt-in: every account of this provider is out, so carry on with the other provider — or on
+        // the host's OpenCode, when a stopped Claude chat was pointed there in the settings.
+        const toOpenCode = family === "claude" && this.prefs.claudeForkDestination === "opencode";
+        const result = await (toOpenCode
+          ? this.forkToOpenCode(paseo, agentId, timeline, "auto")
+          : this.forkToOtherProvider(paseo, agentId, family, timeline, "auto")
+        ).catch((error: unknown) => ({
+          skipped: `Couldn't continue on ${toOpenCode ? OPENCODE_LABEL : FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
         }));
         if ("fork" in result) {
           this.switchGuard.note(agentId, now);
           await this.appendRow(paseo, agentId, {
             ...base,
-            to: result.account.label,
-            toFamily: result.family,
+            to: result.to,
+            toFamily: result.toFamily,
+            toProvider: result.toProvider,
             reason: "exhausted",
             continued: true,
             continuedIn: result.fork,
@@ -749,7 +766,7 @@ export class Service {
           });
           return;
         }
-        console.log(`[ZeroSub] not continuing ${agentId} on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${result.skipped}`);
+        console.log(`[ZeroSub] not continuing ${agentId}: ${result.skipped}`);
         detail = result.skipped;
       } else if (mostAvailable(latest, OTHER_FAMILY[family], (id) => this.usage.get(id), now, new Set())) {
         detail = `Or continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]} in a new agent from the account button.`;
@@ -846,6 +863,7 @@ export class Service {
       continued: false,
       continuedIn: null,
       toFamily: null,
+      toProvider: null,
       outcome: "stayed",
       detail: `This task continues in “${elsewhere.title}”, so ZeroSub didn't ${skipped} this tab automatically. Carry on there, or pick an account from the account button to continue from here.`,
       at: new Date(now).toISOString(),
@@ -952,6 +970,7 @@ export class Service {
       continued: true,
       continuedIn: null,
       toFamily: null,
+      toProvider: null,
       outcome: "reset",
       detail,
       at,
@@ -1038,6 +1057,7 @@ export class Service {
           continued: false,
           continuedIn: null,
           toFamily: null,
+          toProvider: null,
           outcome: "switched",
           detail: null,
           at: new Date(now).toISOString(),
@@ -1060,7 +1080,7 @@ export class Service {
     family: Family,
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
-  ): Promise<{ fork: Continuation; account: StoredAccount; family: Family } | { skipped: string }> {
+  ): Promise<ForkOutcome> {
     const other = OTHER_FAMILY[family];
     const name = FAMILY_LABEL[other];
     const families = await this.families.resolve(paseo);
@@ -1071,7 +1091,7 @@ export class Service {
     );
     const earlierAccount = earlier && (findAccount(state, state.bindings[earlier.id]?.accountId) ?? mainAccount(state, other));
     if (earlier && earlierAccount) {
-      return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, account: earlierAccount, family: other };
+      return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, to: earlierAccount.label, toFamily: other, toProvider: null };
     }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
@@ -1116,12 +1136,88 @@ export class Service {
       },
     });
     console.log(`[ZeroSub] ${agentId} continues on ${name} (${account.label}) in ${fork.agentId}`);
-    return { fork, account, family: other };
+    return { fork, to: account.label, toFamily: other, toProvider: null };
+  }
+
+  /**
+   * Carries a stopped Claude chat on in a new agent on this host's OpenCode, when that's the chosen
+   * destination and every Claude account is out. OpenCode is a harness, not an account provider, so
+   * the new agent gets no account binding. Its model, thinking option, and mode all come from this
+   * host's catalog and stay no freer than the original; anything else refuses the fork.
+   */
+  private async forkToOpenCode(
+    paseo: PaseoApi,
+    agentId: string,
+    timeline: readonly AgentTimelineItem[] | undefined,
+    source: "auto" | "user" = "auto",
+  ): Promise<ForkOutcome> {
+    // Prompting the original again while it's still out mustn't start a second copy of the work.
+    const earlier = (await listAgents(paseo, false)).agents.find(
+      (agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER,
+    );
+    if (earlier) {
+      return {
+        fork: { agentId: earlier.id, title: earlier.title ?? `${OPENCODE_LABEL} agent` },
+        to: OPENCODE_LABEL,
+        toFamily: null,
+        toProvider: OPENCODE_PROVIDER,
+      };
+    }
+
+    const available = (await paseo.providers.listAvailable()).providers?.some(
+      (entry) => entry.provider === OPENCODE_PROVIDER && entry.available,
+    );
+    if (!available) return { skipped: `${OPENCODE_LABEL} isn't available in Paseo on this host.` };
+
+    const { models } = await paseo.providers.listModels(OPENCODE_PROVIDER);
+    const savedModel = this.prefs.forkOpenCodeModel;
+    const model = savedModel ? models?.find((entry) => entry.id === savedModel) : models?.find((entry) => entry.isDefault);
+    if (savedModel && !model) {
+      return { skipped: "The saved OpenCode model is no longer in this host's catalog. Pick one in ZeroSub's settings." };
+    }
+    if (!model) return { skipped: `No OpenCode model is marked default on this host. Pick one in ZeroSub's settings.` };
+    const thinking = this.prefs.forkOpenCodeThinking;
+    if (thinking && !model.thinkingOptions?.some((option) => option.id === thinking)) {
+      return { skipped: `“${model.label}” no longer offers the saved thinking option. Pick one in ZeroSub's settings.` };
+    }
+
+    const original = (await paseo.agents.ref(agentId).refresh())?.agent;
+    if (!original) throw new Error("That agent is no longer available.");
+    const [sourceModes, targetModes] = await Promise.all([
+      paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
+      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
+    ]);
+    const modeId = equivalentMode(sourceModes, original.currentModeId, targetModes);
+    if (!modeId) {
+      const current = sourceModes.find((mode) => mode.id === original.currentModeId)?.label;
+      return {
+        skipped: `${OPENCODE_LABEL} has no mode as careful as this agent's${current ? ` (“${current}”)` : ""}, so ZeroSub didn't continue it there.`,
+      };
+    }
+
+    const fork = await continueInNewAgent({
+      paseo,
+      sourceAgentId: agentId,
+      timeline,
+      why: source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode",
+      previous: PROVIDER_NAME.claude,
+      target: {
+        provider: OPENCODE_PROVIDER,
+        label: OPENCODE_LABEL,
+        modeId,
+        model: model.id,
+        ...(thinking ? { thinkingOptionId: thinking } : {}),
+      },
+      parentId: await this.continuations.parentFor(paseo, agentId),
+      bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
+    });
+    console.log(`[ZeroSub] ${agentId} continues on ${OPENCODE_LABEL} (${model.id}) in ${fork.agentId}`);
+    return { fork, to: OPENCODE_LABEL, toFamily: null, toProvider: OPENCODE_PROVIDER };
   }
 
   /** "Continue on …" from an agent's account button: the same fork, asked for by the user. */
-  async forkAgent(paseo: PaseoApi, agentId: string): Promise<Continuation> {
-    return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId));
+  async forkAgent(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation> {
+    return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId, destination));
   }
 
   /** Manual continuations share the automatic failover guard, including cross-provider forks. */
@@ -1135,7 +1231,7 @@ export class Service {
     }
   }
 
-  private async forkAgentNow(paseo: PaseoApi, agentId: string): Promise<Continuation> {
+  private async forkAgentNow(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation> {
     this.attach(paseo);
     const info = await agentInfo(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
@@ -1144,18 +1240,25 @@ export class Service {
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
-    const result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+    let result: ForkOutcome;
+    if (destination === "opencode") {
+      if (family !== "claude") throw new Error("Only Claude agents can continue on OpenCode.");
+      result = await this.forkToOpenCode(paseo, agentId, undefined, "user");
+    } else {
+      result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+    }
     if ("skipped" in result) throw new Error(result.skipped);
     const state = await this.store.read();
     await this.appendRow(paseo, agentId, {
       family,
       from: findAccount(state, this.runningOn(state, agentId, family))?.label ?? null,
-      to: result.account.label,
+      to: result.to,
       reason: "manual",
       resetsAt: null,
       continued: true,
       continuedIn: result.fork,
-      toFamily: result.family,
+      toFamily: result.toFamily,
+      toProvider: result.toProvider,
       outcome: "continued",
       detail: null,
       at: new Date().toISOString(),
@@ -1295,6 +1398,7 @@ export class Service {
         continued: false,
         continuedIn: null,
         toFamily: null,
+        toProvider: null,
         outcome: "switched",
         detail: null,
         at: new Date().toISOString(),
@@ -1700,6 +1804,7 @@ export class Service {
           continued: true,
           continuedIn: continuation,
           toFamily: null,
+          toProvider: null,
           outcome: "continued",
           detail: null,
           at: new Date().toISOString(),
