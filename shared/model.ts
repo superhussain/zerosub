@@ -9,6 +9,10 @@ export const FAMILY_LABEL: Record<Family, string> = {
   codex: "ChatGPT",
 };
 
+/** Paseo's OpenCode harness provider. It runs on the host itself, so a fork to it uses no account. */
+export const OPENCODE_PROVIDER = "opencode";
+export const OPENCODE_LABEL = "OpenCode";
+
 export const UsageWindowSchema = z.object({
   /** Stable key, e.g. `five_hour`, `seven_day`, `seven_day_opus`, `primary`, `secondary`. */
   id: z.string(),

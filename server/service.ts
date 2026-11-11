@@ -101,6 +101,9 @@ const DEFAULT_PREFERENCES: Preferences = {
   autoRedeem: false,
   useCredits: false,
   forkOtherProvider: false,
+  claudeForkDestination: "codex",
+  forkOpenCodeModel: "",
+  forkOpenCodeThinking: "",
 };
 
 interface LoginSession {
