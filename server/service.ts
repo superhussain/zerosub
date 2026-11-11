@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type {
@@ -35,8 +35,8 @@ import {
 } from "./adapter";
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity } from "./account-identity";
-import { CodexContinuations } from "./continuations";
-import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
+import { CodexContinuations, MESSAGE_PREFIX, busy, fitInstructions, matchesTransfer, readUpdates, ready, samePlace, sentDigestOf, transferMarker, type Agent } from "./continuations";
+import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, updatePrompt, type Continuation } from "./handoff";
 import { removeHome } from "./homes";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
@@ -55,8 +55,10 @@ import {
   findAccount,
   mainAccount,
   type ContinuationChain,
+  type OpenCodeFork,
   type StoredAccount,
   type StoredState,
+  type TimelineMark,
 } from "./state";
 
 type PaseoApi = PluginHookContext["paseo"];
@@ -132,10 +134,32 @@ interface AgentInfo {
   continuedFrom: string | null;
 }
 
+/**
+ * Whether a fork's conversation was delivered: `sent` and confirmed on the fork's timeline,
+ * `up-to-date` (nothing new to send), or `found` (an existing fork without a provable checkpoint, so
+ * nothing was sent). `detail` says why nothing was sent.
+ */
+type ForkDelivery = "sent" | "up-to-date" | "found";
+
 /** What a fork attempt settles on: the new (or found) continuation and where the row says it went, or `skipped` with the reason nothing was started. */
 type ForkOutcome =
-  | { fork: Continuation; to: string; toFamily: Family | null; toProvider: string | null }
+  | {
+      fork: Continuation;
+      to: string;
+      toFamily: Family | null;
+      toProvider: string | null;
+      delivery: ForkDelivery;
+      detail?: string;
+    }
   | { skipped: string };
+
+const UP_TO_DATE_DETAIL = "No update was sent: the OpenCode continuation already has everything from this agent.";
+const FOUND_DETAIL =
+  "Found the existing OpenCode continuation, but couldn't tell what it has already received. Nothing was sent; open that chat to inspect it against this agent's latest instructions.";
+const HISTORY_GAP_DETAIL =
+  "ZeroSub couldn't read this agent's handoff history, so it can't prove what the continuation has. Nothing was sent; check both chats.";
+const uncertainDetail = (title: string, messageId: string): string =>
+  `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send a second copy.`;
 
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
@@ -173,6 +197,8 @@ export class Service {
   private readonly deferred = new Map<string, SwitchRow | null>();
   /** Agents in the middle of a failover, so nothing else moves them at the same time. */
   private readonly switching = new Set<string>();
+  /** OpenCode fork handoffs in flight, by source agent; duplicate requests join the first call. */
+  private readonly openCodeForkInFlight = new Map<string, Promise<ForkOutcome>>();
   /** Interactive sessions being routed right now, and their agents. Where each opens isn't recorded yet. */
   private readonly routing = new Map<Promise<unknown>, string>();
   /** One failover at a time per exhausted account. */
@@ -747,7 +773,7 @@ export class Service {
         // the host's OpenCode, when a stopped Claude chat was pointed there in the settings.
         const toOpenCode = family === "claude" && this.prefs.claudeForkDestination === "opencode";
         const result = await (toOpenCode
-          ? this.forkToOpenCode(paseo, agentId, timeline, "auto")
+          ? this.forkToOpenCode(paseo, agentId, "auto")
           : this.forkToOtherProvider(paseo, agentId, family, timeline, "auto")
         ).catch((error: unknown) => ({
           skipped: `Couldn't continue on ${toOpenCode ? OPENCODE_LABEL : FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
@@ -760,9 +786,10 @@ export class Service {
             toFamily: result.toFamily,
             toProvider: result.toProvider,
             reason: "exhausted",
-            continued: true,
+            continued: result.delivery === "sent",
             continuedIn: result.fork,
-            outcome: "continued",
+            outcome: result.delivery === "sent" ? "continued" : "stayed",
+            detail: result.detail ?? null,
           });
           return;
         }
@@ -1091,7 +1118,7 @@ export class Service {
     );
     const earlierAccount = earlier && (findAccount(state, state.bindings[earlier.id]?.accountId) ?? mainAccount(state, other));
     if (earlier && earlierAccount) {
-      return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, to: earlierAccount.label, toFamily: other, toProvider: null };
+      return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, to: earlierAccount.label, toFamily: other, toProvider: null, delivery: "sent" };
     }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
@@ -1136,39 +1163,187 @@ export class Service {
       },
     });
     console.log(`[ZeroSub] ${agentId} continues on ${name} (${account.label}) in ${fork.agentId}`);
-    return { fork, to: account.label, toFamily: other, toProvider: null };
+    return { fork, to: account.label, toFamily: other, toProvider: null, delivery: "sent" };
   }
 
   /**
    * Carries a stopped Claude chat on in a new agent on this host's OpenCode, when that's the chosen
    * destination and every Claude account is out. OpenCode is a harness, not an account provider, so
    * the new agent gets no account binding. Its model, thinking option, and mode all come from this
-   * host's catalog and stay no freer than the original; anything else refuses the fork.
+   * host's catalog and match the original's permission tier; OpenCode's own permission policy applies
+   * and can allow more than Claude does. Anything else refuses the fork.
    */
-  private async forkToOpenCode(
-    paseo: PaseoApi,
-    agentId: string,
-    timeline: readonly AgentTimelineItem[] | undefined,
-    source: "auto" | "user" = "auto",
-  ): Promise<ForkOutcome> {
-    // Prompting the original again while it's still out mustn't start a second copy of the work.
-    const earlier = (await listAgents(paseo, false)).agents.find(
-      (agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER,
-    );
-    if (earlier) {
-      return {
-        fork: { agentId: earlier.id, title: earlier.title ?? `${OPENCODE_LABEL} agent` },
-        to: OPENCODE_LABEL,
-        toFamily: null,
-        toProvider: OPENCODE_PROVIDER,
-      };
-    }
+  private forkToOpenCode(paseo: PaseoApi, agentId: string, source: "auto" | "user" = "auto"): Promise<ForkOutcome> {
+    // One handoff at a time per source; a concurrent duplicate gets the first call's result. There is
+    // no atomic compare-and-send in the SDK: this guard plus the fresh checks below are the bounds.
+    const existing = this.openCodeForkInFlight.get(agentId);
+    if (existing) return existing;
+    const task = this.forkToOpenCodeNow(paseo, agentId, source).finally(() => this.openCodeForkInFlight.delete(agentId));
+    this.openCodeForkInFlight.set(agentId, task);
+    return task;
+  }
 
+  private async forkToOpenCodeNow(paseo: PaseoApi, agentId: string, source: "auto" | "user"): Promise<ForkOutcome> {
     const available = (await paseo.providers.listAvailable()).providers?.some(
       (entry) => entry.provider === OPENCODE_PROVIDER && entry.available,
     );
     if (!available) return { skipped: `${OPENCODE_LABEL} isn't available in Paseo on this host.` };
 
+    const original = (await paseo.agents.ref(agentId).refresh())?.agent;
+    if (!original) throw new Error("That agent is no longer available.");
+    if (!ready(original)) {
+      return { skipped: "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode." };
+    }
+
+    const record = (await this.store.read()).opencodeForks[agentId];
+    // Prompting the original again while it's still out must reuse its fork, not start a second one.
+    const forkId =
+      record?.forkAgentId ??
+      (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER)?.id;
+    if (!forkId) return this.createOpenCodeFork(paseo, agentId, original, source);
+
+    let fork = (await paseo.agents.ref(forkId).refresh())?.agent;
+    // Reconcile a reservation an earlier call left behind, before anything else happens.
+    if (record?.pending) {
+      const pending = record.pending;
+      if (pending.stage === "creating") {
+        if (fork && !fork.archivedAt && !fork.lastUserMessageAt) {
+          // Created but never prompted: deliver the reserved initial handoff under its reserved ID.
+          return this.deliverReservedOpenCode(paseo, agentId, fork, source);
+        }
+        if (!fork) {
+          // The target vanished before anything was sent: retry the identical promptless create.
+          return this.retryReservedCreate(paseo, agentId, pending, source);
+        }
+        if (fork.archivedAt) {
+          // Nothing was sent, so dropping the reservation cannot duplicate work.
+          await this.store.update((draft) => { delete draft.opencodeForks[agentId]; });
+          return this.createOpenCodeFork(paseo, agentId, original, source);
+        }
+        return {
+          skipped: `The unstarted OpenCode fork “${fork.title ?? OPENCODE_LABEL}” received another message. Check it and archive it before retrying.`,
+        };
+      }
+      if (!fork || fork.archivedAt) {
+        // An unresolved send is never dropped because its target is archived or gone: archival is not
+        // proof nothing was delivered. Keep the reservation and say so.
+        return this.openCodeUncertain(forkId, fork?.title, pending.messageId);
+      }
+      if (pending.sentDigest !== undefined && (await this.hasReceipt(paseo, forkId, pending.messageId, pending.sentDigest))) {
+        await this.settleOpenCode(agentId, pending.messageId);
+        fork = (await paseo.agents.ref(forkId).refresh())?.agent;
+        delete record.pending;
+      } else {
+        return this.openCodeUncertain(forkId, fork.title, pending.messageId);
+      }
+    }
+
+    if (!fork) {
+      // A settled fork that is gone or archived may be replaced by a new one.
+      return this.createOpenCodeFork(paseo, agentId, original, source);
+    }
+    if (!record?.seen) {
+      // A fork from an earlier release, or one without a checkpoint: what it has can't be proven,
+      // so nothing is sent and nothing is adopted silently.
+      return this.openCodeFound(fork);
+    }
+    // Fresh checks before sending: same place, same parent, not working, nobody waiting on it.
+    const expectedParent = await this.continuations.parentFor(paseo, agentId);
+    if (
+      fork.provider !== OPENCODE_PROVIDER || !samePlace(original, fork) || busy(fork) || fork.pendingPermissions?.length ||
+      fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent
+    ) {
+      return {
+        skipped: "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.",
+      };
+    }
+    return this.updateOpenCodeFork(paseo, agentId, fork, record.seen);
+  }
+
+  /** A found fork with no provable checkpoint: link it, send nothing. */
+  private openCodeFound(fork: { id: string; title?: string | null }): ForkOutcome {
+    return {
+      fork: { agentId: fork.id, title: fork.title ?? `${OPENCODE_LABEL} agent` },
+      to: OPENCODE_LABEL,
+      toFamily: null,
+      toProvider: OPENCODE_PROVIDER,
+      delivery: "found",
+      detail: FOUND_DETAIL,
+    };
+  }
+
+  /** An unconfirmed handoff: the reservation stays, the row links the fork, nothing is claimed. */
+  private openCodeUncertain(forkId: string, title: string | null | undefined, messageId: string): ForkOutcome {
+    return {
+      fork: { agentId: forkId, title: title ?? `${OPENCODE_LABEL} agent` },
+      to: OPENCODE_LABEL,
+      toFamily: null,
+      toProvider: OPENCODE_PROVIDER,
+      delivery: "found",
+      detail: uncertainDetail(title ?? `${OPENCODE_LABEL} agent`, messageId),
+    };
+  }
+
+  /** Whether the fork's timeline proves this exact message arrived, by ID or by marker plus digest. */
+  private async hasReceipt(paseo: PaseoApi, forkId: string, messageId: string, digest: string): Promise<boolean> {
+    const page = await paseo.agents.ref(forkId).timeline.refetch({ direction: "tail", limit: 500, projection: "canonical" });
+    return page.entries.some((entry) => matchesTransfer(entry, messageId, digest));
+  }
+
+  /** Records what the fork has seen once its receipt matched, clearing the reservation. */
+  private async settleOpenCode(agentId: string, messageId: string): Promise<void> {
+    await this.store.update((draft) => {
+      const record = draft.opencodeForks[agentId];
+      if (record?.pending?.messageId === messageId) {
+        record.seen = record.pending.seen;
+        delete record.pending;
+      }
+    });
+  }
+
+  /** Sends the source's newest instructions to an existing OpenCode fork, once, under one message ID. */
+  private async updateOpenCodeFork(paseo: PaseoApi, agentId: string, fork: { id: string; title?: string | null }, seen: TimelineMark): Promise<ForkOutcome> {
+    let delta: Awaited<ReturnType<typeof readUpdates>>;
+    try {
+      delta = await readUpdates(paseo, agentId, seen);
+    } catch {
+      // A gap means what the fork has can't be proven; refuse honestly instead of guessing.
+      return this.openCodeFound(fork);
+    }
+    // Only this plugin's own message IDs mark a transfer receipt: prose that merely looks like a
+    // handoff is an instruction like any other.
+    const items = delta.entries
+      .filter((entry) => !(entry.item.type === "user_message" && entry.item.clientMessageId?.startsWith(MESSAGE_PREFIX)))
+      .map((entry) => entry.item);
+    if (!items.length) {
+      return {
+        fork: { agentId: fork.id, title: fork.title ?? `${OPENCODE_LABEL} agent` },
+        to: OPENCODE_LABEL,
+        toFamily: null,
+        toProvider: OPENCODE_PROVIDER,
+        delivery: "up-to-date",
+        detail: UP_TO_DATE_DETAIL,
+      };
+    }
+    const instructions = fitInstructions(items.filter((item) => item.type === "user_message").map((item) => item.text));
+    const progress = buildTranscript(items.filter((item) => item.type !== "user_message"));
+    const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
+    const prompt = updatePrompt(instructions, progress, PROVIDER_NAME.claude, transferMarker(messageId));
+    // Reserved before any send: an uncertain dispatch must never send a second copy.
+    await this.store.update((draft) => {
+      const record = draft.opencodeForks[agentId] ?? { forkAgentId: fork.id };
+      record.pending = { stage: "sending", targetId: fork.id, messageId, seen: delta.mark, sentDigest: sentDigestOf(prompt) };
+      draft.opencodeForks[agentId] = record;
+    });
+    await paseo.agents.ref(fork.id).send(prompt, { messageId });
+    return this.confirmOpenCode(paseo, agentId, fork, messageId);
+  }
+
+  /**
+   * Starts a fresh OpenCode fork: reserve the target and its create request, create promptless, then
+   * deliver the initial handoff under the reserved message ID.
+   */
+  private async createOpenCodeFork(paseo: PaseoApi, agentId: string, original: Agent, source: "auto" | "user"): Promise<ForkOutcome> {
     const { models } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     const savedModel = this.prefs.forkOpenCodeModel;
     const model = savedModel ? models?.find((entry) => entry.id === savedModel) : models?.find((entry) => entry.isDefault);
@@ -1181,8 +1356,6 @@ export class Service {
       return { skipped: `“${model.label}” no longer offers the saved thinking option. Pick one in ZeroSub's settings.` };
     }
 
-    const original = (await paseo.agents.ref(agentId).refresh())?.agent;
-    if (!original) throw new Error("That agent is no longer available.");
     const [sourceModes, targetModes] = await Promise.all([
       paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
       paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
@@ -1195,12 +1368,38 @@ export class Service {
       };
     }
 
-    const fork = await continueInNewAgent({
+    let delta: Awaited<ReturnType<typeof readUpdates>>;
+    try {
+      delta = await readUpdates(paseo, agentId);
+    } catch {
+      return { skipped: HISTORY_GAP_DETAIL };
+    }
+
+    const targetId = randomUUID();
+    const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
+    await this.store.update((draft) => {
+      draft.opencodeForks[agentId] = {
+        forkAgentId: targetId,
+        pending: {
+          stage: "creating",
+          targetId,
+          messageId,
+          seen: delta.mark,
+          config: {
+            provider: `${OPENCODE_PROVIDER}/${model.id}`,
+            modeId,
+            ...(thinking ? { thinkingOptionId: thinking } : {}),
+          },
+        },
+      };
+    });
+    await continueInNewAgent({
       paseo,
       sourceAgentId: agentId,
-      timeline,
       why: source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode",
       previous: PROVIDER_NAME.claude,
+      agentId: targetId, // also the create's idempotency key, so a retried create can't double it
+      deferPrompt: true,
       target: {
         provider: OPENCODE_PROVIDER,
         label: OPENCODE_LABEL,
@@ -1211,12 +1410,88 @@ export class Service {
       parentId: await this.continuations.parentFor(paseo, agentId),
       bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
     });
-    console.log(`[ZeroSub] ${agentId} continues on ${OPENCODE_LABEL} (${model.id}) in ${fork.agentId}`);
-    return { fork, to: OPENCODE_LABEL, toFamily: null, toProvider: OPENCODE_PROVIDER };
+    const fork = (await paseo.agents.ref(targetId).refresh())?.agent;
+    if (!fork) return this.openCodeUncertain(targetId, null, messageId);
+    return this.deliverReservedOpenCode(paseo, agentId, fork, source);
+  }
+
+  /** A lost create acknowledgement: repeat the identical promptless create from the stored config. */
+  private async retryReservedCreate(
+    paseo: PaseoApi,
+    agentId: string,
+    pending: NonNullable<OpenCodeFork["pending"]>,
+    source: "auto" | "user",
+  ): Promise<ForkOutcome> {
+    const config = pending.config;
+    if (!config) return this.openCodeUncertain(pending.targetId, null, pending.messageId);
+    const model = config.provider.slice(OPENCODE_PROVIDER.length + 1);
+    await continueInNewAgent({
+      paseo,
+      sourceAgentId: agentId,
+      why: source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode",
+      previous: PROVIDER_NAME.claude,
+      agentId: pending.targetId,
+      deferPrompt: true,
+      target: {
+        provider: OPENCODE_PROVIDER,
+        label: OPENCODE_LABEL,
+        modeId: config.modeId,
+        model,
+        ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
+      },
+      parentId: await this.continuations.parentFor(paseo, agentId),
+      bind: async () => {},
+    });
+    const fork = (await paseo.agents.ref(pending.targetId).refresh())?.agent;
+    if (!fork) return this.openCodeUncertain(pending.targetId, null, pending.messageId);
+    return this.deliverReservedOpenCode(paseo, agentId, fork, source);
+  }
+
+  /** Sends the reserved initial handoff to a created promptless fork, under its reserved message ID. */
+  private async deliverReservedOpenCode(paseo: PaseoApi, agentId: string, fork: { id: string; title?: string | null }, source: "auto" | "user"): Promise<ForkOutcome> {
+    const pending = (await this.store.read()).opencodeForks[agentId]?.pending;
+    if (!pending || pending.stage !== "creating") {
+      throw new Error("The OpenCode fork's reservation changed during the handoff. Check the fork's chat and retry.");
+    }
+    let delta: Awaited<ReturnType<typeof readUpdates>>;
+    try {
+      delta = await readUpdates(paseo, agentId);
+    } catch {
+      return { skipped: HISTORY_GAP_DETAIL };
+    }
+    const why = source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode";
+    const prompt = [continuationPrompt(buildTranscript(delta.entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(pending.messageId)].join("\n");
+    await this.store.update((draft) => {
+      const record = draft.opencodeForks[agentId];
+      if (record?.pending?.messageId === pending.messageId) {
+        record.pending.stage = "sending";
+        record.pending.seen = delta.mark;
+        record.pending.sentDigest = sentDigestOf(prompt);
+      }
+    });
+    await paseo.agents.ref(fork.id).send(prompt, { messageId: pending.messageId });
+    return this.confirmOpenCode(paseo, agentId, fork, pending.messageId);
+  }
+
+  /** Checks the fork's timeline for the reserved message; a match settles, anything else stays reserved. */
+  private async confirmOpenCode(paseo: PaseoApi, agentId: string, fork: { id: string; title?: string | null }, messageId: string): Promise<ForkOutcome> {
+    const pending = (await this.store.read()).opencodeForks[agentId]?.pending;
+    if (pending?.stage === "sending" && pending.messageId === messageId && pending.sentDigest !== undefined &&
+      (await this.hasReceipt(paseo, fork.id, messageId, pending.sentDigest))) {
+      await this.settleOpenCode(agentId, messageId);
+      return {
+        fork: { agentId: fork.id, title: fork.title ?? `${OPENCODE_LABEL} agent` },
+        to: OPENCODE_LABEL,
+        toFamily: null,
+        toProvider: OPENCODE_PROVIDER,
+        delivery: "sent",
+      };
+    }
+    return this.openCodeUncertain(fork.id, fork.title, messageId);
   }
 
   /** "Continue on …" from an agent's account button: the same fork, asked for by the user. */
-  async forkAgent(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation> {
+  async forkAgent(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery }> {
     return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId, destination));
   }
 
@@ -1231,7 +1506,7 @@ export class Service {
     }
   }
 
-  private async forkAgentNow(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation> {
+  private async forkAgentNow(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery }> {
     this.attach(paseo);
     const info = await agentInfo(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
@@ -1243,7 +1518,7 @@ export class Service {
     let result: ForkOutcome;
     if (destination === "opencode") {
       if (family !== "claude") throw new Error("Only Claude agents can continue on OpenCode.");
-      result = await this.forkToOpenCode(paseo, agentId, undefined, "user");
+      result = await this.forkToOpenCode(paseo, agentId, "user");
     } else {
       result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
     }
@@ -1255,15 +1530,15 @@ export class Service {
       to: result.to,
       reason: "manual",
       resetsAt: null,
-      continued: true,
+      continued: result.delivery === "sent",
       continuedIn: result.fork,
       toFamily: result.toFamily,
       toProvider: result.toProvider,
-      outcome: "continued",
-      detail: null,
+      outcome: result.delivery === "sent" ? "continued" : "stayed",
+      detail: result.detail ?? null,
       at: new Date().toISOString(),
     });
-    return result.fork;
+    return { ...result.fork, delivery: result.delivery };
   }
 
   private async continueElsewhere(

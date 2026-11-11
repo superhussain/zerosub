@@ -116,7 +116,15 @@ export const setAccountEnabled = defineRpc({
 export const forkAgent = defineRpc({
   name: "zerosub.agents.fork",
   input: z.object({ agentId: z.string(), destination: z.enum(["other", "opencode"]).default("other") }),
-  output: z.object({ agentId: z.string(), title: z.string() }),
+  output: z.object({
+    agentId: z.string(),
+    title: z.string(),
+    /**
+     * Whether the conversation was delivered: `sent` and confirmed, `up-to-date` (nothing new to
+     * send), or `found` (an existing continuation without a provable checkpoint; nothing was sent).
+     */
+    delivery: z.enum(["sent", "up-to-date", "found"]).default("sent"),
+  }),
 });
 
 export const setAgentAccount = defineRpc({
