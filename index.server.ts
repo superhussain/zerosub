@@ -83,7 +83,7 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(redeemReset, ({ accountId, agentId }, { paseo }) => service.redeem(paseo, accountId, agentId));
   server.handle(setAgentAccount, ({ agentId, accountId }, { paseo }) => service.setAgentAccount(paseo, agentId, accountId));
-  server.handle(forkAgent, ({ agentId }, { paseo }) => service.forkAgent(paseo, agentId));
+  server.handle(forkAgent, ({ agentId, destination }, { paseo }) => service.forkAgent(paseo, agentId, destination));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
 
   return async () => {

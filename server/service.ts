@@ -747,7 +747,7 @@ export class Service {
         // the host's OpenCode, when a stopped Claude chat was pointed there in the settings.
         const toOpenCode = family === "claude" && this.prefs.claudeForkDestination === "opencode";
         const result = await (toOpenCode
-          ? this.forkToOpenCode(paseo, agentId, timeline)
+          ? this.forkToOpenCode(paseo, agentId, timeline, "auto")
           : this.forkToOtherProvider(paseo, agentId, family, timeline, "auto")
         ).catch((error: unknown) => ({
           skipped: `Couldn't continue on ${toOpenCode ? OPENCODE_LABEL : FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
@@ -1149,6 +1149,7 @@ export class Service {
     paseo: PaseoApi,
     agentId: string,
     timeline: readonly AgentTimelineItem[] | undefined,
+    source: "auto" | "user" = "auto",
   ): Promise<ForkOutcome> {
     // Prompting the original again while it's still out mustn't start a second copy of the work.
     const earlier = (await listAgents(paseo, false)).agents.find(
@@ -1198,7 +1199,7 @@ export class Service {
       paseo,
       sourceAgentId: agentId,
       timeline,
-      why: "every Claude account reached its usage limit",
+      why: source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode",
       previous: PROVIDER_NAME.claude,
       target: {
         provider: OPENCODE_PROVIDER,
@@ -1215,8 +1216,8 @@ export class Service {
   }
 
   /** "Continue on …" from an agent's account button: the same fork, asked for by the user. */
-  async forkAgent(paseo: PaseoApi, agentId: string): Promise<Continuation> {
-    return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId));
+  async forkAgent(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation> {
+    return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId, destination));
   }
 
   /** Manual continuations share the automatic failover guard, including cross-provider forks. */
@@ -1230,7 +1231,7 @@ export class Service {
     }
   }
 
-  private async forkAgentNow(paseo: PaseoApi, agentId: string): Promise<Continuation> {
+  private async forkAgentNow(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation> {
     this.attach(paseo);
     const info = await agentInfo(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
@@ -1239,7 +1240,13 @@ export class Service {
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
-    const result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+    let result: ForkOutcome;
+    if (destination === "opencode") {
+      if (family !== "claude") throw new Error("Only Claude agents can continue on OpenCode.");
+      result = await this.forkToOpenCode(paseo, agentId, undefined, "user");
+    } else {
+      result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+    }
     if ("skipped" in result) throw new Error(result.skipped);
     const state = await this.store.read();
     await this.appendRow(paseo, agentId, {
