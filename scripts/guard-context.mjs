@@ -6,11 +6,8 @@
 
 import { execFileSync } from "node:child_process";
 
-const git = (args) =>
-  execFileSync("git", args, { encoding: "utf8" })
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+const git = (args) => execFileSync("git", args, { encoding: "utf8" });
+const paths = (args) => git(args).split("\0").filter(Boolean);
 
 const inContext = (path) => path === ".context" || path.startsWith(".context/");
 
@@ -19,14 +16,14 @@ if (mode === "--history") {
   const base = process.argv[3] ?? "origin/main";
   let commits;
   try {
-    commits = git(["rev-list", `${base}..HEAD`]);
+    commits = git(["rev-list", `${base}..HEAD`]).split("\n").map((line) => line.trim()).filter(Boolean);
   } catch {
     console.error(`guard:context: couldn't list commits since ${base}; run from a clone of the repository.`);
     process.exit(1);
   }
   const bad = new Set();
   for (const commit of commits) {
-    for (const path of git(["ls-tree", "-r", "--name-only", commit])) {
+    for (const path of paths(["ls-tree", "-z", "-r", "--name-only", commit])) {
       if (inContext(path)) bad.add(path);
     }
   }
@@ -39,7 +36,7 @@ if (mode === "--history") {
 }
 
 if (mode === undefined) {
-  const bad = git(["ls-files"]).filter(inContext); // tracked or staged: the index is the truth here
+  const bad = paths(["ls-files", "-z"]).filter(inContext); // tracked or staged: the index is the truth here
   if (bad.length > 0) {
     console.error("guard:context: .context paths are tracked or staged. Remove them from the index; never commit local scratch:");
     for (const path of bad) console.error("  " + path);

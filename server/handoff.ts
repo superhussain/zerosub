@@ -83,14 +83,22 @@ function describeTool(item: Extract<AgentTimelineItem, { type: "tool_call" }>): 
 export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MAX_TRANSCRIPT): string {
   const lines: string[] = [];
   let firstUser: string | null = null;
+  let firstUserIndex: number | null = null;
+  let latestUser: string | null = null;
+  let latestUserIndex: number | null = null;
   let todos: string | null = null;
   for (const item of timeline) {
     switch (item.type) {
       case "user_message": {
         // Clipping below can't then split a quoted pair: the prompt's own tags are the only ones.
         const text = neutralise(shortenEarlierHandOff(item.text));
-        if (firstUser === null) firstUser = clip(text, MAX_FIRST_MESSAGE);
-        lines.push(`User: ${text.trim()}`);
+        if (firstUser === null) {
+          firstUser = clip(text, MAX_FIRST_MESSAGE);
+          firstUserIndex = lines.length;
+        }
+        latestUser = text.trim();
+        latestUserIndex = lines.length;
+        lines.push(`User: ${latestUser}`);
         break;
       }
       case "assistant_message":
@@ -108,11 +116,15 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
   }
   let body = lines.join("\n\n");
   if (body.length > max) {
-    const tail = body.slice(body.length - max);
+    const keepLatest = latestUserIndex !== firstUserIndex && latestUser !== null;
+    const progress = (keepLatest ? lines.filter((_, index) => index !== latestUserIndex) : lines).join("\n\n");
+    const tail = progress.slice(progress.length - max);
     const start = tail.indexOf("\n\n");
-    body = `${firstUser ? `User (original request): ${firstUser}\n\n` : ""}[… earlier conversation omitted …]\n\n${
-      start >= 0 ? tail.slice(start + 2) : tail
-    }`;
+    const latest =
+      keepLatest && latestUser !== null
+        ? `User (latest instruction): ${clip(latestUser, MAX_FIRST_MESSAGE)}\n\n`
+        : "";
+    body = `${firstUser ? `User (original request): ${firstUser}\n\n` : ""}${latest}[… earlier conversation omitted …]\n\n${start >= 0 ? tail.slice(start + 2) : tail}`;
   }
   return todos ? `${body}\n\nTask list at the time it stopped:\n${todos}` : body;
 }

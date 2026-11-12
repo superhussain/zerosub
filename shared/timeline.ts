@@ -42,6 +42,8 @@ export const SwitchRowSchema = z.object({
    * `reset`: a banked reset refilled `from`, and the agent stayed on it.
    */
   outcome: z.enum(["switched", "pending", "continued", "stayed", "reset"]).default("switched"),
+  /** Delivery state for a fork row. Undefined retains the pre-delivery-status rendering. */
+  delivery: z.enum(["sent", "up-to-date", "found", "uncertain"]).optional(),
   detail: z.string().nullable().default(null),
   at: z.string(),
 });

@@ -81,6 +81,11 @@ export const OpenCodeForkSchema = z.object({
           provider: z.string(),
           modeId: z.string(),
           thinkingOptionId: z.string().optional(),
+          /** Original request identity and location, frozen so a retry cannot create a different target. */
+          workspaceId: z.string().nullable().optional(),
+          cwd: z.string().nullable().optional(),
+          parentId: z.string().nullable().optional(),
+          title: z.string().optional(),
         })
         .optional(),
       /** SHA-256 of the exact sent text, so a receipt survives a provider reload. */

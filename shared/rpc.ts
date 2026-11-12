@@ -121,9 +121,10 @@ export const forkAgent = defineRpc({
     title: z.string(),
     /**
      * Whether the conversation was delivered: `sent` and confirmed, `up-to-date` (nothing new to
-     * send), or `found` (an existing continuation without a provable checkpoint; nothing was sent).
+     * send), `found` (an existing continuation without a provable checkpoint; nothing was sent),
+     * or `uncertain` (a previous handoff has no trustworthy receipt; nothing more was sent).
      */
-    delivery: z.enum(["sent", "up-to-date", "found"]).default("sent"),
+    delivery: z.enum(["sent", "up-to-date", "found", "uncertain"]).default("sent"),
   }),
 });
 

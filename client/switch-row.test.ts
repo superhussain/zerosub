@@ -59,6 +59,35 @@ describe("describing a switch row", () => {
     );
   });
 
+  it.each([
+    [
+      "up-to-date",
+      "The work is already up to date in “Fix the build (continued on OpenCode)” on OpenCode; ZeroSub sent nothing new. DETAIL",
+    ],
+    [
+      "found",
+      "ZeroSub found the existing OpenCode continuation “Fix the build (continued on OpenCode)” but couldn't tell what it has received. Nothing was sent; open that chat to check it against the latest instructions. DETAIL",
+    ],
+    [
+      "uncertain",
+      "ZeroSub couldn't confirm its last handoff to “Fix the build (continued on OpenCode)”. Nothing more was sent; open that chat before retrying. DETAIL",
+    ],
+  ] as const)("describes a %s fork without claiming it continued", (delivery, expected) => {
+    const note = describeRow(
+      row({
+        reason: "manual",
+        to: "OpenCode",
+        toProvider: "opencode",
+        continuedIn: { agentId: "fork-2", title: "Fix the build (continued on OpenCode)" },
+        outcome: "stayed",
+        delivery,
+        detail: "DETAIL",
+      }),
+    );
+    expect(note).toBe(expected);
+    expect(note).not.toContain("in a new agent");
+  });
+
   it("keeps a refused fork a stayed row that says why", () => {
     const note = describeRow(
       row({

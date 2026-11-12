@@ -646,12 +646,23 @@ export function matchesTransfer(entry: { item: AgentTimelineItem; turnId?: strin
     digestOf(entry.item.text) === digest;
 }
 
+export class UnresolvableEpochError extends Error {}
+
 /** Canonical sequence cursors avoid re-sending projected messages that merge across a watermark. */
-export async function readUpdates(paseo: PaseoApi, agentId: string, since?: Mark, receiptId?: string) {
+export async function readUpdates(
+  paseo: PaseoApi,
+  agentId: string,
+  since?: Mark,
+  receiptId?: string,
+  options: { onEpochReset?: "replay" | "unresolvable" } = {},
+) {
   const timeline = paseo.agents.ref(agentId).timeline;
   let page = await timeline.refetch({ direction: "tail", limit: 500, projection: "canonical" });
   if (page.gap || page.staleCursor) throw new Error("The task's handoff history has a gap. Check its timeline before continuing.");
   const mark = { epoch: page.epoch, seq: page.window.maxSeq };
+  if (since && since.epoch !== page.epoch && options.onEpochReset === "unresolvable") {
+    throw new UnresolvableEpochError("The source timeline epoch changed, so its unread history can't be determined.");
+  }
   const after = since?.epoch === page.epoch ? since.seq : -1;
   const entries = [...page.entries];
   const foundReceipt = () => receiptId !== undefined && entries.some((entry) => delivered(entry, receiptId));

@@ -33,6 +33,17 @@ function isFork(row: SwitchRow): boolean {
 
 export function describeRow(row: SwitchRow): string {
   if (isFork(row) && row.continuedIn) {
+    const title = row.continuedIn.title;
+    const detail = row.detail ? ` ${row.detail}` : "";
+    if (row.delivery === "up-to-date") {
+      return `The work is already up to date in “${title}” on ${row.to}; ZeroSub sent nothing new.${detail}`;
+    }
+    if (row.delivery === "found") {
+      return `ZeroSub found the existing OpenCode continuation “${title}” but couldn't tell what it has received. Nothing was sent; open that chat to check it against the latest instructions.${detail}`;
+    }
+    if (row.delivery === "uncertain") {
+      return `ZeroSub couldn't confirm its last handoff to “${title}”. Nothing more was sent; open that chat before retrying.${detail}`;
+    }
     const reset = formatResetIn(row.resetsAt);
     const lead =
       row.reason === "exhausted"
@@ -40,7 +51,7 @@ export function describeRow(row: SwitchRow): string {
         : "The work";
     const destination = row.toProvider ? row.to : (row.toFamily ? FAMILY_LABEL[row.toFamily] : row.to);
     // A fork to the other provider moved to an account; an OpenCode fork has none to name.
-    return `${lead} continues on ${destination} in a new agent: “${row.continuedIn.title}”${row.toProvider ? "." : ` (${row.to}).`}`;
+    return `${lead} continues on ${destination} in a new agent: “${title}”${row.toProvider ? "." : ` (${row.to}).`}${detail}`;
   }
   if (row.reason === "exhausted") {
     const reset = formatResetIn(row.resetsAt);

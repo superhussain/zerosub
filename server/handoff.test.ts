@@ -88,6 +88,20 @@ describe("quoting an earlier hand-off", () => {
   });
 });
 
+describe("clipping a transcript", () => {
+  it("keeps the latest stop instruction ahead of omitted progress", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      user("STOP, DO NOT MODIFY ANYTHING"),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+    ]);
+    expect(transcript).toContain("User (original request): Fix the build");
+    expect(transcript).toContain("User (latest instruction): STOP, DO NOT MODIFY ANYTHING");
+    expect(transcript).toContain("[… earlier conversation omitted …]");
+    expect(transcript.indexOf("STOP, DO NOT MODIFY ANYTHING")).toBeLessThan(transcript.indexOf("[… earlier conversation omitted …]"));
+  });
+});
+
 describe("starting the new agent", () => {
   /** A source agent, a sub-agent of `lead`, and the creates Paseo receives for its continuation. */
   function fake(workspaceId?: string) {
