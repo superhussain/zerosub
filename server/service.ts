@@ -174,6 +174,7 @@ const MODE_REFUSAL =
   "This agent or its OpenCode continuation changed mode, so the continuation could allow more than this agent now does. Nothing was sent; check both chats before retrying.";
 const HOLD_REFUSAL =
   "ZeroSub's record of what it sent to OpenCode for this agent is damaged or incomplete, so it can't tell whether a continuation already has this work. Nothing was sent. Check this agent's OpenCode chats; to start a new continuation anyway, choose Continue on OpenCode again.";
+const SOURCE_BUSY_REFUSAL = "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode.";
 const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
 
 /** The conversation a handoff carries: no plugin rows, and none of our own handoff prompts. */
@@ -1298,9 +1299,7 @@ export class Service {
     // turn_ended can arrive just before the source reports idle: an automatic fork waits a moment,
     // refusing if a newer message arrives meanwhile.
     const original = source === "auto" ? await waitForSource(paseo, first, "auto").catch(() => undefined) : first;
-    if (!original || !ready(original)) {
-      return { skipped: "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode." };
-    }
+    if (!original || !ready(original)) return { skipped: SOURCE_BUSY_REFUSAL };
 
     const recordRead = await this.store.read();
     let record = recordRead.opencodeForks[agentId];
@@ -1531,6 +1530,13 @@ export class Service {
         const record = draft.opencodeForks[agentId];
         if (record) record.seen = delta.mark;
       });
+      // Input can land while the watermark is saved. The mark stays where it was inspected, and
+      // "up to date" holds only if the source still has nothing newer and is still stopped.
+      const since = await this.sourceSince(paseo, agentId, delta.mark);
+      if (since === "newer") return { skipped: NEWER_REFUSAL };
+      if (since !== "same") return this.openCodeFound(fork, since === "epoch" ? FOUND_DETAIL : HISTORY_GAP_DETAIL);
+      const now = (await paseo.agents.ref(agentId).refresh())?.agent;
+      if (!now || !ready(now)) return { skipped: SOURCE_BUSY_REFUSAL };
       return {
         fork: { agentId: fork.id, title: forkRef(fork) },
         to: OPENCODE_LABEL,

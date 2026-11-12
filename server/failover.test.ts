@@ -835,6 +835,58 @@ describe("forking to the other provider", () => {
       });
     });
 
+    /** A settled fork whose source gained only a plugin note, with `act` run once as its watermark is saved. */
+    const duringWatermarkWrite = async (act: (setup: Awaited<ReturnType<typeof setUpFork>>) => void) => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "plugin", id: "external-note", pluginId: "synthetic", kind: "note", version: 1, data: {} });
+      const inspected = setup.timelines.get(AGENT)!.at(-1)!.seqEnd;
+      const save = setup.store.update.bind(setup.store);
+      let done = false;
+      setup.store.update = async (change) => {
+        const next = await save(change);
+        if (!done && next.opencodeForks[AGENT]?.seen?.seq === inspected) {
+          done = true;
+          act(setup);
+        }
+        return next;
+      };
+      return { setup, inspected };
+    };
+
+    it("reports an instruction that arrives while an empty update's watermark is saved, then sends it once", async () => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) =>
+        setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2"));
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual({ epoch: "epoch-1", seq: inspected });
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("Now also update the CHANGELOG");
+      expect(setup.created).toHaveLength(0);
+    });
+
+    it("refuses up-to-date when the source starts working while the watermark is saved", async () => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) => { setup.byId.get(AGENT)!.status = "running"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/working or waiting for permission/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(inspected);
+    });
+
+    it.each([
+      ["a history gap", "gap", /couldn't read this agent's handoff history/],
+      ["an epoch reset", "epoch", /couldn't tell what it has already received/],
+    ])("calls %s while the watermark is saved an inspection, not up-to-date", async (_, kind, detail) => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) => {
+        if (kind === "gap") setup.gap.source = true;
+        else setup.setSourceEpoch("epoch-2");
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("found");
+      expect(setup.notes.at(-1)?.detail).toMatch(detail);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(inspected);
+    });
+
     it("advances past plugin-only notes without sending an empty update or feeding a repeat", async () => {
       const setup = await setUpReuse({}, { seen: MARK });
       setup.addTurn(AGENT, {
