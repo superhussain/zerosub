@@ -89,7 +89,7 @@ describe("quoting an earlier hand-off", () => {
 });
 
 describe("clipping a transcript", () => {
-  it("keeps the latest stop instruction ahead of omitted progress", () => {
+  it("keeps the latest stop instruction last, after the omitted progress", () => {
     const transcript = buildTranscript([
       user("Fix the build"),
       user("STOP, DO NOT MODIFY ANYTHING"),
@@ -98,7 +98,49 @@ describe("clipping a transcript", () => {
     expect(transcript).toContain("User (original request): Fix the build");
     expect(transcript).toContain("User (latest instruction): STOP, DO NOT MODIFY ANYTHING");
     expect(transcript).toContain("[… earlier conversation omitted …]");
-    expect(transcript.indexOf("STOP, DO NOT MODIFY ANYTHING")).toBeLessThan(transcript.indexOf("[… earlier conversation omitted …]"));
+    expect(transcript.indexOf("STOP, DO NOT MODIFY ANYTHING")).toBeGreaterThan(
+      transcript.indexOf("[… earlier conversation omitted …]"),
+    );
+    // The summary reorders older progress around the latest instruction, so it can't claim a
+    // strictly oldest-first reading.
+    expect(continuationPrompt(transcript, "a limit")).not.toContain("oldest first");
+  });
+
+  it("keeps both ends of a long latest instruction", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+      user(`${"Check each step. ".repeat(600)}STOP, DO NOT MODIFY ANYTHING`),
+    ]);
+    const latest = transcript.slice(transcript.indexOf("User (latest instruction):"));
+    expect(latest).toContain("STOP, DO NOT MODIFY ANYTHING");
+    expect(latest).toContain("[… omitted …]");
+    expect(latest.length).toBeLessThan(6_200);
+  });
+
+  it("keeps the latest stop instruction after the older instructions and the todo snapshot", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+      user("CONTINUE EVERYTHING"),
+      { type: "todo", items: [{ text: "Ship it", completed: false }] },
+      user("STOP, DO NOT MODIFY ANYTHING"),
+    ]);
+    expect(transcript).toContain("User: CONTINUE EVERYTHING");
+    expect(transcript.indexOf("CONTINUE EVERYTHING")).toBeLessThan(transcript.indexOf("User (latest instruction): STOP"));
+    expect(transcript.indexOf("Task list at the time it stopped:")).toBeLessThan(
+      transcript.indexOf("User (latest instruction): STOP"),
+    );
+  });
+
+  it("keeps a terminal stop when the only user message is the latest one", () => {
+    const transcript = buildTranscript([
+      user(`${"Please do the work. ".repeat(400)}STOP, DO NOT MODIFY ANYTHING`),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+    ]);
+    expect(transcript).toMatch(/User \(original request\):[\s\S]*STOP, DO NOT MODIFY ANYTHING/);
+    expect(transcript).toContain("[… omitted …]");
+    expect(transcript).not.toContain("User (latest instruction):");
   });
 });
 

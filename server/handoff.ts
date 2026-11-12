@@ -93,7 +93,7 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
         // Clipping below can't then split a quoted pair: the prompt's own tags are the only ones.
         const text = neutralise(shortenEarlierHandOff(item.text));
         if (firstUser === null) {
-          firstUser = clip(text, MAX_FIRST_MESSAGE);
+          firstUser = text;
           firstUserIndex = lines.length;
         }
         latestUser = text.trim();
@@ -116,23 +116,26 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
   }
   let body = lines.join("\n\n");
   if (body.length > max) {
-    const keepLatest = latestUserIndex !== firstUserIndex && latestUser !== null;
-    const progress = (keepLatest ? lines.filter((_, index) => index !== latestUserIndex) : lines).join("\n\n");
+    // The latest user instruction is lifted out of the clipped middle: keepEnds keeps its request
+    // and its end (a final stop survives), and it goes last, after the older progress and the todo
+    // snapshot. When it is also the original request, the request header keeps both ends instead.
+    const onlyUser = latestUserIndex === firstUserIndex;
+    const progress = (latestUser !== null ? lines.filter((_, index) => index !== latestUserIndex) : lines).join("\n\n");
     const tail = progress.slice(progress.length - max);
     const start = tail.indexOf("\n\n");
-    const latest =
-      keepLatest && latestUser !== null
-        ? `User (latest instruction): ${clip(latestUser, MAX_FIRST_MESSAGE)}\n\n`
-        : "";
-    body = `${firstUser ? `User (original request): ${firstUser}\n\n` : ""}${latest}[… earlier conversation omitted …]\n\n${start >= 0 ? tail.slice(start + 2) : tail}`;
+    const older = `${firstUser ? `User (original request): ${onlyUser ? keepEnds(firstUser, MAX_FIRST_MESSAGE) : clip(firstUser, MAX_FIRST_MESSAGE)}\n\n` : ""}[… earlier conversation omitted …]\n\n${start >= 0 ? tail.slice(start + 2) : tail}`;
+    const withTodos = todos ? `${older}\n\nTask list at the time it stopped:\n${todos}` : older;
+    body = latestUser !== null && !onlyUser ? `${withTodos}\n\nUser (latest instruction): ${keepEnds(latestUser, MAX_FIRST_MESSAGE)}` : withTodos;
+  } else if (todos) {
+    body = `${body}\n\nTask list at the time it stopped:\n${todos}`;
   }
-  return todos ? `${body}\n\nTask list at the time it stopped:\n${todos}` : body;
+  return body;
 }
 
 export function continuationPrompt(transcript: string, why: string, previous = "Codex"): string {
   return [
     `This task is continuing from an earlier ${previous} session that stopped because ${why}.`,
-    "The working directory already contains every change that session made. Here is its conversation, oldest first:",
+    "The working directory already contains every change that session made. Here is its conversation:",
     "",
     OPEN,
     transcript,
@@ -196,7 +199,8 @@ export async function continueInNewAgent(options: {
   paseo: PaseoApi;
   sourceAgentId: string;
   timeline?: readonly AgentTimelineItem[];
-  why: string;
+  /** Why the session stopped; the first prompt names it. A promptless create needs none. */
+  why?: string;
   bind(agentId: string): Promise<void>;
   target?: ContinuationTarget;
   /** What to call the session that stopped, e.g. `Claude Code`. */
@@ -257,7 +261,9 @@ export async function continueInNewAgent(options: {
     ...(options.agentId ? { idempotencyKey: options.agentId } : {}),
     config,
     title,
-    ...(!options.deferPrompt ? { prompt: continuationPrompt(buildTranscript(timeline ?? []), options.why, options.previous) } : {}),
+    ...(!options.deferPrompt && options.why !== undefined
+      ? { prompt: continuationPrompt(buildTranscript(timeline ?? []), options.why, options.previous) }
+      : {}),
     labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
   };
   if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);

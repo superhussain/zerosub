@@ -86,6 +86,12 @@ export const OpenCodeForkSchema = z.object({
           cwd: z.string().nullable().optional(),
           parentId: z.string().nullable().optional(),
           title: z.string().optional(),
+          /**
+           * The exact generic reason the first prompt gave for this fork, frozen with it: a retry
+           * must rebuild the same prompt, whatever trigger the retry itself came from. Missing on
+           * reservations saved by earlier versions, which then stay uncertain rather than guess.
+           */
+          why: z.string().optional(),
         })
         .optional(),
       /** SHA-256 of the exact sent text, so a receipt survives a provider reload. */

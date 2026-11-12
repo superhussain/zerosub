@@ -88,6 +88,22 @@ describe("describing a switch row", () => {
     expect(note).not.toContain("in a new agent");
   });
 
+  it("points an uncertain fork row at the known agent ID when the target has no title", () => {
+    const note = describeRow(
+      row({
+        reason: "manual",
+        to: "OpenCode",
+        toProvider: "opencode",
+        continuedIn: { agentId: "fork-9", title: "OpenCode agent fork-9" },
+        outcome: "stayed",
+        delivery: "uncertain",
+        detail: null,
+      }),
+    );
+    expect(note).toContain("fork-9");
+    expect(note).not.toMatch(/continues on|opened|in a new agent/);
+  });
+
   it("keeps a refused fork a stayed row that says why", () => {
     const note = describeRow(
       row({

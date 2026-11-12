@@ -508,6 +508,9 @@ describe("forking to the other provider", () => {
       lastUserMessageAt: "2026-09-23T07:00:00.000Z",
       labels,
     };
+    /** Every timeline read, so tests can count how many pages a check needed. */
+    const timelineReads: Array<{ id: string; direction?: string }> = [];
+    const epochOf = (id: string) => (id === AGENT ? sourceEpoch : "epoch-1");
     const agents: Array<Record<string, unknown>> = [source, ...others];
     const byId = new Map(agents.map((agent) => [agent.id as string, agent]));
     const created: Array<{ agentId: string; idempotencyKey?: string; config: { provider: string; modeId?: string }; title: string; prompt?: string; labels: Record<string, string> }> = [];
@@ -527,8 +530,8 @@ describe("forking to the other provider", () => {
       rows.push({ item: entry, turnId: `turn-${++seq}`, seqEnd: ++seq });
       timelines.set(id, rows);
     };
-    /** Makes the next source read fail, as a history gap does. */
-    const gap = { source: false };
+    /** Makes the next source read fail, as a history gap does; `fork` gaps every other timeline. */
+    const gap = { source: false, fork: false };
     let sourceEpoch = "epoch-1";
     const modes: Record<string, Array<{ id: string; label: string; colorTier?: string }>> = {
       ...MODES,
@@ -586,17 +589,23 @@ describe("forking to the other provider", () => {
               notes.push(item.data);
               addTurn(id, { ...item, pluginId: "zerosub" } as AgentTimelineItem);
             },
-            refetch: async () => {
-              if (gap.source && id === AGENT) return { entries: [], gap: true, staleCursor: false, epoch: sourceEpoch, window: { maxSeq: 0 }, hasOlder: false, startCursor: null };
+            refetch: async (options: { direction?: string; cursor?: { epoch: string; seq: number } | null; limit?: number } = {}) => {
+              timelineReads.push({ id, direction: options.direction });
+              if ((gap.source && id === AGENT) || (gap.fork && id !== AGENT)) {
+                return { entries: [], gap: true, staleCursor: false, epoch: epochOf(id), window: { maxSeq: 0 }, hasOlder: false, startCursor: null };
+              }
               const rows = timelines.get(id) ?? [];
+              const limit = options.limit ?? 500;
+              const older = options.direction === "before" && options.cursor ? rows.filter((row) => row.seqEnd < options.cursor!.seq) : rows;
+              const page = older.slice(-limit);
               return {
-                entries: rows,
+                entries: page,
                 gap: false,
                 staleCursor: false,
-                epoch: id === AGENT ? sourceEpoch : "epoch-1",
+                epoch: epochOf(id),
                 window: { maxSeq: rows.reduce((max, row) => Math.max(max, row.seqEnd), 0) },
-                hasOlder: false,
-                startCursor: null,
+                hasOlder: older.length > page.length,
+                startCursor: page.length ? { epoch: epochOf(id), seq: page[0]!.seqEnd } : null,
               };
             },
           },
@@ -619,7 +628,7 @@ describe("forking to the other provider", () => {
         { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
         context,
       );
-    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; } };
+    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
   }
 
   it("carries the work on with the other provider, at the same permission level", async () => {
@@ -748,6 +757,7 @@ describe("forking to the other provider", () => {
       ...overrides,
     });
     const digestOf = (text: string) => createHash("sha256").update(text).digest("hex");
+    const whyOf = (source: "auto" | "user") => (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
     const CREATE_CONFIG = {
       provider: "opencode/opencode/glm-5p3-flash",
       modeId: "code",
@@ -756,11 +766,10 @@ describe("forking to the other provider", () => {
       cwd: null,
       parentId: null,
       title: "Fix the build (continued on OpenCode)",
+      why: whyOf("user"),
     };
-    const initialDigest = (source: "auto" | "user" = "user") => {
-      const why = source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode";
-      return digestOf([continuationPrompt(buildTranscript([]), why, "Claude Code"), `zerosub transfer ${RESERVED.messageId}`].join("\n"));
-    };
+    const initialDigest = (source: "auto" | "user" = "user") =>
+      digestOf([continuationPrompt(buildTranscript([]), whyOf(source), "Claude Code"), `zerosub transfer ${RESERVED.messageId}`].join("\n"));
     /** A harness with an existing, settled fork record and its live target agent. */
     const setUpReuse = async (fork: Record<string, unknown> = {}, record: Omit<OpenCodeFork, "forkAgentId"> = {}) => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
@@ -774,14 +783,15 @@ describe("forking to the other provider", () => {
       forkAgentId: RESERVED.targetId,
       pending,
     });
-    const reservedCreation = (sentDigest = initialDigest()): OpenCodeFork => seededPending({
-      stage: "creating",
-      targetId: RESERVED.targetId,
-      messageId: RESERVED.messageId,
-      seen: MARK,
-      config: CREATE_CONFIG,
-      sentDigest,
-    });
+    const reservedCreation = (source: "auto" | "user" = "user", sentDigest = initialDigest(source)): OpenCodeFork =>
+      seededPending({
+        stage: "creating",
+        targetId: RESERVED.targetId,
+        messageId: RESERVED.messageId,
+        seen: MARK,
+        config: { ...CREATE_CONFIG, why: whyOf(source) },
+        sentDigest,
+      });
 
     it("sends new instructions to the existing fork exactly once, then nothing new on a third fork", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
@@ -892,12 +902,109 @@ describe("forking to the other provider", () => {
     });
 
     it("refuses a resumed creation whose rebuilt prompt differs from its frozen digest", async () => {
-      const setup = await setUpReuse({}, reservedCreation(digestOf("a different reserved prompt")));
+      const setup = await setUpReuse({}, reservedCreation("user", digestOf("a different reserved prompt")));
       const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
       expect(done.delivery).toBe("uncertain");
       expect(setup.sends).toHaveLength(0);
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.sentDigest).toBe(digestOf("a different reserved prompt"));
       expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", delivery: "uncertain" });
+    });
+
+    it("rebuilds an automatic fork with its reserved reason when a manual retry delivers it", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation("auto");
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
+      expect(setup.sends[0]!.text).toContain("every Claude account reached its usage limit");
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("keeps a manually reserved reason when the retry is automatic", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation("user");
+      });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("the work was moved to OpenCode");
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("keeps a legacy reservation without a saved reason uncertain instead of guessing the trigger", async () => {
+      const setup = await setUpReuse({}, reservedCreation("auto"));
+      await setup.store.update((draft) => {
+        const config = draft.opencodeForks[AGENT]!.pending!.config!;
+        delete config.why;
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.created).toHaveLength(0);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    });
+
+    it("names the reserved fork by its known ID when it has no title to show", async () => {
+      const setup = await setUpReuse({ title: null }, reservedCreation("user", digestOf("a different reserved prompt")));
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(done.title).toBe(`OpenCode agent ${RESERVED.targetId}`);
+      expect(setup.notes.at(-1)?.continuedIn).toEqual({ agentId: RESERVED.targetId, title: `OpenCode agent ${RESERVED.targetId}` });
+    });
+
+    it("finds a receipt older than the last 500 rows without sending again", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // The receipt sits at row 1, behind 500 newer rows: one tail page misses it.
+      const rows = [
+        { item: { type: "user_message", text: sent } as AgentTimelineItem, seqEnd: 1 },
+        ...Array.from({ length: 500 }, (_, row) => ({ item: { type: "assistant_message", text: `Row ${row}` } as AgentTimelineItem, seqEnd: row + 2 })),
+      ];
+      setup.timelines.set(RESERVED.targetId, rows);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.pending).toBeUndefined();
+      expect(setup.sends.filter((send) => send.agentId === RESERVED.targetId)).toHaveLength(0);
+      expect(setup.timelineReads.filter((read) => read.id === RESERVED.targetId)).toHaveLength(2);
+    });
+
+    it("stops a receipt scan at its page budget and stays uncertain", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // More non-matching rows than any budget: the scan can't finish, so nothing is claimed.
+      setup.timelines.set(
+        RESERVED.targetId,
+        Array.from({ length: 5_500 }, (_, row) => ({ item: { type: "assistant_message", text: `Row ${row}` } as AgentTimelineItem, seqEnd: row + 1 })),
+      );
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
+      expect(setup.timelineReads.filter((read) => read.id === RESERVED.targetId).length).toBeLessThanOrEqual(10);
+    });
+
+    it("stays uncertain when the fork's history has a gap instead of calling it undelivered", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      setup.gap.fork = true;
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
     });
 
     it("settles a pending send by marker and digest when a reload dropped the message ID", async () => {
@@ -916,6 +1023,20 @@ describe("forking to the other provider", () => {
       expect(record.seen).toEqual({ epoch: "epoch-1", seq: 2 });
       expect(setup.sends).toHaveLength(1);
       expect(setup.sends[0]!.text).toContain("Now also update the CHANGELOG");
+    });
+
+    it("reconciles a first-page receipt with a single read of the fork's timeline", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      setup.timelines.set(RESERVED.targetId, [{ item: { type: "user_message", text: sent }, seqEnd: 1 }]);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("up-to-date");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+      expect(setup.timelineReads.filter((read) => read.id === RESERVED.targetId)).toHaveLength(1);
     });
 
     it("keeps an unconfirmed send reserved and reports uncertainty instead of resending", async () => {
