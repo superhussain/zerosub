@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -492,6 +492,7 @@ describe("forking to the other provider", () => {
     const hooks: {
       onRefetch?: (id: string) => void;
       onRefresh?: (id: string) => void;
+      onModes?: (provider: string) => void;
       send?: (id: string, text: string, messageId: string | undefined) => void;
       createdStatus?: string;
     } = {};
@@ -560,7 +561,10 @@ describe("forking to the other provider", () => {
       config: { get: async () => ({ config: { providers: {} } }) },
       providers: {
         listAvailable: async () => ({ providers: available }),
-        listModes: async (provider: string) => ({ modes: modes[provider] }),
+        listModes: async (provider: string) => {
+          hooks.onModes?.(provider);
+          return { modes: modes[provider] };
+        },
         listModels: async (provider: string) => ({ models: models[provider] }),
       },
       workspaces: {
@@ -993,6 +997,83 @@ describe("forking to the other provider", () => {
       expect(done.delivery).toBe("uncertain");
       expect(setup.sends).toHaveLength(0);
       expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed" });
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    });
+
+    /** Rewrites the registry file as a restart would find it. */
+    const editRegistry = async (edit: (raw: Record<string, Record<string, unknown>>) => void) => {
+      const raw = JSON.parse(await readFile(join(root, "state.json"), "utf8"));
+      edit(raw);
+      await writeFile(join(root, "state.json"), JSON.stringify(raw));
+    };
+
+    it("keeps holding a source when its hold is corrupted before a second restart", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await setUpReuse({}, seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: "d" }));
+      await writeFile(join(root, "state.json"), "{ not json");
+      await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS }); // the first restart records the hold
+      await editRegistry((raw) => { raw.opencodeHolds = { [AGENT]: { at: 7 } }; });
+      const third = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await third.limitTurn();
+      expect(third.created).toHaveLength(0);
+      expect(third.sends).toHaveLength(0);
+      expect(third.notes.at(-1)?.detail).toMatch(/record of what it sent to OpenCode/);
+    });
+
+    it("asks again after a second loss, even though the first one was acknowledged", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await setUpReuse({}, seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: "d" }));
+      await editRegistry((raw) => { raw.opencodeForks = { [AGENT]: { forkAgentId: 7 } }; });
+      const first = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await expect(first.service.forkAgent(first.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+      await first.service.forkAgent(first.paseo, AGENT, "opencode");
+      expect(first.created).toHaveLength(1);
+      // The new record is lost too: that is a new event the first acknowledgement doesn't cover.
+      await editRegistry((raw) => { raw.opencodeForks = { [AGENT]: { forkAgentId: 7 } }; });
+      const second = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await expect(second.service.forkAgent(second.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+      expect(second.created).toHaveLength(0);
+      expect(second.sends).toHaveLength(0);
+    });
+
+    it.each(Object.entries(targets))("never replaces a fork whose record has no checkpoint when the target is %s", async (_, target) => {
+      const setup = await setUpFork("bypassPermissions", [], {}, target, { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId }; });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(0);
+      expect(setup.sends).toHaveLength(0);
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+      expect(setup.created).toHaveLength(0);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created).toHaveLength(1);
+    });
+
+    it("refuses an update when the source's parent changes while the mode catalog is read", async () => {
+      const parents = ["parent-a", "parent-b"].map((id) => ({ id, provider: "claude", status: "idle", workspaceId: "ws-1", archivedAt: null, labels: {} }));
+      const setup = await setUpFork("bypassPermissions", [], { "paseo.parent-agent-id": "parent-a" }, parents, { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId, seen: MARK }; });
+      setup.byId.set(RESERVED.targetId, opencodeAgent(RESERVED.targetId, { labels: { "zerosub.continued-from": AGENT, "paseo.parent-agent-id": "parent-a" } }));
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      // Calls 1-4 are the earlier checks; call 5 is the catalog read inside the check right before the send.
+      let reads = 0;
+      setup.hooks.onModes = () => {
+        if (++reads === 5) (setup.byId.get(AGENT)!.labels as Record<string, string>)["paseo.parent-agent-id"] = "parent-b";
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.sends).toHaveLength(0);
+    });
+
+    it("refuses a reserved creation when the source and fork move together while modes are read", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      // Calls 1-4 are the create's own and the check before the write; call 5 is inside the check
+      // right before the send, after that check has already compared the source with its record.
+      let reads = 0;
+      setup.hooks.onModes = () => {
+        if (++reads === 5) for (const agent of setup.byId.values()) agent.workspaceId = "ws-2";
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(0);
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
     });
 

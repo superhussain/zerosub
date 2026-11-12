@@ -173,7 +173,7 @@ const MOVED_REFUSAL = "The existing OpenCode continuation moved, is working or i
 const MODE_REFUSAL =
   "This agent or its OpenCode continuation changed mode, so the continuation could allow more than this agent now does. Nothing was sent; check both chats before retrying.";
 const HOLD_REFUSAL =
-  "ZeroSub's record of what it sent to OpenCode for this agent was damaged, so it can't tell whether a continuation already has this work. Nothing was sent. Check this agent's OpenCode chats; to start a new continuation anyway, choose Continue on OpenCode again.";
+  "ZeroSub's record of what it sent to OpenCode for this agent is damaged or incomplete, so it can't tell whether a continuation already has this work. Nothing was sent. Check this agent's OpenCode chats; to start a new continuation anyway, choose Continue on OpenCode again.";
 const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
 
 /** The conversation a handoff carries: no plugin rows, and none of our own handoff prompts. */
@@ -1306,12 +1306,9 @@ export class Service {
     let record = recordRead.opencodeForks[agentId];
     // Recovery lost what was sent for this source. A missing, archived or unlisted fork proves
     // nothing, so nothing is forked or sent on its own; a person asked once may start a new one.
-    const hold = record ? undefined : recordRead.opencodeHolds[agentId] ?? recordRead.opencodeHolds[ALL_SOURCES];
-    if (hold && !(source === "user" && recordRead.opencodeHolds[agentId]?.told)) {
-      if (source === "user") {
-        await this.store.update((draft) => { draft.opencodeHolds[agentId] = { at: hold.at, told: true }; });
-      }
-      return { skipped: HOLD_REFUSAL };
+    if (!record && (recordRead.opencodeHolds[agentId] ?? recordRead.opencodeHolds[ALL_SOURCES])) {
+      const refusal = await this.askBeforeUnproven(agentId, source);
+      if (refusal) return refusal;
     }
     // Prompting the original again while it's still out must reuse its fork, not start a second one.
     const forkId =
@@ -1356,7 +1353,12 @@ export class Service {
     }
 
     if (!fork || fork.archivedAt) {
-      // A settled fork that is gone or archived may be replaced by a new one.
+      // A settled fork that is gone or archived may be replaced by a new one. Without a checkpoint,
+      // nothing proves what it received, so it is treated like a lost record.
+      if (!record?.seen) {
+        const refusal = await this.askBeforeUnproven(agentId, source);
+        if (refusal) return refusal;
+      }
       return this.createOpenCodeFork(paseo, agentId, original, source);
     }
     if (!record?.seen) {
@@ -1368,6 +1370,21 @@ export class Service {
     const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id);
     if ("refused" in checked) return { skipped: checked.refused };
     return this.updateOpenCodeFork(paseo, agentId, checked.fork, record.seen);
+  }
+
+  /**
+   * Nothing proves what this source's OpenCode fork already received. An automatic fork never goes
+   * ahead; a person is told once, and the next manual request may start a new fork. The hold is
+   * cleared when that fork's reservation is written.
+   */
+  private async askBeforeUnproven(agentId: string, source: "auto" | "user"): Promise<ForkOutcome | undefined> {
+    if (source === "user" && (await this.store.read()).opencodeHolds[agentId]?.told) return undefined;
+    const at = new Date().toISOString();
+    await this.store.update((draft) => {
+      const hold = draft.opencodeHolds[agentId] ?? { at };
+      draft.opencodeHolds[agentId] = source === "user" ? { at: hold.at, told: true } : hold;
+    });
+    return { skipped: HOLD_REFUSAL };
   }
 
   private async openCodeSource(
@@ -1416,6 +1433,8 @@ export class Service {
       paseo.providers.listModes(source.original.provider).then((result) => result.modes ?? []),
       paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
     ]);
+    // The parent is resolved again after the catalog reads, then the snapshots come last.
+    const parentId = await this.continuations.parentFor(paseo, agentId);
     const [original, fork] = await Promise.all([
       paseo.agents.ref(agentId).refresh().then((result) => result?.agent),
       paseo.agents.ref(forkId).refresh().then((result) => result?.agent),
@@ -1423,6 +1442,9 @@ export class Service {
     if (!original || !ready(original)) return { refused: MOVED_REFUSAL };
     if (original.lastUserMessageAt !== source.original.lastUserMessageAt) return { refused: NEWER_REFUSAL };
     const expectedParent = config ? config.parentId ?? undefined : source.parentId;
+    if (parentId !== expectedParent || original.labels?.[PARENT_LABEL] !== source.original.labels?.[PARENT_LABEL]) return { refused: MOVED_REFUSAL };
+    // A reserved creation's source must still be where it was reserved; the fork moving with it isn't enough.
+    if (config && ((original.workspaceId ?? null) !== config.workspaceId || (original.cwd ?? null) !== config.cwd)) return { refused: MOVED_REFUSAL };
     if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || !sameWorkspace(original, fork) ||
       fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
     if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return { refused: MOVED_REFUSAL };
@@ -1586,6 +1608,8 @@ export class Service {
     const why = source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode";
     const prompt = [continuationPrompt(buildTranscript(delta.entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(messageId)].join("\n");
     await this.store.update((draft) => {
+      // A new reservation is this source's journal again; a hold it was told about is spent.
+      delete draft.opencodeHolds[agentId];
       draft.opencodeForks[agentId] = {
         forkAgentId: targetId,
         pending: {

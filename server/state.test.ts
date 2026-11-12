@@ -188,6 +188,27 @@ describe("StateStore backups", () => {
     expect(Object.keys(state.opencodeHolds)).toEqual(["agent-1"]);
   });
 
+  it.each([
+    ["a source's hold doesn't validate", { "agent-1": { at: 7 } }, ["agent-1"]],
+    ["the holds themselves are unreadable", "holds", ["*"]],
+  ])("keeps holding when %s", async (_, holds, expected) => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account], opencodeHolds: holds }));
+    const state = await new StateStore(path()).read();
+    expect(Object.keys(state.opencodeHolds)).toEqual(expected);
+    expect(Object.values(state.opencodeHolds).every((hold) => !hold.told)).toBe(true);
+  });
+
+  it("resets an earlier acknowledgement when the source's record is lost again", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account], opencodeForks: { "agent-1": { forkAgentId: 7 } }, opencodeHolds: { "agent-1": { at: "2026-01-01", told: true } } }));
+    expect((await new StateStore(path()).read()).opencodeHolds["agent-1"]?.told).toBeUndefined();
+  });
+
   it("holds nothing when the fork records are intact", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const writer = new StateStore(path());

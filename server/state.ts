@@ -374,18 +374,27 @@ export class StateStore {
   }
 }
 
-/** The file's own valid fork records and holds, plus a hold for each record that couldn't be kept. */
+/**
+ * The file's own valid fork records and holds, plus a fresh hold for each record or hold that
+ * couldn't be kept. A lost record is a new event, so an earlier acknowledgement doesn't carry over;
+ * a list that can't be read at all holds every source.
+ */
 function recoveredForks(raw: unknown, at: string): Pick<StoredState, "opencodeForks" | "opencodeHolds"> {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { opencodeForks: {}, opencodeHolds: { [ALL_SOURCES]: { at } } };
+  const all = { opencodeForks: {}, opencodeHolds: { [ALL_SOURCES]: { at } } };
+  if (!isRecord(raw)) return all;
   const { opencodeForks, opencodeHolds } = salvageState(raw).state;
-  const listed = (raw as Record<string, unknown>).opencodeForks;
-  if (listed !== undefined && (!listed || typeof listed !== "object" || Array.isArray(listed))) {
-    return { opencodeForks, opencodeHolds: { ...opencodeHolds, [ALL_SOURCES]: { at } } };
+  for (const list of [raw.opencodeForks, raw.opencodeHolds]) {
+    if (list !== undefined && !isRecord(list)) return { opencodeForks, opencodeHolds: { ...opencodeHolds, ...all.opencodeHolds } };
   }
-  for (const source of Object.keys((listed ?? {}) as Record<string, unknown>)) {
-    if (!opencodeForks[source]) opencodeHolds[source] ??= { at };
-  }
+  const forks = (raw.opencodeForks ?? {}) as Record<string, unknown>;
+  const holds = (raw.opencodeHolds ?? {}) as Record<string, unknown>;
+  for (const source of Object.keys(forks)) if (!opencodeForks[source]) opencodeHolds[source] = { at };
+  for (const source of Object.keys(holds)) if (!opencodeHolds[source]) opencodeHolds[source] = { at };
   return { opencodeForks, opencodeHolds };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function message(error: unknown): string {
