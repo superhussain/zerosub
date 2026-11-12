@@ -491,6 +491,7 @@ describe("forking to the other provider", () => {
     /** Seams for the network boundary: a test can act between reads, or make a send or read throw. */
     const hooks: {
       onRefetch?: (id: string) => void;
+      onRefresh?: (id: string) => void;
       send?: (id: string, text: string, messageId: string | undefined) => void;
       createdStatus?: string;
     } = {};
@@ -519,7 +520,7 @@ describe("forking to the other provider", () => {
     const epochOf = (id: string) => (id === AGENT ? sourceEpoch : "epoch-1");
     const agents: Array<Record<string, unknown>> = [source, ...others];
     const byId = new Map(agents.map((agent) => [agent.id as string, agent]));
-    const created: Array<{ agentId: string; idempotencyKey?: string; config: { provider: string; modeId?: string }; title: string; prompt?: string; labels: Record<string, string> }> = [];
+    const created: Array<{ agentId: string; workspaceId?: string; idempotencyKey?: string; config: { provider: string; modeId?: string }; title: string; prompt?: string; labels: Record<string, string> }> = [];
     const notes: Array<{ to: string; outcome: string; toFamily: string | null; toProvider: string | null; delivery?: string; detail: string | null; continuedIn: { agentId: string } | null }> = [];
     /** Every prompt the plugin sent, and the message ID it was sent under. */
     const sends: Array<{ agentId: string; text: string; messageId?: string }> = [];
@@ -563,10 +564,10 @@ describe("forking to the other provider", () => {
         listModels: async (provider: string) => ({ models: models[provider] }),
       },
       workspaces: {
-        ref: () => ({
+        ref: (workspaceId: string) => ({
           agents: {
             create: async (request: (typeof created)[number]) => {
-              created.push(request);
+              created.push({ ...request, workspaceId });
               const agent = {
                 id: request.agentId,
                 provider: request.config.provider.split("/")[0],
@@ -586,7 +587,10 @@ describe("forking to the other provider", () => {
       agents: {
         list: async () => ({ entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } }),
         ref: (id: string) => ({
-          refresh: async () => ({ agent: byId.get(id) ?? null }),
+          refresh: async () => {
+            hooks.onRefresh?.(id);
+            return { agent: byId.get(id) ?? null };
+          },
           send: async (text: string, options: { messageId?: string } = {}) => {
             if (hooks.send) return hooks.send(id, text, options.messageId);
             sends.push({ agentId: id, text, messageId: options.messageId });
@@ -881,22 +885,115 @@ describe("forking to the other provider", () => {
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
     });
 
-    it("sends nothing and creates nothing after a restart that couldn't trust the fork record", async () => {
-      vi.spyOn(console, "error").mockImplementation(() => undefined);
-      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
-      const first = await setUpReuse(
-        {},
-        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
-      );
-      // The registry is damaged; its newest snapshot still holds a reservation that may be stale.
-      await writeFile(join(root, "state.json"), "{ not json");
-      const second = await setUpFork("bypassPermissions", [], {}, [opencodeAgent(RESERVED.targetId)], { prefs: PREFS });
-      second.timelines.set(RESERVED.targetId, [{ item: { type: "user_message", text: sent }, seqEnd: 1 }]);
-      const done = await second.service.forkAgent(second.paseo, AGENT, "opencode");
+    const damage = {
+      "the registry is not JSON": "{ not json",
+      "the source's record doesn't validate": JSON.stringify({ accounts: [], opencodeForks: { [AGENT]: { forkAgentId: 7 } } }),
+    };
+    const targets = {
+      "absent": [] as Array<Record<string, unknown>>,
+      "archived": [opencodeAgent(RESERVED.targetId, { archivedAt: "2026-09-23T08:00:00.000Z" })],
+    };
+    describe.each(Object.entries(damage))("after a restart where %s", (_, broken) => {
+      /** A reservation is unconfirmed when the registry breaks; the restarted service can't see it. */
+      const restart = async (target: Array<Record<string, unknown>>) => {
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+        await setUpReuse(
+          {},
+          seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf("unconfirmed") }),
+        );
+        await writeFile(join(root, "state.json"), broken);
+        return setUpFork("bypassPermissions", [], {}, target, { prefs: PREFS });
+      };
+
+      it.each(Object.entries(targets))("never forks again on its own when the reserved target is %s", async (_, target) => {
+        const second = await restart(target);
+        await second.limitTurn();
+        expect(second.created).toHaveLength(0);
+        expect(second.sends).toHaveLength(0);
+        expect(second.notes.at(-1)).toMatchObject({ outcome: "stayed" });
+        expect(second.notes.at(-1)?.detail).toMatch(/record of what it sent to OpenCode/);
+      });
+
+      it.each(Object.entries(targets))("asks before a manual fork when the reserved target is %s, then starts one", async (_, target) => {
+        const second = await restart(target);
+        await expect(second.service.forkAgent(second.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+        expect(second.created).toHaveLength(0);
+        expect(second.sends).toHaveLength(0);
+        await second.service.forkAgent(second.paseo, AGENT, "opencode");
+        expect(second.created).toHaveLength(1);
+        expect(second.sends).toHaveLength(1);
+      });
+    });
+
+    /** Runs `change` when `continueInNewAgent` itself refreshes the source, after every earlier check. */
+    const atHelperRefresh = (setup: Awaited<ReturnType<typeof setUpFork>>, change: (source: Record<string, unknown>) => void) => {
+      setup.hooks.onRefresh = (id) => {
+        if (id === AGENT && new Error().stack?.includes("continueInNewAgent")) change(setup.byId.get(AGENT)!);
+      };
+    };
+
+    it("repeats a reserved create with its frozen title even when the source is renamed at the create", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = reservedCreation(); });
+      atHelperRefresh(setup, (source) => { source.title = "Other task"; });
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode").catch(() => undefined);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({
+        agentId: RESERVED.targetId,
+        idempotencyKey: RESERVED.targetId,
+        workspaceId: CREATE_CONFIG.workspaceId,
+        title: CREATE_CONFIG.title,
+        config: { provider: CREATE_CONFIG.provider, modeId: CREATE_CONFIG.modeId, thinkingOptionId: CREATE_CONFIG.thinkingOptionId },
+      });
+    });
+
+    it("refuses a reserved create when the source moves workspace at the create, instead of changing it", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = reservedCreation(); });
+      atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    });
+
+    it.each([
+      ["a history gap before the write", 2, "gap"],
+      ["a history gap after the write", 3, "gap"],
+      ["an epoch reset before the write", 2, "epoch"],
+      ["an epoch reset after the write", 3, "epoch"],
+    ])("calls %s on an update an inspection, not a newer message", async (_, read, kind) => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      let reads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id !== AGENT || ++reads !== read) return;
+        if (kind === "gap") setup.gap.source = true;
+        else setup.setSourceEpoch("epoch-2");
+      };
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
       expect(done.delivery).toBe("found");
-      expect(second.sends).toHaveLength(0);
-      expect(second.created).toHaveLength(0);
-      expect(first.sends).toHaveLength(0);
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)?.detail).not.toMatch(/newer message/);
+      expect(setup.notes.at(-1)?.detail).toMatch(kind === "gap" ? /couldn't read this agent's handoff history/ : /couldn't tell what it has already received/);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.seen).toEqual(MARK);
+      expect(record.pending).toBeUndefined();
+    });
+
+    it.each([
+      ["before the write", 3],
+      ["after the write", 4],
+    ])("keeps a creation reserved and uncertain on a history gap %s", async (_, read) => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      let reads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && ++reads === read) setup.gap.source = true;
+      };
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed" });
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
     });
 
     it("re-reads the persisted reservation after a restart-shaped rebuild of the service", async () => {

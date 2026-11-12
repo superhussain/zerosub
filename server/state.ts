@@ -102,6 +102,14 @@ export const OpenCodeForkSchema = z.object({
 });
 export type OpenCodeFork = z.infer<typeof OpenCodeForkSchema>;
 
+/**
+ * Set when recovery lost a source's OpenCode fork record (key: the source agent ID), or every
+ * source's (key `*`, when the registry couldn't be read at all). Until that source has a record
+ * again, nothing is sent or forked for it automatically; a manual fork asks once (`told`) first.
+ */
+export const OpenCodeHoldSchema = z.object({ at: z.string(), told: z.boolean().optional() });
+export const ALL_SOURCES = "*";
+
 const ContinuationMemberSchema = z.object({
   accountId: z.string(),
   identity: z.string().nullable(),
@@ -153,6 +161,7 @@ export const StoredStateSchema = z.object({
   continuations: z.record(z.string(), ContinuationChainSchema).default({}),
   /** Per-source OpenCode fork records. OpenCode is a harness, not an account provider. */
   opencodeForks: z.record(z.string(), OpenCodeForkSchema).default({}),
+  opencodeHolds: z.record(z.string(), OpenCodeHoldSchema).default({}),
   /**
    * Homes to clean up, by path. Only these are ever signed out or deleted: a home missing from
    * `accounts` may just be missing from a damaged or hand-edited registry.
@@ -203,6 +212,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
       opencodeForks: records(OpenCodeForkSchema, source.opencodeForks),
+      opencodeHolds: records(OpenCodeHoldSchema, source.opencodeHolds),
       cleanup: records(CleanupSchema, source.cleanup),
     },
     dropped: true,
@@ -348,9 +358,8 @@ export class StateStore {
     }
     // OpenCode fork records are the registry's own journal of what was sent. A snapshot can lag the
     // file (it's written second, and its failure is tolerated), so its records are never restored:
-    // only the file's valid ones stay. A source with none falls back to inspecting its fork, which
-    // sends nothing, rather than resuming a reservation that may be stale.
-    state.opencodeForks = raw !== undefined ? salvageState(raw).state.opencodeForks : {};
+    // only the file's valid ones stay, and every record that was lost becomes a hold.
+    Object.assign(state, recoveredForks(raw, new Date().toISOString()));
     console.error(`[ZeroSub] ${this.path} was ${problem}${kept ? `; kept it as ${kept}` : ""}; ${outcome}`);
     await this.write(state).catch((error: unknown) => console.error("[ZeroSub] could not save the recovered state file", message(error)));
     return state;
@@ -363,6 +372,20 @@ export class StateStore {
     await chmod(copy, 0o600);
     return copy;
   }
+}
+
+/** The file's own valid fork records and holds, plus a hold for each record that couldn't be kept. */
+function recoveredForks(raw: unknown, at: string): Pick<StoredState, "opencodeForks" | "opencodeHolds"> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { opencodeForks: {}, opencodeHolds: { [ALL_SOURCES]: { at } } };
+  const { opencodeForks, opencodeHolds } = salvageState(raw).state;
+  const listed = (raw as Record<string, unknown>).opencodeForks;
+  if (listed !== undefined && (!listed || typeof listed !== "object" || Array.isArray(listed))) {
+    return { opencodeForks, opencodeHolds: { ...opencodeHolds, [ALL_SOURCES]: { at } } };
+  }
+  for (const source of Object.keys((listed ?? {}) as Record<string, unknown>)) {
+    if (!opencodeForks[source]) opencodeHolds[source] ??= { at };
+  }
+  return { opencodeForks, opencodeHolds };
 }
 
 function message(error: unknown): string {

@@ -225,11 +225,19 @@ export async function continueInNewAgent(options: {
    * fail outright once the parent has been closed.
    */
   parentId?: string;
+  /**
+   * A request reserved earlier under `agentId`: its frozen title is used, so a retry repeats the
+   * same request, and a source no longer at its frozen location refuses instead.
+   */
+  reserved?: { title: string; workspaceId: string | null; cwd: string | null };
 }): Promise<Continuation> {
-  const { paseo, sourceAgentId } = options;
+  const { paseo, sourceAgentId, reserved } = options;
   const refreshed = await paseo.agents.ref(sourceAgentId).refresh();
   const source = refreshed?.agent;
   if (!source) throw new Error("The original agent is no longer available.");
+  if (reserved && ((source.workspaceId ?? null) !== reserved.workspaceId || (source.cwd ?? null) !== reserved.cwd)) {
+    throw new Error("The original agent moved since its continuation was reserved. Check it before continuing it again.");
+  }
 
   let timeline = options.timeline;
   if (!timeline && !options.deferPrompt) {
@@ -248,9 +256,9 @@ export async function continueInNewAgent(options: {
 
   const agentId = options.agentId ?? randomUUID();
   await options.bind(agentId);
-  const title = target
+  const title = reserved?.title ?? (target
     ? `${source.title?.trim() || "Task"} (continued on ${target.label})`
-    : `${source.title?.trim() || "Codex task"} (continued)`;
+    : `${source.title?.trim() || "Codex task"} (continued)`);
   // Modes and thinking options are provider-specific: only carry them over within one provider.
   // `provider/model` is Paseo's config shape: the OpenCode provider id plus the catalog's full model
   // id (which itself may carry a catalog prefix, e.g. `opencode/bifrost-fireworks/…/glm-5p3-flash`).
@@ -276,6 +284,7 @@ export async function continueInNewAgent(options: {
       : {}),
     labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
   };
+  // A reserved request's location was checked against this snapshot above, so the two agree.
   if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
   else await paseo.agents.create({ ...request, cwd: source.cwd });
   return { agentId, title };

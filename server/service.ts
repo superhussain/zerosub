@@ -48,6 +48,7 @@ import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
 import {
+  ALL_SOURCES,
   MAIN_ACCOUNT_ID,
   StateStore,
   accountsOf,
@@ -171,6 +172,8 @@ const uncertainDetail = (title: string, messageId: string): string =>
 const MOVED_REFUSAL = "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.";
 const MODE_REFUSAL =
   "This agent or its OpenCode continuation changed mode, so the continuation could allow more than this agent now does. Nothing was sent; check both chats before retrying.";
+const HOLD_REFUSAL =
+  "ZeroSub's record of what it sent to OpenCode for this agent was damaged, so it can't tell whether a continuation already has this work. Nothing was sent. Check this agent's OpenCode chats; to start a new continuation anyway, choose Continue on OpenCode again.";
 const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
 
 /** The conversation a handoff carries: no plugin rows, and none of our own handoff prompts. */
@@ -1301,6 +1304,15 @@ export class Service {
 
     const recordRead = await this.store.read();
     let record = recordRead.opencodeForks[agentId];
+    // Recovery lost what was sent for this source. A missing, archived or unlisted fork proves
+    // nothing, so nothing is forked or sent on its own; a person asked once may start a new one.
+    const hold = record ? undefined : recordRead.opencodeHolds[agentId] ?? recordRead.opencodeHolds[ALL_SOURCES];
+    if (hold && !(source === "user" && recordRead.opencodeHolds[agentId]?.told)) {
+      if (source === "user") {
+        await this.store.update((draft) => { draft.opencodeHolds[agentId] = { at: hold.at, told: true }; });
+      }
+      return { skipped: HOLD_REFUSAL };
+    }
     // Prompting the original again while it's still out must reuse its fork, not start a second one.
     const forkId =
       record?.forkAgentId ??
@@ -1390,9 +1402,14 @@ export class Service {
     forkId: string,
     mark?: TimelineMark,
     config?: OpenCodeCreateConfig,
-  ): Promise<{ original: Agent; fork: Agent } | { refused: string }> {
+  ): Promise<{ original: Agent; fork: Agent } | { refused: string; unreadable?: true }> {
     if (config) await waitForCreated(paseo, forkId);
-    if (mark && (await this.sourceChangedSince(paseo, agentId, mark))) return { refused: NEWER_REFUSAL };
+    if (mark) {
+      const since = await this.sourceSince(paseo, agentId, mark);
+      if (since === "newer") return { refused: NEWER_REFUSAL };
+      // Unreadable history proves no newer message either: the caller reports it as an inspection.
+      if (since !== "same") return { refused: since === "epoch" ? FOUND_DETAIL : HISTORY_GAP_DETAIL, unreadable: true };
+    }
     const source = await this.openCodeSource(paseo, agentId, config);
     if (!source) return { refused: MOVED_REFUSAL };
     const [sourceModes, targetModes] = await Promise.all([
@@ -1413,24 +1430,25 @@ export class Service {
     return { original, fork };
   }
 
-  /** Whether the source gained conversation after `mark`; an unreadable history counts as changed. */
-  private async sourceChangedSince(paseo: PaseoApi, agentId: string, mark: TimelineMark): Promise<boolean> {
+  /** What the source gained after `mark`: proven newer conversation, nothing, or unreadable history. */
+  private async sourceSince(paseo: PaseoApi, agentId: string, mark: TimelineMark): Promise<"newer" | "same" | "epoch" | "gap"> {
     try {
-      return meaningful((await readUpdates(paseo, agentId, mark, undefined, { onEpochReset: "unresolvable" })).entries).length > 0;
-    } catch {
-      return true;
+      const { entries } = await readUpdates(paseo, agentId, mark, undefined, { onEpochReset: "unresolvable" });
+      return meaningful(entries).length > 0 ? "newer" : "same";
+    } catch (error) {
+      return error instanceof UnresolvableEpochError ? "epoch" : "gap";
     }
   }
 
-  /** A found fork with no provable checkpoint: link it, send nothing. */
-  private openCodeFound(fork: { id: string; title?: string | null }): ForkOutcome {
+  /** A found fork with no provable checkpoint, or history that can't be read: link it, send nothing. */
+  private openCodeFound(fork: { id: string; title?: string | null }, detail = FOUND_DETAIL): ForkOutcome {
     return {
       fork: { agentId: fork.id, title: forkRef(fork) },
       to: OPENCODE_LABEL,
       toFamily: null,
       toProvider: OPENCODE_PROVIDER,
       delivery: "found",
-      detail: FOUND_DETAIL,
+      detail,
     };
   }
 
@@ -1482,14 +1500,7 @@ export class Service {
       delta = await readUpdates(paseo, agentId, seen, undefined, { onEpochReset: "unresolvable" });
     } catch (error) {
       // A gap or new epoch means what the fork has can't be proven; refuse honestly instead of guessing.
-      return {
-        fork: { agentId: fork.id, title: forkRef(fork) },
-        to: OPENCODE_LABEL,
-        toFamily: null,
-        toProvider: OPENCODE_PROVIDER,
-        delivery: "found",
-        detail: error instanceof UnresolvableEpochError ? FOUND_DETAIL : HISTORY_GAP_DETAIL,
-      };
+      return this.openCodeFound(fork, error instanceof UnresolvableEpochError ? FOUND_DETAIL : HISTORY_GAP_DETAIL);
     }
     // Only meaningful conversation advances a turn. Plugin rows, including our own notes, do not.
     const items = meaningful(delta.entries).map((entry) => entry.item);
@@ -1512,7 +1523,7 @@ export class Service {
     const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
     const prompt = updatePrompt(instructions, progress, PROVIDER_NAME.claude, transferMarker(messageId));
     const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark);
-    if ("refused" in checked) return { skipped: checked.refused };
+    if ("refused" in checked) return checked.unreadable ? this.openCodeFound(fork, checked.refused) : { skipped: checked.refused };
     // Reserved before any send: an uncertain dispatch must never send a second copy.
     await this.store.update((draft) => {
       const record = draft.opencodeForks[agentId] ?? { forkAgentId: fork.id };
@@ -1527,7 +1538,7 @@ export class Service {
         const record = draft.opencodeForks[agentId];
         if (record?.pending?.messageId === messageId) delete record.pending;
       });
-      return { skipped: recheck.refused };
+      return recheck.unreadable ? this.openCodeFound(fork, recheck.refused) : { skipped: recheck.refused };
     }
     return this.sendReserved(paseo, agentId, recheck.fork, prompt, messageId);
   }
@@ -1611,6 +1622,7 @@ export class Service {
         ...(thinking ? { thinkingOptionId: thinking } : {}),
       },
       parentId,
+      reserved: { title, workspaceId: original.workspaceId ?? null, cwd: original.cwd ?? null },
       bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
     });
     const fork = await waitForCreated(paseo, targetId);
@@ -1626,8 +1638,13 @@ export class Service {
   ): Promise<ForkOutcome> {
     const config = pending.config;
     if (!config) return this.openCodeUncertain(pending.targetId, null, pending.messageId);
+    const { title, workspaceId, cwd, parentId } = config;
+    if (title === undefined || workspaceId === undefined || cwd === undefined || parentId === undefined) {
+      return this.openCodeUncertain(pending.targetId, title, pending.messageId);
+    }
+    // Fresh snapshots only validate the frozen request; they never change what is sent under its key.
     const checked = await this.openCodeSource(paseo, agentId, config);
-    if (!checked) return this.openCodeUncertain(pending.targetId, config.title, pending.messageId);
+    if (!checked) return this.openCodeUncertain(pending.targetId, title, pending.messageId);
     const model = config.provider.slice(OPENCODE_PROVIDER.length + 1);
     await continueInNewAgent({
       paseo,
@@ -1642,7 +1659,8 @@ export class Service {
         model,
         ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
       },
-      parentId: checked.parentId,
+      parentId: parentId ?? undefined,
+      reserved: { title, workspaceId, cwd },
       bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
     });
     const fork = await waitForCreated(paseo, pending.targetId);
@@ -1695,7 +1713,7 @@ export class Service {
         const record = draft.opencodeForks[agentId];
         if (record?.pending?.messageId === pending.messageId) record.pending = pending;
       });
-      return { skipped: recheck.refused };
+      return recheck.unreadable ? this.openCodeUncertain(fork.id, fork.title, pending.messageId) : { skipped: recheck.refused };
     }
     return this.sendReserved(paseo, agentId, recheck.fork, prompt, pending.messageId);
   }

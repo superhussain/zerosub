@@ -164,6 +164,38 @@ describe("StateStore backups", () => {
     expect(state.opencodeForks).toEqual({});
   });
 
+  it("holds every OpenCode source when the registry can't be read at all", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account], opencodeForks: { "agent-1": reservation("sending") } }));
+    await writeFile(path(), "{ not json");
+
+    const state = await new StateStore(path()).read();
+    expect(state.opencodeForks).toEqual({});
+    expect(Object.keys(state.opencodeHolds)).toEqual(["*"]);
+    // The hold is written back, so a second restart still knows authority was lost.
+    expect(Object.keys((await new StateStore(path()).read()).opencodeHolds)).toEqual(["*"]);
+  });
+
+  it("holds only the source whose record didn't validate, keeping the others", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account], opencodeForks: { "agent-1": { forkAgentId: 7 }, "agent-2": reservation("sending") } }));
+
+    const state = await new StateStore(path()).read();
+    expect(state.opencodeForks).toEqual({ "agent-2": reservation("sending") });
+    expect(Object.keys(state.opencodeHolds)).toEqual(["agent-1"]);
+  });
+
+  it("holds nothing when the fork records are intact", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account, { id: "broken", family: "gemini" }], opencodeForks: { "agent-2": reservation("sending") } }));
+    expect((await new StateStore(path()).read()).opencodeHolds).toEqual({});
+  });
+
   it("starts empty on a new install, without writing anything", async () => {
     expect((await new StateStore(path()).read()).accounts).toEqual([]);
     expect(await readdir(dir)).toEqual([]);
