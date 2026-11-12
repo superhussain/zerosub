@@ -8,7 +8,7 @@ import type { FamilyResolver } from "./families";
 import { detectClaudeLimit } from "./limits";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
-import { MAIN_ACCOUNT_ID, StateStore, type StoredAccount, type StoredState } from "./state";
+import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, type StoredState } from "./state";
 import { preferences } from "../shared/preferences";
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
@@ -522,7 +522,8 @@ describe("forking to the other provider", () => {
     /** Adds one turn to an agent's timeline, as Paseo would when the user types. */
     const addTurn = (id: string, item: AgentTimelineItem, clientMessageId?: string) => {
       const rows = timelines.get(id) ?? [];
-      rows.push({ item: clientMessageId ? { ...item, clientMessageId } : item, turnId: `turn-${++seq}`, seqEnd: ++seq });
+      const entry = clientMessageId && item.type === "user_message" ? { ...item, clientMessageId } : item;
+      rows.push({ item: entry, turnId: `turn-${++seq}`, seqEnd: ++seq });
       timelines.set(id, rows);
     };
     /** Makes the next source read fail, as a history gap does. */
@@ -743,7 +744,7 @@ describe("forking to the other provider", () => {
     });
     const digestOf = (text: string) => createHash("sha256").update(text).digest("hex");
     /** A harness with an existing, settled fork record and its live target agent. */
-    const setUpReuse = async (fork: Record<string, unknown> = {}, record: Record<string, unknown> = {}) => {
+    const setUpReuse = async (fork: Record<string, unknown> = {}, record: Omit<OpenCodeFork, "forkAgentId"> = {}) => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
       await setup.store.update((draft) => {
         draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId, ...record };
@@ -751,7 +752,10 @@ describe("forking to the other provider", () => {
       setup.byId.set(RESERVED.targetId, opencodeAgent(RESERVED.targetId, fork));
       return setup;
     };
-    const seededPending = (pending: Record<string, unknown>) => ({ forkAgentId: RESERVED.targetId, pending });
+    const seededPending = (pending: NonNullable<OpenCodeFork["pending"]>): OpenCodeFork => ({
+      forkAgentId: RESERVED.targetId,
+      pending,
+    });
 
     it("sends new instructions to the existing fork exactly once, then nothing new on a third fork", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
