@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 // Keeps local scratch out of the repository. Default mode fails when a tracked or staged path sits
-// under `.context/`; `--history <base>` also fails when any commit since `<base>` contains one, even
-// if it was removed again later. Contributors on any machine run this through npm scripts; nothing
-// here depends on a local hook being installed.
+// under a `.context/` directory at any depth; `--history <base>` also fails when any commit since
+// `<base>` contains one, even if it was removed again later. Contributors on any machine run this
+// through npm scripts; nothing here depends on a local hook being installed.
 
 import { execFileSync } from "node:child_process";
 
 const git = (args) => execFileSync("git", args, { encoding: "utf8" });
 const paths = (args) => git(args).split("\0").filter(Boolean);
 
-const inContext = (path) => path === ".context" || path.startsWith(".context/");
+// Any complete `.context` component, at any depth, as `.gitignore`'s `.context/` matches it.
+const inContext = (path) => path.split("/").includes(".context");
 
 const mode = process.argv[2];
 if (mode === "--history") {
