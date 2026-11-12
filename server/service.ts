@@ -169,6 +169,8 @@ const HISTORY_GAP_DETAIL =
   "ZeroSub couldn't read this agent's handoff history, so it can't prove what the continuation has. Nothing was sent; check both chats.";
 const uncertainDetail = (title: string, messageId: string): string =>
   `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send a second copy.`;
+const alreadyContinued = (title: string): string =>
+  `This agent was already continued in “${title}”. Nothing was started; carry on in that chat.`;
 const MOVED_REFUSAL = "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.";
 const MODE_REFUSAL =
   "This agent's mode changed since the OpenCode continuation was set up. Nothing was sent; check both chats before retrying.";
@@ -1226,6 +1228,9 @@ export class Service {
       return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, to: earlierAccount.label, toFamily: other, toProvider: null, delivery: "sent" };
     }
 
+    const openCodeCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER);
+    if (openCodeCopy) return { skipped: alreadyContinued(openCodeCopy.title ?? OPENCODE_LABEL) };
+
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
     const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other);
     const available = provider
@@ -1585,6 +1590,8 @@ export class Service {
    * deliver the initial handoff under the reserved message ID.
    */
   private async createOpenCodeFork(paseo: PaseoApi, agentId: string, original: Agent, source: "auto" | "user"): Promise<ForkOutcome> {
+    const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
+    if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? "another agent") };
     const { models } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     const savedModel = this.prefs.forkOpenCodeModel;
     const model = savedModel ? models?.find((entry) => entry.id === savedModel) : models?.find((entry) => entry.isDefault);
