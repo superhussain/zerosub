@@ -153,11 +153,13 @@ npm install
 paseo plugin install "$(pwd)"   # run the working copy
 
 npm run typecheck      # client and server bundles, separately
-npm test               # routing, failover, limit detection, usage, resets, forks
+npm test               # .context guard first, then routing, failover, limit detection, usage, resets, forks
 npm run audit:mobile   # no DOM/HTML in client code
 paseo plugin reload zerosub
 paseo plugin logs zerosub
 ```
+
+`npm run guard:context` (also runs first inside `npm test`) fails when any tracked or staged path sits under `.context/`, and `npm run guard:history` fails when any commit since `origin/main` contains one. Keep local scratch out of the repository; the guard works on any machine, no local hook needed.
 
 Code layout:
 
