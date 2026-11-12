@@ -28,7 +28,7 @@ beforeEach(async () => {
 afterEach(async () => {
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 function account(id: string, label: string, kind: "main" | "managed") {
