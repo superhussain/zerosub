@@ -15,7 +15,7 @@ import {
   type ReopenSummary,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
-import { ForkDestinationRows } from "./fork-settings";
+import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -711,6 +711,12 @@ function AutomationSettings({ theme }: { theme: Theme }) {
           onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
         />
         <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
+      </SettingsCard>
+      <Text style={text.heading} accessibilityRole="header">
+        Continue on OpenCode
+      </Text>
+      <SettingsCard>
+        <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
       </SettingsCard>
       {settings.saveError ? <Text style={text.danger}>{settings.saveError}</Text> : null}
     </View>

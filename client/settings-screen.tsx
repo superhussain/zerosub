@@ -9,7 +9,7 @@ import {
 import { useState } from "react";
 import { Text } from "react-native";
 import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../shared/preferences";
-import { ForkDestinationRows } from "./fork-settings";
+import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 
 /** Settings → Plugins → zerosub. Accounts themselves live in the sidebar surface. */
 export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurfaceProps & { onOpenAccounts(): void }) {
@@ -147,6 +147,11 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             disabled={settings.saving}
             onValueChange={(showComposerPill) => save({ showComposerPill })}
           />
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection title="Continue on OpenCode">
+        <SettingsCard>
+          <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
         </SettingsCard>
       </SettingsSection>
     </>

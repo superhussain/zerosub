@@ -25,7 +25,7 @@ vi.mock("react", () => ({
   useEffect: (effect: () => unknown) => { effect(); },
 }));
 
-const { ForkDestinationRows } = await import("./fork-settings");
+const { ForkDestinationRows, OpenCodeForkRows } = await import("./fork-settings");
 
 const values = (overrides: Partial<Preferences> = {}): Preferences => ({ ...preferences.schema.parse({}), ...overrides });
 
@@ -39,18 +39,26 @@ interface Row {
   };
 }
 
+/** The rows a render returns: a fragment's children, or the one row it returned on its own. */
+const rowsOf = (element: unknown): Row[] => {
+  const children = (element as { props: { children?: Row | Row[] } }).props.children;
+  return children === undefined ? [element as Row] : ([children].flat() as Row[]);
+};
+
 /** Renders once for the loading state, lets the catalog land, then renders again and reports the rows. */
 const render = async (overrides: Partial<Preferences> = {}) => {
   const saved: Array<Partial<Preferences>> = [];
   const draw = () =>
-    ForkDestinationRows({ values: values(overrides), saving: false, onSave: (patch) => saved.push(patch) }) as {
+    OpenCodeForkRows({ values: values(overrides), saving: false, onSave: (patch) => saved.push(patch) }) as {
       props: { children: Row | Row[] };
     };
   draw();
   for (let round = 0; round < 5; round += 1) await Promise.resolve();
   const children = draw().props.children;
   const rows = (Array.isArray(children) ? children : [children]).map((row) => row as Row);
-  return { rows, byLabel: (label: string) => rows.find((row) => row.props.label === label)!, saved };
+  const destination = ForkDestinationRows({ values: values(overrides), saving: false, onSave: () => undefined }) as unknown as Row;
+  const all = [destination, ...rows];
+  return { rows, byLabel: (label: string) => all.find((row) => row.props.label === label)!, saved };
 };
 
 beforeEach(() => {
@@ -59,12 +67,16 @@ beforeEach(() => {
   state = undefined;
 });
 
-describe("ForkDestinationRows", () => {
+describe("OpenCodeForkRows and ForkDestinationRows", () => {
+  it("renders only the destination select, no model or thinking rows, from ForkDestinationRows", () => {
+    const row = ForkDestinationRows({ values: values(), saving: false, onSave: () => undefined }) as unknown as Row;
+    expect(row.props.label).toBe("Fork a stopped Claude chat to");
+  });
+
   it("shows the read error, not an empty catalog, when listModels reports one", async () => {
     catalogError = "daemon unreachable";
     await render();
-    const draw = ForkDestinationRows({ values: values(), saving: false, onSave: () => undefined }) as { props: { children: Row[] } };
-    const rows = draw.props.children.flat() as Row[];
+    const rows = rowsOf(OpenCodeForkRows({ values: values(), saving: false, onSave: () => undefined }));
     expect(rows.find((row) => row.props.label === "OpenCode model")?.props.hint).toBe("Couldn't read this host's OpenCode models: daemon unreachable");
   });
 
@@ -76,7 +88,7 @@ describe("ForkDestinationRows", () => {
     const model = byLabel("OpenCode model");
     expect(destination.props.disabled).toBe(true);
     expect(model.props.disabled).toBe(false);
-    expect(model.props.hint).toBe("Used by a manual Continue on OpenCode, and by the automatic fork when the destination above is OpenCode.");
+    expect(model.props.hint).toBe("Used by Continue on OpenCode in the account menu, and by the automatic fork when its destination is OpenCode.");
     expect(model.props.options).toContainEqual({ label: "Host default", value: "" });
     // The host marks a default, so its thinking options are listed and pickable.
     const thinking = byLabel("OpenCode thinking");
@@ -98,10 +110,8 @@ describe("ForkDestinationRows", () => {
 
   it("lists no thinking options while the catalog is loading", async () => {
     catalog = CATALOG;
-    const draw = () =>
-      ForkDestinationRows({ values: values(), saving: false, onSave: () => undefined }) as { props: { children: Row[] } };
     state = { status: "loading" };
-    const rows = draw().props.children.flat() as Row[];
+    const rows = rowsOf(OpenCodeForkRows({ values: values(), saving: false, onSave: () => undefined }));
     expect(rows.find((row) => row.props.label === "OpenCode model")?.props.hint).toBe("Loading this host's OpenCode catalog…");
     expect(rows.every((row) => row.props.options === undefined || row.props.label !== "OpenCode thinking")).toBe(true);
   });
