@@ -1427,7 +1427,7 @@ describe("forking to the other provider", () => {
       const setup = await setUpReuse({}, { seen: MARK });
       setup.byId.get(AGENT)!.currentModeId = "plan";
       setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
-      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/changed mode/);
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/mode changed/);
       expect(setup.sends).toHaveLength(0);
       expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual(MARK);
     });
@@ -1439,7 +1439,7 @@ describe("forking to the other provider", () => {
       const setup = await setUpReuse({ currentModeId: forkMode }, { seen: MARK });
       setup.byId.get(AGENT)!.currentModeId = sourceMode;
       setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
-      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/changed mode/);
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/mode changed/);
       expect(setup.sends).toHaveLength(0);
     });
 
@@ -1529,7 +1529,7 @@ describe("forking to the other provider", () => {
       setup.hooks.onRefetch = (id) => {
         if (id === AGENT && ++reads === read) setup.byId.get(AGENT)!.currentModeId = "plan";
       };
-      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/changed mode/);
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/mode changed/);
       expect(setup.sends).toHaveLength(0);
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
     });
