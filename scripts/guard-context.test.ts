@@ -59,3 +59,30 @@ describe("guard:context", () => {
     expect(guard("--history", "base")).toBe(0);
   });
 });
+
+describe("guard:history on a shallow clone", () => {
+  it("refuses to vouch for history it can't see, even with the base fetched", async () => {
+    // A hidden middle commit adds nested scratch, and the next removes it.
+    await put("client/.context/probe.mjs");
+    git("add", "-f", "--", "client/.context/probe.mjs");
+    git("commit", "-q", "-m", "scratch");
+    git("rm", "-q", "--", "client/.context/probe.mjs");
+    git("commit", "-q", "-m", "remove scratch");
+    await put("client/x.ts");
+    git("add", "--", "client/x.ts");
+    git("commit", "-q", "-m", "work");
+    const source = repo;
+    const clone = await mkdtemp(join(tmpdir(), "zerosub-guard-shallow-"));
+    try {
+      execFileSync("git", ["clone", "-q", "--depth=1", `file://${source}`, clone]);
+      execFileSync("git", ["-C", clone, "fetch", "-q", "--depth=1", "origin", "refs/heads/base:refs/heads/base"]);
+      repo = clone;
+      expect(git("rev-parse", "--is-shallow-repository").trim()).toBe("true");
+      expect(guard("--history", "base")).toBe(1);
+      expect(guard()).toBe(0);
+    } finally {
+      repo = source;
+      await rm(clone, { recursive: true, force: true });
+    }
+  }, 30_000); // a dozen git processes; slow when the whole suite runs in parallel
+});

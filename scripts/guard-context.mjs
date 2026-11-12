@@ -15,11 +15,18 @@ const inContext = (path) => path.split("/").includes(".context");
 const mode = process.argv[2];
 if (mode === "--history") {
   const base = process.argv[3] ?? "origin/main";
+  let shallow;
   let commits;
   try {
+    // A shallow clone lists only the commits it has: `base..HEAD` succeeding there proves nothing.
+    shallow = git(["rev-parse", "--is-shallow-repository"]).trim() !== "false";
     commits = git(["rev-list", `${base}..HEAD`]).split("\n").map((line) => line.trim()).filter(Boolean);
   } catch {
     console.error(`guard:context: couldn't list commits since ${base}; run from a clone of the repository.`);
+    process.exit(1);
+  }
+  if (shallow) {
+    console.error("guard:context: this clone's history is incomplete (shallow); run `git fetch --unshallow` and retry.");
     process.exit(1);
   }
   const bad = new Set();
