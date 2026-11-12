@@ -58,7 +58,7 @@ export function ForkDestinationRows({
       label="Fork a stopped Claude chat to"
       hint={
         values.claudeForkDestination === "opencode"
-          ? "Applies when every Claude account is out. OpenCode runs this host's permission policy, where Build edits files and runs shell without asking, which can allow more than Claude. Choosing OpenCode here is your opt-in. Pick the model and thinking below."
+          ? "Applies when every Claude account is out. OpenCode runs this host's permission policy, so Build can edit files and run shell without asking. That can allow more than Claude does."
           : "Applies when every Claude account is out. ChatGPT uses the account with the most room left."
       }
       value={values.claudeForkDestination}

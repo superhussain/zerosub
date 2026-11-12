@@ -1220,7 +1220,8 @@ export class Service {
     const families = await this.families.resolve(paseo);
     const state = await this.store.read();
     // Prompting the original again while it's still out mustn't start a second copy of the work.
-    const earlier = (await listAgents(paseo, false)).agents.find(
+    const { agents } = await listAgents(paseo, false);
+    const earlier = agents.find(
       (agent) => agent.continuedFrom === agentId && families[agent.provider] === other,
     );
     const earlierAccount = earlier && (findAccount(state, state.bindings[earlier.id]?.accountId) ?? mainAccount(state, other));
@@ -1228,7 +1229,7 @@ export class Service {
       return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, to: earlierAccount.label, toFamily: other, toProvider: null, delivery: "sent" };
     }
 
-    const openCodeCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER);
+    const openCodeCopy = agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER);
     if (openCodeCopy) return { skipped: alreadyContinued(openCodeCopy.title ?? OPENCODE_LABEL) };
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
@@ -1280,8 +1281,8 @@ export class Service {
    * Carries a stopped Claude chat on in a new agent on this host's OpenCode, when that's the chosen
    * destination and every Claude account is out. OpenCode is a harness, not an account provider, so
    * the new agent gets no account binding. Its model, thinking option, and mode all come from this
-   * host's catalog and match the original's permission tier; OpenCode's own permission policy applies
-   * and can allow more than Claude does. Anything else refuses the fork.
+   * host's catalog. The mode is Plan or Build under the host's own permission policy, which can
+   * allow more than Claude does. Anything else refuses the fork.
    */
   private forkToOpenCode(paseo: PaseoApi, agentId: string, source: "auto" | "user" = "auto"): Promise<ForkOutcome> {
     // One handoff at a time per source; a concurrent duplicate gets the first call's result. There is
@@ -1591,7 +1592,7 @@ export class Service {
    */
   private async createOpenCodeFork(paseo: PaseoApi, agentId: string, original: Agent, source: "auto" | "user"): Promise<ForkOutcome> {
     const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
-    if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? "another agent") };
+    if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? chatGptCopy.id) };
     const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
     const savedModel = this.prefs.forkOpenCodeModel;

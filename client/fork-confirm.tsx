@@ -107,7 +107,8 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
         <Text style={text.body}>
           This starts a new OpenCode agent in this workspace with the conversation so far, using the OpenCode model and
           thinking option picked in ZeroSub's settings. It gets Plan or Build under this host's OpenCode permission
-          policy, where Build edits files and runs shell without asking, which can allow more than Claude does. This agent stays as it is.
+          policy. Build edits files and runs shell without asking, so it can allow more than Claude does. Claude's Auto classifier and
+          sandbox rules aren't copied. This agent stays as it is.
         </Text>
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
