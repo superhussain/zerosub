@@ -32,3 +32,18 @@ export function equivalentMode(
   }
   return best?.id ?? null;
 }
+
+/**
+ * Whether an agent already in `targetModeId` allows no more than the source's current mode, by the
+ * same tiers `equivalentMode` picks from. An unknown mode on either side is never within.
+ */
+export function withinMode(
+  sourceModes: readonly ModeInfo[],
+  sourceModeId: string | null | undefined,
+  targetModes: readonly ModeInfo[],
+  targetModeId: string | null | undefined,
+): boolean {
+  const ceiling = tierOf(sourceModes.find((mode) => mode.id === sourceModeId));
+  const tier = tierOf(targetModes.find((mode) => mode.id === targetModeId));
+  return ceiling >= 0 && tier >= 0 && tier <= ceiling;
+}

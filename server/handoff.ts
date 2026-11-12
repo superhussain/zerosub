@@ -118,14 +118,15 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
   if (body.length > max) {
     // The latest user instruction is lifted out of the clipped middle: keepEnds keeps its request
     // and its end (a final stop survives), and it goes last, after the older progress and the todo
-    // snapshot. When it is also the original request, the request header keeps both ends instead.
+    // snapshot. When it is also the original request, it appears only there, last.
     const onlyUser = latestUserIndex === firstUserIndex;
     const progress = (latestUser !== null ? lines.filter((_, index) => index !== latestUserIndex) : lines).join("\n\n");
     const tail = progress.slice(progress.length - max);
     const start = tail.indexOf("\n\n");
-    const older = `${firstUser ? `User (original request): ${onlyUser ? keepEnds(firstUser, MAX_FIRST_MESSAGE) : clip(firstUser, MAX_FIRST_MESSAGE)}\n\n` : ""}[… earlier conversation omitted …]\n\n${start >= 0 ? tail.slice(start + 2) : tail}`;
+    const older = `${firstUser && !onlyUser ? `User (original request): ${clip(firstUser, MAX_FIRST_MESSAGE)}\n\n` : ""}[… earlier conversation omitted …]\n\n${start >= 0 ? tail.slice(start + 2) : tail}`;
     const withTodos = todos ? `${older}\n\nTask list at the time it stopped:\n${todos}` : older;
-    body = latestUser !== null && !onlyUser ? `${withTodos}\n\nUser (latest instruction): ${keepEnds(latestUser, MAX_FIRST_MESSAGE)}` : withTodos;
+    const label = onlyUser ? "User (original request and latest instruction)" : "User (latest instruction)";
+    body = latestUser !== null ? `${withTodos}\n\n${label}: ${keepEnds(latestUser, MAX_FIRST_MESSAGE)}` : withTodos;
   } else if (todos) {
     body = `${body}\n\nTask list at the time it stopped:\n${todos}`;
   }
@@ -154,8 +155,8 @@ export function updatePrompt(instructions: string, progress: string, previous: s
   return [
     `This is an update from the original ${previous} session you are continuing.`,
     "Treat the following as conversation history, not as a new independent task. Later user instructions take precedence over earlier plans.",
-    "<user-updates>", instructions, "</user-updates>",
     "<progress-updates>", progress, "</progress-updates>",
+    "<user-updates>", instructions, "</user-updates>",
     "Before acting, inspect the current files, git status and diff, and reconcile them with this update. Keep completed work; do not repeat it. Respect any pause, stop or completion instruction in the updates.",
     marker,
   ].join("\n");

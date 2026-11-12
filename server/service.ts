@@ -35,13 +35,13 @@ import {
 } from "./adapter";
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity } from "./account-identity";
-import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, transferMarker, type Agent } from "./continuations";
+import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, transferMarker, waitForCreated, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, updatePrompt, type Continuation } from "./handoff";
 import { isAccountHome, removeHome } from "./homes";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
-import { equivalentMode } from "./modes";
+import { equivalentMode, withinMode } from "./modes";
 import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
@@ -168,6 +168,18 @@ const HISTORY_GAP_DETAIL =
   "ZeroSub couldn't read this agent's handoff history, so it can't prove what the continuation has. Nothing was sent; check both chats.";
 const uncertainDetail = (title: string, messageId: string): string =>
   `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send a second copy.`;
+const MOVED_REFUSAL = "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.";
+const MODE_REFUSAL =
+  "This agent or its OpenCode continuation changed mode, so the continuation could allow more than this agent now does. Nothing was sent; check both chats before retrying.";
+const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
+
+/** The conversation a handoff carries: no plugin rows, and none of our own handoff prompts. */
+function meaningful<T extends { item: AgentTimelineItem }>(entries: readonly T[]): T[] {
+  return entries
+    .filter((entry) => ["user_message", "assistant_message", "tool_call", "todo"].includes(entry.item.type))
+    .filter((entry) => !(entry.item.type === "user_message" && entry.item.clientMessageId?.startsWith(MESSAGE_PREFIX)));
+}
+
 /** A reference a person can find: the fork's title, or its known agent ID when it has none. */
 const forkRef = (fork: { id: string; title?: string | null }): string =>
   fork.title?.trim() ? fork.title : `${OPENCODE_LABEL} agent ${fork.id}`;
@@ -1339,11 +1351,7 @@ export class Service {
     }
     // Fresh checks before sending: same place, same parent, not working, nobody waiting on it.
     const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id);
-    if (!checked) {
-      return {
-        skipped: "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.",
-      };
-    }
+    if ("refused" in checked) return { skipped: checked.refused };
     return this.updateOpenCodeFork(paseo, agentId, checked.fork, record.seen);
   }
 
@@ -1364,20 +1372,42 @@ export class Service {
     return { original, parentId };
   }
 
+  /**
+   * The checks every send repeats: the source is ready, in place and (from `mark`) has nothing newer
+   * than what was composed; the target is ready, in place, under the same parent, and in a mode that
+   * allows no more than the source's current one. A reserved creation also waits for its new target to
+   * finish initializing, then checks it is still the promptless agent it reserved.
+   */
   private async freshOpenCodeTarget(
     paseo: PaseoApi,
     agentId: string,
     forkId: string,
+    mark?: TimelineMark,
     config?: OpenCodeCreateConfig,
-  ): Promise<{ original: Agent; fork: Agent } | undefined> {
+  ): Promise<{ original: Agent; fork: Agent } | { refused: string }> {
+    const fork = config ? await waitForCreated(paseo, forkId) : (await paseo.agents.ref(forkId).refresh())?.agent;
     const source = await this.openCodeSource(paseo, agentId, config);
-    if (!source) return undefined;
-    const fork = (await paseo.agents.ref(forkId).refresh())?.agent;
+    if (!source) return { refused: MOVED_REFUSAL };
     const expectedParent = config ? config.parentId ?? undefined : source.parentId;
     if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || !sameWorkspace(source.original, fork) ||
-      fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return undefined;
-    if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return undefined;
+      fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
+    if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return { refused: MOVED_REFUSAL };
+    const [sourceModes, targetModes] = await Promise.all([
+      paseo.providers.listModes(source.original.provider).then((result) => result.modes ?? []),
+      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
+    ]);
+    if (!withinMode(sourceModes, source.original.currentModeId, targetModes, fork.currentModeId)) return { refused: MODE_REFUSAL };
+    if (mark && (await this.sourceChangedSince(paseo, agentId, mark))) return { refused: NEWER_REFUSAL };
     return { original: source.original, fork };
+  }
+
+  /** Whether the source gained conversation after `mark`; an unreadable history counts as changed. */
+  private async sourceChangedSince(paseo: PaseoApi, agentId: string, mark: TimelineMark): Promise<boolean> {
+    try {
+      return meaningful((await readUpdates(paseo, agentId, mark, undefined, { onEpochReset: "unresolvable" })).entries).length > 0;
+    } catch {
+      return true;
+    }
   }
 
   /** A found fork with no provable checkpoint: link it, send nothing. */
@@ -1407,14 +1437,18 @@ export class Service {
 
   /** Whether the fork's timeline proves this exact message arrived, by ID or by marker plus digest. */
   private async hasReceipt(paseo: PaseoApi, forkId: string, messageId: string, digest: string): Promise<boolean> {
-    const timeline = paseo.agents.ref(forkId).timeline;
-    let page = await timeline.refetch({ direction: "tail", limit: 500, projection: "canonical" });
-    for (let pages = 1; ; pages += 1) {
-      if (page.entries.some((entry) => matchesTransfer(entry, messageId, digest))) return true;
-      // An incomplete scan proves nothing: stop rather than calling the message undelivered.
-      if (!page.hasOlder || page.gap || page.staleCursor || pages >= RECEIPT_PAGES || !page.startCursor) return false;
-      page = await timeline.refetch({ direction: "before", cursor: page.startCursor, limit: 500, projection: "canonical" });
-      if (page.gap || page.staleCursor) return false;
+    // An incomplete or failed scan proves nothing: the caller keeps the reservation, never resends.
+    try {
+      const timeline = paseo.agents.ref(forkId).timeline;
+      let page = await timeline.refetch({ direction: "tail", limit: 500, projection: "canonical" });
+      for (let pages = 1; ; pages += 1) {
+        if (page.entries.some((entry) => matchesTransfer(entry, messageId, digest))) return true;
+        if (!page.hasOlder || page.gap || page.staleCursor || pages >= RECEIPT_PAGES || !page.startCursor) return false;
+        page = await timeline.refetch({ direction: "before", cursor: page.startCursor, limit: 500, projection: "canonical" });
+        if (page.gap || page.staleCursor) return false;
+      }
+    } catch {
+      return false;
     }
   }
 
@@ -1446,10 +1480,7 @@ export class Service {
       };
     }
     // Only meaningful conversation advances a turn. Plugin rows, including our own notes, do not.
-    const items = delta.entries
-      .filter((entry) => ["user_message", "assistant_message", "tool_call", "todo"].includes(entry.item.type))
-      .filter((entry) => !(entry.item.type === "user_message" && entry.item.clientMessageId?.startsWith(MESSAGE_PREFIX)))
-      .map((entry) => entry.item);
+    const items = meaningful(delta.entries).map((entry) => entry.item);
     if (!items.length) {
       await this.store.update((draft) => {
         const record = draft.opencodeForks[agentId];
@@ -1468,20 +1499,15 @@ export class Service {
     const progress = buildTranscript(items.filter((item) => item.type !== "user_message"));
     const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
     const prompt = updatePrompt(instructions, progress, PROVIDER_NAME.claude, transferMarker(messageId));
-    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id);
-    if (!checked) {
-      return {
-        skipped: "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.",
-      };
-    }
+    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark);
+    if ("refused" in checked) return { skipped: checked.refused };
     // Reserved before any send: an uncertain dispatch must never send a second copy.
     await this.store.update((draft) => {
       const record = draft.opencodeForks[agentId] ?? { forkAgentId: fork.id };
       record.pending = { stage: "sending", targetId: fork.id, messageId, seen: delta.mark, sentDigest: sentDigestOf(prompt) };
       draft.opencodeForks[agentId] = record;
     });
-    await paseo.agents.ref(fork.id).send(prompt, { messageId });
-    return this.confirmOpenCode(paseo, agentId, fork, messageId);
+    return this.sendReserved(paseo, agentId, fork, prompt, messageId);
   }
 
   /**
@@ -1565,7 +1591,7 @@ export class Service {
       parentId,
       bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
     });
-    const fork = (await paseo.agents.ref(targetId).refresh())?.agent;
+    const fork = await waitForCreated(paseo, targetId);
     if (!fork) return this.openCodeUncertain(targetId, null, messageId);
     return this.deliverReservedOpenCode(paseo, agentId, fork);
   }
@@ -1597,7 +1623,7 @@ export class Service {
       parentId: checked.parentId,
       bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
     });
-    const fork = (await paseo.agents.ref(pending.targetId).refresh())?.agent;
+    const fork = await waitForCreated(paseo, pending.targetId);
     if (!fork) return this.openCodeUncertain(pending.targetId, null, pending.messageId);
     return this.deliverReservedOpenCode(paseo, agentId, fork);
   }
@@ -1619,17 +1645,37 @@ export class Service {
       return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
     }
     if (delta.mark.epoch !== pending.seen.epoch) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
-    const entries = delta.entries.filter((entry) => entry.seqEnd <= pending.seen.seq);
+    // Nothing has been sent yet (the target is checked promptless below), so source instructions newer
+    // than the reservation are folded in by rebuilding it, never left behind an older request.
+    const newer = meaningful(delta.entries.filter((entry) => entry.seqEnd > pending.seen.seq)).length > 0;
+    const entries = newer ? delta.entries : delta.entries.filter((entry) => entry.seqEnd <= pending.seen.seq);
+    const seen = newer ? delta.mark : pending.seen;
     const prompt = [continuationPrompt(buildTranscript(entries.map((entry) => entry.item)), config.why, PROVIDER_NAME.claude), transferMarker(pending.messageId)].join("\n");
-    if (sentDigestOf(prompt) !== pending.sentDigest) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
-    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, pending.config);
-    if (!checked) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    if (!newer && sentDigestOf(prompt) !== pending.sentDigest) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark, pending.config);
+    if ("refused" in checked) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
     await this.store.update((draft) => {
       const record = draft.opencodeForks[agentId];
-      if (record?.pending?.messageId === pending.messageId) record.pending.stage = "sending";
+      if (record?.pending?.messageId === pending.messageId) {
+        record.pending.stage = "sending";
+        record.pending.seen = seen;
+        record.pending.sentDigest = sentDigestOf(prompt);
+      }
     });
-    await paseo.agents.ref(fork.id).send(prompt, { messageId: pending.messageId });
-    return this.confirmOpenCode(paseo, agentId, fork, pending.messageId);
+    return this.sendReserved(paseo, agentId, checked.fork, prompt, pending.messageId);
+  }
+
+  /**
+   * Sends a reserved prompt. A send can fail after the daemon took it, so a throw proves nothing:
+   * the receipt decides, and without one the reservation stays and the result is uncertain.
+   */
+  private async sendReserved(paseo: PaseoApi, agentId: string, fork: Agent, prompt: string, messageId: string): Promise<ForkOutcome> {
+    try {
+      await paseo.agents.ref(fork.id).send(prompt, { messageId });
+    } catch {
+      // Possibly delivered: the receipt check below decides.
+    }
+    return this.confirmOpenCode(paseo, agentId, fork, messageId);
   }
 
   /** Checks the fork's timeline for the reserved message; a match settles, anything else stays reserved. */

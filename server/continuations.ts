@@ -467,7 +467,7 @@ async function waitForSource(paseo: PaseoApi, original: Agent, source: Source): 
 }
 
 /** A tab created without a prompt can still report initializing for a moment before it is idle. */
-async function waitForCreated(paseo: PaseoApi, agentId: string): Promise<Agent | undefined> {
+export async function waitForCreated(paseo: PaseoApi, agentId: string): Promise<Agent | undefined> {
   let agent = await snapshot(paseo, agentId);
   for (let attempt = 0; agent?.status === "initializing" && attempt < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -666,7 +666,8 @@ export async function readUpdates(
   const after = since?.epoch === page.epoch ? since.seq : -1;
   const entries = [...page.entries];
   const foundReceipt = () => receiptId !== undefined && entries.some((entry) => delivered(entry, receiptId));
-  for (let pages = 1; page.hasOlder && (page.startCursor?.seq ?? 0) > after && !foundReceipt(); pages += 1) {
+  // Older rows with no cursor to reach them can't be proven read, whatever the watermark says.
+  for (let pages = 1; page.hasOlder && (page.startCursor?.seq ?? Infinity) > after && !foundReceipt(); pages += 1) {
     if (pages >= MAX_PAGES || !page.startCursor) throw new Error("Couldn't read the complete handoff history. Try again after checking the task's timeline.");
     page = await timeline.refetch({ direction: "before", cursor: page.startCursor, limit: 500, projection: "canonical" });
     if (page.epoch !== mark.epoch || page.staleCursor || page.gap) throw new Error("The task's history changed during the handoff. Try again.");

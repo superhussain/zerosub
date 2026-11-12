@@ -2,7 +2,7 @@
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./adapter";
-import { buildTranscript, continuationPrompt, continueInNewAgent, keepEnds, shortenEarlierHandOff } from "./handoff";
+import { buildTranscript, continuationPrompt, continueInNewAgent, keepEnds, shortenEarlierHandOff, updatePrompt } from "./handoff";
 
 const OPEN = "<previous-session>";
 const CLOSE = "</previous-session>";
@@ -133,14 +133,25 @@ describe("clipping a transcript", () => {
     );
   });
 
-  it("keeps a terminal stop when the only user message is the latest one", () => {
+  it("keeps a terminal stop when the only user message is the latest one, after the todo snapshot", () => {
     const transcript = buildTranscript([
       user(`${"Please do the work. ".repeat(400)}STOP, DO NOT MODIFY ANYTHING`),
+      { type: "todo", items: [{ text: "Ship it", completed: false }] },
       { type: "assistant_message", text: "a".repeat(50_000) },
     ]);
-    expect(transcript).toMatch(/User \(original request\):[\s\S]*STOP, DO NOT MODIFY ANYTHING/);
+    expect(transcript).toMatch(/User \(original request and latest instruction\):[\s\S]*STOP, DO NOT MODIFY ANYTHING$/);
     expect(transcript).toContain("[… omitted …]");
-    expect(transcript).not.toContain("User (latest instruction):");
+    expect(transcript.indexOf("Task list at the time it stopped:")).toBeLessThan(transcript.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+    expect(transcript.match(/Please do the work\./g)!.length).toBeLessThan(400);
+  });
+});
+
+describe("an update for an existing fork", () => {
+  it("puts the user's instructions after the older progress", () => {
+    const prompt = updatePrompt("User: STOP", "Assistant: Continuing.\n\nTask list at the time it stopped:\n- [ ] Ship it", "Claude Code", "zerosub transfer m1");
+    expect(prompt.indexOf("<progress-updates>")).toBeLessThan(prompt.indexOf("<user-updates>"));
+    expect(prompt.indexOf("- [ ] Ship it")).toBeLessThan(prompt.indexOf("User: STOP"));
+    expect(prompt.endsWith("zerosub transfer m1")).toBe(true);
   });
 });
 

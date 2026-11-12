@@ -488,6 +488,12 @@ describe("forking to the other provider", () => {
     } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
+    /** Seams for the network boundary: a test can act between reads, or make a send or read throw. */
+    const hooks: {
+      onRefetch?: (id: string) => void;
+      send?: (id: string, text: string, messageId: string | undefined) => void;
+      createdStatus?: string;
+    } = {};
     await store.update((draft) =>
       Object.assign(draft, {
         accounts: options.noChatGPT
@@ -564,7 +570,8 @@ describe("forking to the other provider", () => {
               const agent = {
                 id: request.agentId,
                 provider: request.config.provider.split("/")[0],
-                status: "idle",
+                status: hooks.createdStatus ?? "idle",
+                currentModeId: request.config.modeId,
                 title: request.title,
                 workspaceId: "ws-1",
                 archivedAt: null,
@@ -581,6 +588,7 @@ describe("forking to the other provider", () => {
         ref: (id: string) => ({
           refresh: async () => ({ agent: byId.get(id) ?? null }),
           send: async (text: string, options: { messageId?: string } = {}) => {
+            if (hooks.send) return hooks.send(id, text, options.messageId);
             sends.push({ agentId: id, text, messageId: options.messageId });
             addTurn(id, { type: "user_message", text }, options.messageId);
           },
@@ -591,6 +599,7 @@ describe("forking to the other provider", () => {
             },
             refetch: async (options: { direction?: string; cursor?: { epoch: string; seq: number } | null; limit?: number } = {}) => {
               timelineReads.push({ id, direction: options.direction });
+              hooks.onRefetch?.(id);
               if ((gap.source && id === AGENT) || (gap.fork && id !== AGENT)) {
                 return { entries: [], gap: true, staleCursor: false, epoch: epochOf(id), window: { maxSeq: 0 }, hasOlder: false, startCursor: null };
               }
@@ -628,7 +637,7 @@ describe("forking to the other provider", () => {
         { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
         context,
       );
-    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
+    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents, hooks, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
   }
 
   it("carries the work on with the other provider, at the same permission level", async () => {
@@ -751,6 +760,7 @@ describe("forking to the other provider", () => {
       provider: "opencode",
       status: "idle",
       title: "Fix the build (continued on OpenCode)",
+      currentModeId: "code",
       workspaceId: "ws-1",
       archivedAt: null,
       labels: { "zerosub.continued-from": AGENT },
@@ -1133,6 +1143,166 @@ describe("forking to the other provider", () => {
       await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
       expect(setup.sends).toHaveLength(0);
       expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", continuedIn: { agentId: RESERVED.targetId } });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't read this agent's handoff history/);
+    });
+
+    it("refuses to keep sending to an older fork once the source moved to a more careful mode", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.byId.get(AGENT)!.currentModeId = "plan";
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/changed mode/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual(MARK);
+    });
+
+    it.each([
+      ["a broader mode than the source's", "code", "acceptEdits"],
+      ["a mode the catalog doesn't list", "mystery", "bypassPermissions"],
+    ])("refuses a fork now in %s", async (_, forkMode, sourceMode) => {
+      const setup = await setUpReuse({ currentModeId: forkMode }, { seen: MARK });
+      setup.byId.get(AGENT)!.currentModeId = sourceMode;
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/changed mode/);
+      expect(setup.sends).toHaveLength(0);
+    });
+
+    it("still sends to a fork in a more careful mode than the source's", async () => {
+      const setup = await setUpReuse({ currentModeId: "build" }, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("refuses an update when the source gained a newer instruction after it was read", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      let sourceReads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && ++sourceReads === 2) setup.addTurn(AGENT, { type: "user_message", text: "STOP" }, "user-3");
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual(MARK);
+    });
+
+    it("rebuilds an undelivered reserved creation with the source's newer instruction", async () => {
+      const setup = await setUpReuse({}, reservedCreation());
+      setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2");
+      const stopSeq = setup.timelines.get(AGENT)!.at(-1)!.seqEnd;
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+      // The rebuilt reservation's mark covers the STOP, not the row ZeroSub appended afterwards.
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(stopSeq);
+    });
+
+    it("never sends the older initial request when a STOP lands after it was gathered", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.addTurn(AGENT, { type: "user_message", text: "Fix the build" }, "user-1");
+      // The STOP arrives after the create gathered the window it reserved, before the delivery.
+      let added = false;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && setup.created.length === 1 && !added) {
+          added = true;
+          setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2");
+        }
+      };
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+    });
+
+    it("waits for a created fork that is still initializing, then delivers once", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createdStatus = "initializing";
+      // The fork reports idle a moment after it is created, as a promptless OpenCode agent does.
+      const settle = setInterval(() => {
+        for (const agent of setup.byId.values()) if (agent.status === "initializing") setTimeout(() => { agent.status = "idle"; }, 500);
+      }, 100);
+      try {
+        expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      } finally {
+        clearInterval(settle);
+      }
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("keeps the reservation when a created fork never finishes initializing", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createdStatus = "initializing";
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    }, 15_000);
+
+    it("settles a send whose acknowledgement was lost when the receipt is there", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      setup.hooks.send = (id, text, messageId) => {
+        setup.sends.push({ agentId: id, text, messageId });
+        setup.addTurn(id, { type: "user_message", text }, messageId);
+        throw new Error("socket hang up");
+      };
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("stays uncertain, keeping the transfer, when the send and the receipt read both throw", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      setup.hooks.send = (id, text, messageId) => {
+        setup.sends.push({ agentId: id, text, messageId });
+        setup.hooks.onRefetch = (read) => {
+          if (read === RESERVED.targetId) throw new Error("timeline read failed");
+        };
+        throw new Error("socket hang up");
+      };
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending;
+      expect(pending?.messageId).toBe(setup.sends[0]!.messageId);
+      expect(setup.notes.at(-1)?.detail).toContain(setup.sends[0]!.messageId!);
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("puts the latest instruction after older progress and todos in an update", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "CONTINUE EVERYTHING" }, "user-2");
+      setup.addTurn(AGENT, { type: "assistant_message", text: "Continuing with the release." });
+      setup.addTurn(AGENT, { type: "todo", items: [{ text: "Ship it", completed: false }] });
+      setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-3");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const text = setup.sends[0]!.text;
+      expect(text.indexOf("Continuing with the release.")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+      expect(text.indexOf("- [ ] Ship it")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+      expect(text.indexOf("CONTINUE EVERYTHING")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+    });
+
+    it("keeps the update's watermark when older history has no usable cursor", async () => {
+      const setup = await setUpReuse({}, { seen: { epoch: "epoch-1", seq: 1 } });
+      setup.timelines.set(
+        AGENT,
+        Array.from({ length: 600 }, (_, row) => ({ item: { type: "assistant_message", text: `Row ${row}` } as AgentTimelineItem, seqEnd: row + 1 })),
+      );
+      const timeline = setup.paseo as unknown as { agents: { ref: (id: string) => { timeline: { refetch: (o: unknown) => Promise<Record<string, unknown>> } } } };
+      const ref = timeline.agents.ref;
+      timeline.agents.ref = (id: string) => {
+        const real = ref(id);
+        if (id !== AGENT) return real;
+        const refetch = real.timeline.refetch;
+        real.timeline.refetch = async (options: unknown) => ({ ...(await refetch(options)), startCursor: null });
+        return real;
+      };
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual({ epoch: "epoch-1", seq: 1 });
       expect(setup.notes.at(-1)?.detail).toMatch(/couldn't read this agent's handoff history/);
     });
 
