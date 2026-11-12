@@ -457,6 +457,7 @@ describe("forking to the other provider", () => {
       { id: "plan", label: "Plan Mode", colorTier: "planning" },
       { id: "default", label: "Always Ask", colorTier: "safe" },
       { id: "acceptEdits", label: "Accept File Edits", colorTier: "moderate" },
+      { id: "auto", label: "Auto", colorTier: "moderate" },
       { id: "bypassPermissions", label: "Bypass", colorTier: "dangerous" },
     ],
     codex: [
@@ -544,8 +545,9 @@ describe("forking to the other provider", () => {
     const modes: Record<string, Array<{ id: string; label: string; colorTier?: string }>> = {
       ...MODES,
       opencode: options.opencodeModes ?? [
+        // Paseo's real OpenCode catalog.
         { id: "build", label: "Build", colorTier: "moderate" },
-        { id: "code", label: "Code", colorTier: "dangerous" },
+        { id: "plan", label: "Plan", colorTier: "planning" },
       ],
     };
     const models: Record<string, Array<Record<string, unknown>>> = {
@@ -721,7 +723,7 @@ describe("forking to the other provider", () => {
       const fork = created[0];
       expect(fork?.config).toEqual({
         provider: "opencode/opencode/glm-5p3-flash",
-        modeId: "code", // no more permissive than Bypass
+        modeId: "build", // Bypass is as loose as Build gets
         thinkingOptionId: "high",
       });
       expect(fork?.title).toBe("Fix the build (continued on OpenCode)");
@@ -748,10 +750,9 @@ describe("forking to the other provider", () => {
     it("uses the host's default model, and no thinking override, when none was saved", async () => {
       const { created, limitTurn } = await setUpFork("default", [], {}, [], {
         prefs: { forkOtherProvider: true, claudeForkDestination: "opencode" },
-        opencodeModes: [{ id: "ask", label: "Ask", colorTier: "safe" }],
       });
       await limitTurn();
-      expect(created[0]?.config).toEqual({ provider: "opencode/opencode/glm-5p3-flash", modeId: "ask" });
+      expect(created[0]?.config).toEqual({ provider: "opencode/opencode/glm-5p3-flash", modeId: "plan" });
     });
 
     it("points at the earlier OpenCode fork instead of starting another", async () => {
@@ -768,7 +769,7 @@ describe("forking to the other provider", () => {
       provider: "opencode",
       status: "idle",
       title: "Fix the build (continued on OpenCode)",
-      currentModeId: "code",
+      currentModeId: "build",
       workspaceId: "ws-1",
       archivedAt: null,
       labels: { "zerosub.continued-from": AGENT },
@@ -778,7 +779,7 @@ describe("forking to the other provider", () => {
     const whyOf = (source: "auto" | "user") => (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
     const CREATE_CONFIG = {
       provider: "opencode/opencode/glm-5p3-flash",
-      modeId: "code",
+      modeId: "build",
       thinkingOptionId: "high",
       workspaceId: "ws-1",
       cwd: null,
@@ -1433,7 +1434,7 @@ describe("forking to the other provider", () => {
     });
 
     it.each([
-      ["a broader mode than the source's", "code", "acceptEdits"],
+      ["a broader mode than the source's", "build", "plan"],
       ["a mode the catalog doesn't list", "mystery", "bypassPermissions"],
     ])("refuses a fork now in %s", async (_, forkMode, sourceMode) => {
       const setup = await setUpReuse({ currentModeId: forkMode }, { seen: MARK });
@@ -1729,6 +1730,64 @@ describe("forking to the other provider", () => {
   });
   });
 
+  describe("a continuation of the other kind", () => {
+    const chatGptAgent = {
+      id: "gpt-fork",
+      provider: "codex",
+      status: "idle",
+      title: "Fix the build (continued on ChatGPT)",
+      workspaceId: "ws-1",
+      archivedAt: null,
+      labels: { "zerosub.continued-from": AGENT },
+    };
+    const openCodeAgent = { ...chatGptAgent, id: "oc-fork", provider: "opencode", title: "Fix the build (continued on OpenCode)" };
+    const AUTO = { forkOtherProvider: true };
+
+    it("creates no OpenCode fork when ChatGPT already continued the agent", async () => {
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [chatGptAgent], {
+        prefs: { ...AUTO, claudeForkDestination: "opencode" },
+      });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toMatch(/already continued in “Fix the build \(continued on ChatGPT\)”/);
+    });
+
+    it("creates no ChatGPT fork when OpenCode already continued the agent", async () => {
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [openCodeAgent], { prefs: AUTO });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toMatch(/already continued in “Fix the build \(continued on OpenCode\)”/);
+    });
+
+    it("refuses a manual OpenCode fork that names the ChatGPT chat", async () => {
+      const { created, service, paseo } = await setUpFork("bypassPermissions", [], {}, [chatGptAgent], { prefs: { autoSwitch: false } });
+      await expect(service.forkAgent(paseo, AGENT, "opencode")).rejects.toThrow(/already continued in “Fix the build \(continued on ChatGPT\)”/);
+      expect(created).toHaveLength(0);
+    });
+
+    it("refuses a manual ChatGPT fork that names the OpenCode chat", async () => {
+      const { created, service, paseo } = await setUpFork("bypassPermissions", [], {}, [openCodeAgent], { prefs: { autoSwitch: false } });
+      await expect(service.forkAgent(paseo, AGENT)).rejects.toThrow(/already continued in “Fix the build \(continued on OpenCode\)”/);
+      expect(created).toHaveLength(0);
+    });
+  });
+
+  describe("OpenCode mode choice", () => {
+    it.each([
+      ["plan", "plan"],
+      ["default", "plan"],
+      ["acceptEdits", "build"],
+      ["auto", "build"],
+      ["bypassPermissions", "build"],
+    ])("sends a %s Claude agent to OpenCode %s", async (claudeMode, openCodeMode) => {
+      const { created, limitTurn } = await setUpFork(claudeMode, [], {}, [], {
+        prefs: { forkOtherProvider: true, claudeForkDestination: "opencode" },
+      });
+      await limitTurn();
+      expect(created[0]?.config.modeId).toBe(openCodeMode);
+    });
+  });
+
   describe("manual OpenCode continuation", () => {
     const PREFS = { autoSwitch: false, forkOtherProvider: false, forkOpenCodeModel: "opencode/glm-5p3-flash", forkOpenCodeThinking: "high" };
     const manually = async (options: { modeId?: string } & Parameters<typeof setUpFork>[4] = {}) => {
@@ -1744,7 +1803,7 @@ describe("forking to the other provider", () => {
       expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)", delivery: "sent" });
       expect(created[0]?.config).toEqual({
         provider: "opencode/opencode/glm-5p3-flash",
-        modeId: "code", // no more permissive than Bypass
+        modeId: "build", // Bypass is as loose as Build gets
         thinkingOptionId: "high",
       });
       expect(created[0]?.title).toBe("Fix the build (continued on OpenCode)");
