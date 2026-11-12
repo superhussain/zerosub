@@ -35,7 +35,7 @@ import {
 } from "./adapter";
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity } from "./account-identity";
-import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, transferMarker, waitForCreated, type Agent } from "./continuations";
+import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, updatePrompt, type Continuation } from "./handoff";
 import { isAccountHome, removeHome } from "./homes";
 import { Mutex } from "./json-file";
@@ -1290,9 +1290,12 @@ export class Service {
     );
     if (!available) return { skipped: `${OPENCODE_LABEL} isn't available in Paseo on this host.` };
 
-    const original = (await paseo.agents.ref(agentId).refresh())?.agent;
-    if (!original) throw new Error("That agent is no longer available.");
-    if (!ready(original)) {
+    const first = (await paseo.agents.ref(agentId).refresh())?.agent;
+    if (!first) throw new Error("That agent is no longer available.");
+    // turn_ended can arrive just before the source reports idle: an automatic fork waits a moment,
+    // refusing if a newer message arrives meanwhile.
+    const original = source === "auto" ? await waitForSource(paseo, first, "auto").catch(() => undefined) : first;
+    if (!original || !ready(original)) {
       return { skipped: "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode." };
     }
 
@@ -1373,10 +1376,13 @@ export class Service {
   }
 
   /**
-   * The checks every send repeats: the source is ready, in place and (from `mark`) has nothing newer
-   * than what was composed; the target is ready, in place, under the same parent, and in a mode that
-   * allows no more than the source's current one. A reserved creation also waits for its new target to
-   * finish initializing, then checks it is still the promptless agent it reserved.
+   * The checks run before a reservation is written and again right before its send: the source has
+   * nothing newer than `mark` and is ready and in place; the target is ready, in place, under the same
+   * parent, and in a mode whose Paseo tier is no higher than the source's current one (tiers only, not
+   * OpenCode's permission policy). A reserved creation first waits for its new target to finish
+   * initializing, and the target must still be the promptless agent it reserved. The snapshots are
+   * read last, after every timeline read, so the comparison sees the modes as of the send. The SDK has
+   * no compare-and-send: a change after these reads and before the send is still possible.
    */
   private async freshOpenCodeTarget(
     paseo: PaseoApi,
@@ -1385,20 +1391,26 @@ export class Service {
     mark?: TimelineMark,
     config?: OpenCodeCreateConfig,
   ): Promise<{ original: Agent; fork: Agent } | { refused: string }> {
-    const fork = config ? await waitForCreated(paseo, forkId) : (await paseo.agents.ref(forkId).refresh())?.agent;
+    if (config) await waitForCreated(paseo, forkId);
+    if (mark && (await this.sourceChangedSince(paseo, agentId, mark))) return { refused: NEWER_REFUSAL };
     const source = await this.openCodeSource(paseo, agentId, config);
     if (!source) return { refused: MOVED_REFUSAL };
-    const expectedParent = config ? config.parentId ?? undefined : source.parentId;
-    if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || !sameWorkspace(source.original, fork) ||
-      fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
-    if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return { refused: MOVED_REFUSAL };
     const [sourceModes, targetModes] = await Promise.all([
       paseo.providers.listModes(source.original.provider).then((result) => result.modes ?? []),
       paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
     ]);
-    if (!withinMode(sourceModes, source.original.currentModeId, targetModes, fork.currentModeId)) return { refused: MODE_REFUSAL };
-    if (mark && (await this.sourceChangedSince(paseo, agentId, mark))) return { refused: NEWER_REFUSAL };
-    return { original: source.original, fork };
+    const [original, fork] = await Promise.all([
+      paseo.agents.ref(agentId).refresh().then((result) => result?.agent),
+      paseo.agents.ref(forkId).refresh().then((result) => result?.agent),
+    ]);
+    if (!original || !ready(original)) return { refused: MOVED_REFUSAL };
+    if (original.lastUserMessageAt !== source.original.lastUserMessageAt) return { refused: NEWER_REFUSAL };
+    const expectedParent = config ? config.parentId ?? undefined : source.parentId;
+    if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || !sameWorkspace(original, fork) ||
+      fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
+    if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return { refused: MOVED_REFUSAL };
+    if (!withinMode(sourceModes, original.currentModeId, targetModes, fork.currentModeId)) return { refused: MODE_REFUSAL };
+    return { original, fork };
   }
 
   /** Whether the source gained conversation after `mark`; an unreadable history counts as changed. */
@@ -1507,7 +1519,17 @@ export class Service {
       record.pending = { stage: "sending", targetId: fork.id, messageId, seen: delta.mark, sentDigest: sentDigestOf(prompt) };
       draft.opencodeForks[agentId] = record;
     });
-    return this.sendReserved(paseo, agentId, fork, prompt, messageId);
+    // Again after the write: input or modes can change while it commits. Nothing is sent yet, so a
+    // refusal here drops the reservation instead of leaving it uncertain.
+    const recheck = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark);
+    if ("refused" in recheck) {
+      await this.store.update((draft) => {
+        const record = draft.opencodeForks[agentId];
+        if (record?.pending?.messageId === messageId) delete record.pending;
+      });
+      return { skipped: recheck.refused };
+    }
+    return this.sendReserved(paseo, agentId, recheck.fork, prompt, messageId);
   }
 
   /**
@@ -1645,24 +1667,37 @@ export class Service {
       return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
     }
     if (delta.mark.epoch !== pending.seen.epoch) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    const why = config.why;
+    const compose = (entries: typeof delta.entries) =>
+      [continuationPrompt(buildTranscript(entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(pending.messageId)].join("\n");
+    // The reserved prompt must still rebuild to its digest before anything is sent or rebuilt.
+    const reserved = compose(delta.entries.filter((entry) => entry.seqEnd <= pending.seen.seq));
+    if (sentDigestOf(reserved) !== pending.sentDigest) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
     // Nothing has been sent yet (the target is checked promptless below), so source instructions newer
     // than the reservation are folded in by rebuilding it, never left behind an older request.
     const newer = meaningful(delta.entries.filter((entry) => entry.seqEnd > pending.seen.seq)).length > 0;
-    const entries = newer ? delta.entries : delta.entries.filter((entry) => entry.seqEnd <= pending.seen.seq);
-    const seen = newer ? delta.mark : pending.seen;
-    const prompt = [continuationPrompt(buildTranscript(entries.map((entry) => entry.item)), config.why, PROVIDER_NAME.claude), transferMarker(pending.messageId)].join("\n");
-    if (!newer && sentDigestOf(prompt) !== pending.sentDigest) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
-    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark, pending.config);
+    const prompt = newer ? compose(delta.entries) : reserved;
+    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark, config);
     if ("refused" in checked) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
     await this.store.update((draft) => {
       const record = draft.opencodeForks[agentId];
       if (record?.pending?.messageId === pending.messageId) {
         record.pending.stage = "sending";
-        record.pending.seen = seen;
+        record.pending.seen = newer ? delta.mark : pending.seen;
         record.pending.sentDigest = sentDigestOf(prompt);
       }
     });
-    return this.sendReserved(paseo, agentId, checked.fork, prompt, pending.messageId);
+    // Again after the write. Nothing is sent yet, so a refusal returns the reservation to the
+    // promptless state it was frozen in, for the next call to rebuild.
+    const recheck = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark, config);
+    if ("refused" in recheck) {
+      await this.store.update((draft) => {
+        const record = draft.opencodeForks[agentId];
+        if (record?.pending?.messageId === pending.messageId) record.pending = pending;
+      });
+      return { skipped: recheck.refused };
+    }
+    return this.sendReserved(paseo, agentId, recheck.fork, prompt, pending.messageId);
   }
 
   /**

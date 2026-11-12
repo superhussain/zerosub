@@ -12,10 +12,10 @@ function tierOf(mode: ModeInfo | undefined): number {
 }
 
 /**
- * The other provider's mode that allows no more than the source agent's mode: the same tier if it
- * has one, otherwise the closest more careful one (first listed wins a tie). `null` when it has
- * nothing that careful, or the source mode is unknown, so a fork never gets more freedom than the
- * user gave the original.
+ * The other provider's mode whose Paseo tier is no higher than the source agent's: the same tier if
+ * it has one, otherwise the closest more careful one (first listed wins a tie). `null` when it has
+ * nothing that careful, or the source mode is unknown. Tiers order modes; they don't make two
+ * providers' policies equivalent.
  */
 export function equivalentMode(
   sourceModes: readonly ModeInfo[],
@@ -34,8 +34,9 @@ export function equivalentMode(
 }
 
 /**
- * Whether an agent already in `targetModeId` allows no more than the source's current mode, by the
- * same tiers `equivalentMode` picks from. An unknown mode on either side is never within.
+ * Whether `targetModeId`'s Paseo tier is no higher than the source mode's tier, by the same ordering
+ * `equivalentMode` picks from. It compares tiers only, not what each provider's own policy allows.
+ * An unknown mode on either side is never within.
  */
 export function withinMode(
   sourceModes: readonly ModeInfo[],

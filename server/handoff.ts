@@ -11,6 +11,7 @@ export const PARENT_LABEL = "paseo.parent-agent-id";
 
 const MAX_TRANSCRIPT = 40_000;
 const MAX_FIRST_MESSAGE = 6_000;
+const MAX_TODOS = 6_000;
 const MAX_EARLIER_HANDOFF = 6_000;
 
 const OPEN = "<previous-session>";
@@ -87,6 +88,7 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
   let latestUser: string | null = null;
   let latestUserIndex: number | null = null;
   let todos: string | null = null;
+  let todosIndex = 0;
   for (const item of timeline) {
     switch (item.type) {
       case "user_message": {
@@ -109,28 +111,35 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
         break;
       case "todo":
         todos = item.items.map((task) => `- [${task.completed ? "x" : " "}] ${task.text}`).join("\n");
+        todosIndex = lines.length;
         break;
       default:
         break;
     }
   }
-  let body = lines.join("\n\n");
-  if (body.length > max) {
-    // The latest user instruction is lifted out of the clipped middle: keepEnds keeps its request
-    // and its end (a final stop survives), and it goes last, after the older progress and the todo
-    // snapshot. When it is also the original request, it appears only there, last.
-    const onlyUser = latestUserIndex === firstUserIndex;
-    const progress = (latestUser !== null ? lines.filter((_, index) => index !== latestUserIndex) : lines).join("\n\n");
-    const tail = progress.slice(progress.length - max);
-    const start = tail.indexOf("\n\n");
-    const older = `${firstUser && !onlyUser ? `User (original request): ${clip(firstUser, MAX_FIRST_MESSAGE)}\n\n` : ""}[… earlier conversation omitted …]\n\n${start >= 0 ? tail.slice(start + 2) : tail}`;
-    const withTodos = todos ? `${older}\n\nTask list at the time it stopped:\n${todos}` : older;
-    const label = onlyUser ? "User (original request and latest instruction)" : "User (latest instruction)";
-    body = latestUser !== null ? `${withTodos}\n\n${label}: ${keepEnds(latestUser, MAX_FIRST_MESSAGE)}` : withTodos;
-  } else if (todos) {
-    body = `${body}\n\nTask list at the time it stopped:\n${todos}`;
+  // The todo snapshot counts against `max`. Unclipped, it sits where the list last changed, so an
+  // instruction given after it stays after it. Clipped, the latest user instruction is lifted out
+  // and goes last, after the snapshot; when it is also the original request, it appears only there.
+  const onlyUser = latestUserIndex === firstUserIndex;
+  const label = onlyUser ? "User (original request and latest instruction)" : "User (latest instruction)";
+  const todoSection = todos === null ? "" : `Task list at the time it stopped:\n${keepEnds(todos, Math.min(MAX_TODOS, Math.floor(max / 4)))}`;
+  const rest = latestUser !== null ? lines.filter((_, index) => index !== latestUserIndex) : lines;
+  const body = lines.join("\n\n");
+  if (body.length + todoSection.length <= max) {
+    return [...lines.slice(0, todosIndex), todoSection, ...lines.slice(todosIndex)].filter(Boolean).join("\n\n");
   }
-  return body;
+  const head = firstUser && !onlyUser ? `User (original request): ${clip(firstUser, MAX_FIRST_MESSAGE)}` : "";
+  const omitted = "[… earlier conversation omitted …]";
+  const latest = latestUser === null ? "" : `${label}: ${keepEnds(latestUser, MAX_FIRST_MESSAGE)}`;
+  const progress = rest.join("\n\n");
+  const room = Math.max(0, max - [head, omitted, todoSection, latest].filter(Boolean).join("\n\n").length - 2);
+  let kept = progress;
+  if (progress.length > room) {
+    const tail = progress.slice(progress.length - room);
+    const start = tail.indexOf("\n\n");
+    kept = start >= 0 ? tail.slice(start + 2) : tail;
+  }
+  return [head, omitted, kept, todoSection, latest].filter(Boolean).join("\n\n");
 }
 
 export function continuationPrompt(transcript: string, why: string, previous = "Codex"): string {
@@ -142,7 +151,7 @@ export function continuationPrompt(transcript: string, why: string, previous = "
     transcript,
     CLOSE,
     "",
-    "Pick up exactly where it left off. Check the current state of the files before changing anything, and don't redo finished work.",
+    "Pick up exactly where it left off, unless the latest user instruction says to stop or pause: then do only what it allows. Check the current state of the files before changing anything, and don't redo finished work.",
   ].join("\n");
 }
 

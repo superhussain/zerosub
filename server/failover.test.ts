@@ -1199,6 +1199,92 @@ describe("forking to the other provider", () => {
       expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(stopSeq);
     });
 
+    /** Runs `act` once, right after the store commits a sending reservation. */
+    const duringSendingWrite = (setup: Awaited<ReturnType<typeof setUpFork>>, act: () => void) => {
+      const save = setup.store.update.bind(setup.store);
+      let done = false;
+      setup.store.update = async (change) => {
+        const next = await save(change);
+        if (!done && next.opencodeForks[AGENT]?.pending?.stage === "sending") {
+          done = true;
+          act();
+        }
+        return next;
+      };
+    };
+
+    it("releases an update reservation when a STOP lands while it is being written", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      duringSendingWrite(setup, () => setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-3"));
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.pending).toBeUndefined();
+      expect(record.seen).toEqual(MARK);
+      // Nothing was dispatched, so the next call carries both instructions in one send.
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+    });
+
+    it("returns a creation to its reserved state when a STOP lands while it is being written", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      duringSendingWrite(setup, () => setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2"));
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(pending.stage).toBe("creating");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(pending.messageId);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+    });
+
+    it.each([
+      ["the freshness read", 2],
+      ["the read after the reservation is written", 3],
+    ])("refuses when the source moves to Plan during %s", async (_, read) => {
+      const setup = await setUpReuse({ currentModeId: "build" }, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      let reads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && ++reads === read) setup.byId.get(AGENT)!.currentModeId = "plan";
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/changed mode/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("never sends a reservation whose original prompt doesn't match its digest, even with newer input", async () => {
+      const setup = await setUpReuse({}, reservedCreation("user", digestOf("a different reserved prompt")));
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.sentDigest).toBe(digestOf("a different reserved prompt"));
+    });
+
+    it("waits for an automatic source that reports idle just after its turn ended", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, sourceStatus: "running" });
+      setTimeout(() => { setup.byId.get(AGENT)!.status = "idle"; }, 500);
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("keeps an oversized todo inside the update's bounds with the latest STOP last", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "todo", items: [{ text: "t".repeat(200_000), completed: false }] });
+      setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const text = setup.sends[0]!.text;
+      expect(text.length).toBeLessThan(42_000);
+      expect(text).toContain("[… omitted …]");
+      expect(text.indexOf("Task list at the time it stopped:")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+    });
+
     it("never sends the older initial request when a STOP lands after it was gathered", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
       setup.addTurn(AGENT, { type: "user_message", text: "Fix the build" }, "user-1");

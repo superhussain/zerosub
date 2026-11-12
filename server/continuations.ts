@@ -452,7 +452,7 @@ async function checkCurrent(paseo: PaseoApi, chain: ContinuationChain, sourceAge
 }
 
 /** The source must have stopped, without a newer message than the one that asked for the switch. */
-async function waitForSource(paseo: PaseoApi, original: Agent, source: Source): Promise<Agent> {
+export async function waitForSource(paseo: PaseoApi, original: Agent, source: Source): Promise<Agent> {
   let agent = await snapshot(paseo, original.id);
   // turn_ended can arrive just before the directory reports idle, as in the existing reopener.
   for (let attempt = 0; source === "auto" && agent && attempt < 20 && (agent.status === "running" || agent.status === "initializing"); attempt += 1) {
