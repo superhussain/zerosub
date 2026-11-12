@@ -1,0 +1,114 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { preferences, type Preferences } from "../shared/preferences";
+
+// The row components are React Native views that don't load here; pass their props straight through
+// so the test can assert on labels, hints, disabled flags and options.
+vi.mock("@getpaseo/plugin/client/ui", () => ({
+  SettingsRow: (props: Record<string, unknown>) => props,
+  SettingsSelect: (props: Record<string, unknown>) => props,
+}));
+
+const CATALOG = [
+  { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] },
+  { id: "opencode/other", label: "Other" },
+];
+let catalog: Array<Record<string, unknown>> = CATALOG;
+vi.mock("@getpaseo/plugin/client", () => ({
+  usePaseo: () => ({ providers: { listModels: async () => ({ models: catalog }) } }),
+}));
+
+// The component is called as a function, so drive its hooks by hand: one state holder, effects run now.
+let state: unknown;
+vi.mock("react", () => ({
+  useState: (initial: unknown) => [state ?? initial, (next: unknown) => { state = next; }],
+  useEffect: (effect: () => unknown) => { effect(); },
+}));
+
+const { ForkDestinationRows } = await import("./fork-settings");
+
+const values = (overrides: Partial<Preferences> = {}): Preferences => ({ ...preferences.schema.parse({}), ...overrides });
+
+interface Row {
+  props: {
+    label: string;
+    hint?: string;
+    disabled?: boolean;
+    options?: Array<{ label: string; value: string }>;
+    onValueChange?: (value: string) => void;
+  };
+}
+
+/** Renders once for the loading state, lets the catalog land, then renders again and reports the rows. */
+const render = async (overrides: Partial<Preferences> = {}) => {
+  const saved: Array<Partial<Preferences>> = [];
+  const draw = () =>
+    ForkDestinationRows({ values: values(overrides), saving: false, onSave: (patch) => saved.push(patch) }) as {
+      props: { children: Row | Row[] };
+    };
+  draw();
+  for (let round = 0; round < 5; round += 1) await Promise.resolve();
+  const children = draw().props.children;
+  const rows = (Array.isArray(children) ? children : [children]).map((row) => row as Row);
+  return { rows, byLabel: (label: string) => rows.find((row) => row.props.label === label)!, saved };
+};
+
+beforeEach(() => {
+  catalog = CATALOG;
+  state = undefined;
+});
+
+describe("ForkDestinationRows", () => {
+  it("shows the model row next to a disabled destination under factory defaults", async () => {
+    // Factory defaults: destination codex, both automation flags off. The model (then thinking) rows
+    // still show, because a manual Continue on OpenCode uses them.
+    const { rows, byLabel } = await render();
+    const destination = byLabel("Fork a stopped Claude chat to");
+    const model = byLabel("OpenCode model");
+    expect(destination.props.disabled).toBe(true);
+    expect(model.props.disabled).toBe(false);
+    expect(model.props.hint).toBe("Used by a manual Continue on OpenCode, and by the automatic fork when the destination above is OpenCode.");
+    expect(model.props.options).toContainEqual({ label: "Host default", value: "" });
+    expect(rows.map((row) => row.props.label)).not.toContain("OpenCode thinking");
+  });
+
+  it("drops Host default and says so when the host marks no default", async () => {
+    catalog = CATALOG.filter((entry) => !("isDefault" in entry));
+    const { byLabel } = await render();
+    const model = byLabel("OpenCode model");
+    expect(model.props.options!.map((option) => option.label)).not.toContain("Host default");
+    expect(model.props.hint).toBe("This host marks no OpenCode default; pick a model.");
+  });
+
+  it("keeps the stale-model hint when the saved model left the catalog", async () => {
+    catalog = CATALOG.filter((entry) => !("isDefault" in entry));
+    const { byLabel } = await render({ forkOpenCodeModel: "opencode/gone" });
+    expect(byLabel("OpenCode model").props.hint).toBe("That model is no longer in this host's catalog; pick another.");
+  });
+
+  it("enables the destination only with both automation switches on, the model row regardless", async () => {
+    const both = await render({ forkOtherProvider: true, autoSwitch: true });
+    expect(both.byLabel("Fork a stopped Claude chat to").props.disabled).toBe(false);
+    expect(both.byLabel("OpenCode model").props.disabled).toBe(false);
+    const destination = await render({ forkOtherProvider: true, autoSwitch: false });
+    expect(destination.byLabel("Fork a stopped Claude chat to").props.disabled).toBe(true);
+    expect(destination.byLabel("OpenCode model").props.disabled).toBe(false);
+  });
+
+  it("saves a picked model, reveals the thinking row, and clears a thinking option the model drops", async () => {
+    const view = await render({ forkOtherProvider: true, autoSwitch: true });
+    expect(view.rows.map((row) => row.props.label)).not.toContain("OpenCode thinking");
+    view.byLabel("OpenCode model").props.onValueChange!("opencode/glm-5p3-flash");
+    expect(view.saved).toEqual([{ forkOpenCodeModel: "opencode/glm-5p3-flash", forkOpenCodeThinking: "" }]);
+
+    const picked = await render({ forkOpenCodeModel: "opencode/glm-5p3-flash", forkOpenCodeThinking: "high" });
+    expect(picked.byLabel("OpenCode thinking").props.options).toEqual([
+      { label: "Model default", value: "" },
+      { label: "High", value: "high" },
+    ]);
+    picked.byLabel("OpenCode thinking").props.onValueChange!("high");
+    expect(picked.saved).toEqual([{ forkOpenCodeThinking: "high" }]);
+    // The freshly picked model offers no thinking options, so the saved one can't stand.
+    picked.byLabel("OpenCode model").props.onValueChange!("opencode/other");
+    expect(picked.saved.at(-1)).toEqual({ forkOpenCodeModel: "opencode/other", forkOpenCodeThinking: "" });
+  });
+});
