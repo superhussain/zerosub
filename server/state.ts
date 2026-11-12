@@ -346,6 +346,11 @@ export class StateStore {
       state = emptyState();
       outcome = "continued with an empty registry, as there is no backup";
     }
+    // OpenCode fork records are the registry's own journal of what was sent. A snapshot can lag the
+    // file (it's written second, and its failure is tolerated), so its records are never restored:
+    // only the file's valid ones stay. A source with none falls back to inspecting its fork, which
+    // sends nothing, rather than resuming a reservation that may be stale.
+    state.opencodeForks = raw !== undefined ? salvageState(raw).state.opencodeForks : {};
     console.error(`[ZeroSub] ${this.path} was ${problem}${kept ? `; kept it as ${kept}` : ""}; ${outcome}`);
     await this.write(state).catch((error: unknown) => console.error("[ZeroSub] could not save the recovered state file", message(error)));
     return state;

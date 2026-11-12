@@ -118,6 +118,52 @@ describe("StateStore backups", () => {
     if (damage !== null) expect(await readFile(join(dir, kept[0] ?? ""), "utf8")).toBe(damage);
   });
 
+  const MARK = { epoch: "epoch-1", seq: 3 };
+  const reservation = (stage: "creating" | "sending") => ({
+    forkAgentId: "fork-1",
+    seen: MARK,
+    pending: {
+      stage,
+      targetId: "fork-1",
+      messageId: "zerosub-handoff-m2",
+      seen: { epoch: "epoch-1", seq: 9 },
+      ...(stage === "creating"
+        ? { config: { provider: "opencode/glm", modeId: "build", workspaceId: "ws", cwd: null, parentId: null, title: "Fix the build (continued on OpenCode)", why: "the work was moved to OpenCode" } }
+        : {}),
+      sentDigest: "digest-m2",
+    },
+  });
+
+  it.each(["creating", "sending"] as const)(
+    "keeps the file's current %s reservation over a lagging snapshot when an unrelated record is broken",
+    async (stage) => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const writer = new StateStore(path());
+      await writer.update((draft) => Object.assign(draft, { accounts: [{ ...account, label: "older" }], opencodeForks: { "agent-1": { forkAgentId: "fork-1", seen: MARK } } }));
+      // The registry is written before its snapshot, and a failed snapshot is tolerated: the file is newer.
+      await writeFile(path(), JSON.stringify({ accounts: [account, { id: "broken", family: "gemini" }], opencodeForks: { "agent-1": reservation(stage) } }));
+
+      const state = await new StateStore(path()).read();
+      expect(state.accounts.map((entry) => entry.label)).toEqual(["older"]);
+      expect(state.opencodeForks).toEqual({ "agent-1": reservation(stage) });
+      expect(JSON.parse(await readFile(path(), "utf8")).opencodeForks["agent-1"].pending.messageId).toBe("zerosub-handoff-m2");
+    },
+  );
+
+  it.each([
+    ["not valid JSON", "{ not json"],
+    ["partly invalid in that record", JSON.stringify({ accounts: [account], opencodeForks: { "agent-1": { forkAgentId: "fork-1", pending: { stage: "bogus" } } } })],
+  ])("drops OpenCode fork records it can't trust when the file is %s, instead of restoring the snapshot's", async (_, damage) => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account], opencodeForks: { "agent-1": reservation("sending") } }));
+    await writeFile(path(), damage);
+
+    const state = await new StateStore(path()).read();
+    expect(state.accounts.map((entry) => entry.id)).toEqual(["claude-main"]);
+    expect(state.opencodeForks).toEqual({});
+  });
+
   it("starts empty on a new install, without writing anything", async () => {
     expect((await new StateStore(path()).read()).accounts).toEqual([]);
     expect(await readdir(dir)).toEqual([]);

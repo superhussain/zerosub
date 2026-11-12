@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -879,6 +879,24 @@ describe("forking to the other provider", () => {
       expect(setup.sends).toHaveLength(1);
       expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("sends nothing and creates nothing after a restart that couldn't trust the fork record", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const first = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // The registry is damaged; its newest snapshot still holds a reservation that may be stale.
+      await writeFile(join(root, "state.json"), "{ not json");
+      const second = await setUpFork("bypassPermissions", [], {}, [opencodeAgent(RESERVED.targetId)], { prefs: PREFS });
+      second.timelines.set(RESERVED.targetId, [{ item: { type: "user_message", text: sent }, seqEnd: 1 }]);
+      const done = await second.service.forkAgent(second.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("found");
+      expect(second.sends).toHaveLength(0);
+      expect(second.created).toHaveLength(0);
+      expect(first.sends).toHaveLength(0);
     });
 
     it("re-reads the persisted reservation after a restart-shaped rebuild of the service", async () => {
