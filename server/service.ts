@@ -1444,8 +1444,8 @@ export class Service {
     if (parentId !== expectedParent || original.labels?.[PARENT_LABEL] !== source.original.labels?.[PARENT_LABEL]) return { refused: MOVED_REFUSAL };
     // A reserved creation's source must still be where it was reserved; the fork moving with it isn't enough.
     if (config && ((original.workspaceId ?? null) !== config.workspaceId || (original.cwd ?? null) !== config.cwd)) return { refused: MOVED_REFUSAL };
-    if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || !sameWorkspace(original, fork) ||
-      fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
+    if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || fork.labels?.[CONTINUED_FROM_LABEL] !== agentId ||
+      !sameWorkspace(original, fork) || fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
     if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return { refused: MOVED_REFUSAL };
     if (!withinMode(sourceModes, original.currentModeId, targetModes, fork.currentModeId)) return { refused: MODE_REFUSAL };
     return { original, fork };

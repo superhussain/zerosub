@@ -887,6 +887,13 @@ describe("forking to the other provider", () => {
       expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(inspected);
     });
 
+    it("never sends to a recorded fork that names a different source", async () => {
+      const setup = await setUpReuse({ labels: { "zerosub.continued-from": "different-source" } }, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.sends).toHaveLength(0);
+    });
+
     it("advances past plugin-only notes without sending an empty update or feeding a repeat", async () => {
       const setup = await setUpReuse({}, { seen: MARK });
       setup.addTurn(AGENT, {
