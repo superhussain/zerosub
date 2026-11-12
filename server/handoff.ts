@@ -191,7 +191,7 @@ export interface ContinuationTarget {
   provider: string;
   /** Its name for people, used in the new agent's title, e.g. `ChatGPT`. */
   label: string;
-  /** A mode no more permissive than the source agent's. */
+  /** The fork's mode. ChatGPT gets one no looser than the source's; OpenCode gets Plan or Build. */
   modeId: string;
   /** A model from the host's catalog for this provider. Empty uses the provider's default. */
   model?: string;

@@ -171,7 +171,7 @@ const uncertainDetail = (title: string, messageId: string): string =>
   `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send a second copy.`;
 const MOVED_REFUSAL = "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.";
 const MODE_REFUSAL =
-  "This agent or its OpenCode continuation changed mode, so the continuation could allow more than this agent now does. Nothing was sent; check both chats before retrying.";
+  "This agent's mode changed since the OpenCode continuation was set up. Nothing was sent; check both chats before retrying.";
 const HOLD_REFUSAL =
   "ZeroSub's record of what it sent to OpenCode for this agent is damaged or incomplete, so it can't tell whether a continuation already has this work. Nothing was sent. Check this agent's OpenCode chats; to start a new continuation anyway, choose Continue on OpenCode again.";
 const SOURCE_BUSY_REFUSAL = "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode.";
