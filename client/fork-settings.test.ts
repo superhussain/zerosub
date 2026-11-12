@@ -58,17 +58,42 @@ beforeEach(() => {
 });
 
 describe("ForkDestinationRows", () => {
-  it("shows the model row next to a disabled destination under factory defaults", async () => {
-    // Factory defaults: destination codex, both automation flags off. The model (then thinking) rows
-    // still show, because a manual Continue on OpenCode uses them.
-    const { rows, byLabel } = await render();
+  it("shows the model and thinking rows next to a disabled destination under factory defaults", async () => {
+    // Factory defaults: destination codex, both automation flags off, no saved model. The model and
+    // thinking rows still show, because a manual Continue on OpenCode uses them.
+    const { byLabel } = await render();
     const destination = byLabel("Fork a stopped Claude chat to");
     const model = byLabel("OpenCode model");
     expect(destination.props.disabled).toBe(true);
     expect(model.props.disabled).toBe(false);
     expect(model.props.hint).toBe("Used by a manual Continue on OpenCode, and by the automatic fork when the destination above is OpenCode.");
     expect(model.props.options).toContainEqual({ label: "Host default", value: "" });
-    expect(rows.map((row) => row.props.label)).not.toContain("OpenCode thinking");
+    // The host marks a default, so its thinking options are listed and pickable.
+    const thinking = byLabel("OpenCode thinking");
+    expect(thinking.props.disabled).toBe(false);
+    expect(thinking.props.options).toEqual([
+      { label: "Model default", value: "" },
+      { label: "High", value: "high" },
+    ]);
+    expect(thinking.props.hint).toContain("GLM 5.3 Flash");
+  });
+
+  it("shows the thinking row as unavailable when no model resolves", async () => {
+    catalog = CATALOG.filter((entry) => !("isDefault" in entry));
+    const thinking = (await render()).byLabel("OpenCode thinking");
+    expect(thinking.props.disabled).toBe(true);
+    expect(thinking.props.options).toEqual([{ label: "Model default", value: "" }]);
+    expect(thinking.props.hint).toBe("Pick a model above to choose its thinking option.");
+  });
+
+  it("lists no thinking options while the catalog is loading", async () => {
+    catalog = CATALOG;
+    const draw = () =>
+      ForkDestinationRows({ values: values(), saving: false, onSave: () => undefined }) as { props: { children: Row[] } };
+    state = { status: "loading" };
+    const rows = draw().props.children.flat() as Row[];
+    expect(rows.find((row) => row.props.label === "OpenCode model")?.props.hint).toBe("Loading this host's OpenCode catalog…");
+    expect(rows.every((row) => row.props.options === undefined || row.props.label !== "OpenCode thinking")).toBe(true);
   });
 
   it("drops Host default and says so when the host marks no default", async () => {
@@ -94,9 +119,8 @@ describe("ForkDestinationRows", () => {
     expect(destination.byLabel("OpenCode model").props.disabled).toBe(false);
   });
 
-  it("saves a picked model, reveals the thinking row, and clears a thinking option the model drops", async () => {
+  it("saves a picked model and clears a thinking option the model drops", async () => {
     const view = await render({ forkOtherProvider: true, autoSwitch: true });
-    expect(view.rows.map((row) => row.props.label)).not.toContain("OpenCode thinking");
     view.byLabel("OpenCode model").props.onValueChange!("opencode/glm-5p3-flash");
     expect(view.saved).toEqual([{ forkOpenCodeModel: "opencode/glm-5p3-flash", forkOpenCodeThinking: "" }]);
 
@@ -110,5 +134,8 @@ describe("ForkDestinationRows", () => {
     // The freshly picked model offers no thinking options, so the saved one can't stand.
     picked.byLabel("OpenCode model").props.onValueChange!("opencode/other");
     expect(picked.saved.at(-1)).toEqual({ forkOpenCodeModel: "opencode/other", forkOpenCodeThinking: "" });
+    // Back to Host default: the host's marked default offers "high", so it stands.
+    picked.byLabel("OpenCode model").props.onValueChange!("");
+    expect(picked.saved.at(-1)).toEqual({ forkOpenCodeModel: "" });
   });
 });

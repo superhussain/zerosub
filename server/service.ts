@@ -1368,7 +1368,7 @@ export class Service {
     // Fresh checks before sending: same place, same parent, not working, nobody waiting on it.
     const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id);
     if ("refused" in checked) return { skipped: checked.refused };
-    return this.updateOpenCodeFork(paseo, agentId, checked.fork, record.seen);
+    return this.updateOpenCodeFork(paseo, agentId, checked.fork, record.seen, checked.original.lastUserMessageAt);
   }
 
   /**
@@ -1515,7 +1515,14 @@ export class Service {
   }
 
   /** Sends the source's newest instructions to an existing OpenCode fork, once, under one message ID. */
-  private async updateOpenCodeFork(paseo: PaseoApi, agentId: string, fork: Agent, seen: TimelineMark): Promise<ForkOutcome> {
+  /** `sourceAt` is the source's last user message time as checked before its history was read. */
+  private async updateOpenCodeFork(
+    paseo: PaseoApi,
+    agentId: string,
+    fork: Agent,
+    seen: TimelineMark,
+    sourceAt: string | null | undefined,
+  ): Promise<ForkOutcome> {
     let delta: Awaited<ReturnType<typeof readUpdates>>;
     try {
       delta = await readUpdates(paseo, agentId, seen, undefined, { onEpochReset: "unresolvable" });
@@ -1537,6 +1544,8 @@ export class Service {
       if (since !== "same") return this.openCodeFound(fork, since === "epoch" ? FOUND_DETAIL : HISTORY_GAP_DETAIL);
       const now = (await paseo.agents.ref(agentId).refresh())?.agent;
       if (!now || !ready(now)) return { skipped: SOURCE_BUSY_REFUSAL };
+      // A message that landed after the history read shows only in the source's own timestamp.
+      if (now.lastUserMessageAt !== sourceAt) return { skipped: NEWER_REFUSAL };
       return {
         fork: { agentId: fork.id, title: forkRef(fork) },
         to: OPENCODE_LABEL,

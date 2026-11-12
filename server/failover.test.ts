@@ -865,6 +865,28 @@ describe("forking to the other provider", () => {
       expect(setup.created).toHaveLength(0);
     });
 
+    it("reports an instruction that lands between the history recheck and the final refresh", async () => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) => {
+        // The history recheck has nothing new; the instruction lands just before the last source refresh.
+        let reads = 0;
+        setup.hooks.onRefetch = (id) => {
+          if (id !== AGENT || ++reads !== 1) return;
+          setup.hooks.onRefresh = (refreshed) => {
+            if (refreshed !== AGENT) return;
+            setup.hooks.onRefresh = undefined;
+            setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+            setup.byId.get(AGENT)!.lastUserMessageAt = "2026-09-23T07:30:00.000Z";
+          };
+        };
+      });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(inspected);
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("Now also update the CHANGELOG");
+    });
+
     it("refuses up-to-date when the source starts working while the watermark is saved", async () => {
       const { setup, inspected } = await duringWatermarkWrite((setup) => { setup.byId.get(AGENT)!.status = "running"; });
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/working or waiting for permission/);
