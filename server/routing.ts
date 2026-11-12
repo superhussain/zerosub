@@ -102,21 +102,21 @@ function weeklyWindow(usage: Usage): UsageWindow | undefined {
 export function paceScore(usage: Usage | null | undefined, pending: number, now: number): PaceScore {
   const fiveCharge = PENDING_FIVE_HOUR_PERCENT * pending;
   const weekCharge = PENDING_WEEKLY_PERCENT * pending;
-  if (!usage || usage.windows.length === 0) {
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  const long = usage ? weeklyWindow(usage) : undefined;
+  if (!usage || usage.windows.length === 0 || (!short && !long)) {
     const fiveHour = UNKNOWN_SCORE + fiveCharge;
     return { fiveHour, weekly: 0, score: fiveHour, gated: fiveHour >= FIVE_HOUR_GATE_PERCENT };
   }
   const parsed = Date.parse(usage.fetchedAt);
   const fetched = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
-  const short = fiveHourWindow(usage);
-  const long = weeklyWindow(usage);
   const expired = (window: UsageWindow) => !!window.resetsAt && Date.parse(window.resetsAt) <= now;
 
   let fiveHour = fiveCharge;
   if (short && Number.isFinite(short.usedPercent) && !expired(short)) {
-    if (!short.resetsAt) fiveHour = short.usedPercent + fiveCharge;
+    const reset = Date.parse(short.resetsAt ?? "");
+    if (!Number.isFinite(reset)) fiveHour = short.usedPercent + fiveCharge;
     else {
-      const reset = Date.parse(short.resetsAt);
       const elapsed = Math.max(MIN_FIVE_HOUR_ELAPSED_MS, fetched - (reset - FIVE_HOUR_MS));
       const ahead = Math.min(now + PACE_HORIZON_MS, reset) - fetched;
       fiveHour = short.usedPercent + (short.usedPercent / elapsed) * ahead + fiveCharge;
@@ -124,9 +124,10 @@ export function paceScore(usage: Usage | null | undefined, pending: number, now:
   }
   let weekly = 0;
   if (long && Number.isFinite(long.usedPercent) && !expired(long)) {
-    if (!long.resetsAt) weekly = long.usedPercent + weekCharge;
+    const reset = Date.parse(long.resetsAt ?? "");
+    if (!Number.isFinite(reset)) weekly = long.usedPercent + weekCharge;
     else {
-      const share = 1 - (Date.parse(long.resetsAt) - fetched) / WEEK_MS;
+      const share = 1 - (reset - fetched) / WEEK_MS;
       weekly = (long.usedPercent + weekCharge) / Math.min(1, Math.max(MIN_WEEK_SHARE, share));
     }
   }
@@ -158,11 +159,11 @@ export function mostAvailable(
   const rank = (account: StoredAccount) => {
     const pace = pacing ? paceScore(usageOf(account.id), pacing.pendingOf(account.id), now) : undefined;
     return [
-    pace ? (pace.gated ? 1 : 0) : fiveHourGated(usageOf(account.id), now) ? 1 : 0,
-    pace ? pace.score : headroomScore(usageOf(account.id), now),
-    account.id === preferred ? 0 : 1,
-    account.kind === "main" ? 0 : 1,
-    Date.parse(account.createdAt) || 0,
+      pace ? (pace.gated ? 1 : 0) : fiveHourGated(usageOf(account.id), now) ? 1 : 0,
+      pace ? pace.score : headroomScore(usageOf(account.id), now),
+      account.id === preferred ? 0 : 1,
+      account.kind === "main" ? 0 : 1,
+      Date.parse(account.createdAt) || 0,
     ];
   };
   candidates.sort((a, b) => {

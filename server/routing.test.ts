@@ -469,6 +469,22 @@ describe("pacing", () => {
     expect(paceScore(undefined, 2, PNOW).score).toBe(70);
   });
 
+  it("scores an account with no 5-hour or weekly window as unknown", () => {
+    const odd: Usage = { ...pace(0, 1, 0, 1), windows: [{ id: "weekly_opus", label: "Weekly - Opus", usedPercent: 10, resetsAt: null }] };
+    expect(paceScore(odd, 1, PNOW)).toMatchObject({ fiveHour: 60, weekly: 0, score: 60 });
+  });
+
+  it("treats an unparseable resetsAt like a missing one", () => {
+    const bad: Usage = {
+      ...pace(0, 1, 0, 1),
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: 85, resetsAt: "soon" },
+        { id: "seven_day", label: "Weekly", usedPercent: 40, resetsAt: "soon" },
+      ],
+    };
+    expect(paceScore(bad, 1, PNOW)).toMatchObject({ fiveHour: 95, weekly: 42, score: 95, gated: true });
+  });
+
   it("ignores pending placements and ranks the legacy way when balancing is off", () => {
     const decision = (balanceNewAgents: boolean) => chooseAccount(state, {
       ...base, now: PNOW, balanceNewAgents, reason: "create", usageOf, pendingOf: () => 5,

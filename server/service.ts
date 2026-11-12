@@ -1199,7 +1199,6 @@ export class Service {
     const now = Date.now();
     const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.pacing(now));
     if (!account) return { skipped: `Every ${name} account is at its limit too.` };
-    this.notePlacement(account.id, now);
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
     if (!original) throw new Error("That agent is no longer available.");
