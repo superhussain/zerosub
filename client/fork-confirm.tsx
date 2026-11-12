@@ -77,7 +77,19 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
       try {
         const fork = await store.rpc(forkAgent, { agentId, destination: "opencode" });
         close();
-        toast.show(`Continuing on OpenCode in “${fork.title}”`, { variant: "success", durationMs: 5_000 });
+        if (fork.delivery === "up-to-date") {
+          toast.show("No update was sent: the OpenCode continuation already has everything from this agent.", {
+            variant: "default",
+            durationMs: 5_000,
+          });
+        } else if (fork.delivery === "found") {
+          toast.show(`Found the existing OpenCode continuation “${fork.title}”. Nothing was sent; open that chat to inspect it.`, {
+            variant: "default",
+            durationMs: 5_000,
+          });
+        } else {
+          toast.show(`Continuing on OpenCode in “${fork.title}”`, { variant: "success", durationMs: 5_000 });
+        }
       } catch (failure) {
         setError(describe(failure));
         setBusy(false);
@@ -89,7 +101,8 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
         <Text style={text.heading}>Continue on OpenCode?</Text>
         <Text style={text.body}>
           This starts a new OpenCode agent in this workspace with the conversation so far, using the OpenCode model and
-          thinking option picked in ZeroSub's settings, allowed no more than this agent is. This agent stays as it is.
+          thinking option picked in ZeroSub's settings. Its mode matches this agent's level, but OpenCode runs its own
+          permission policy, which can allow more than Claude does. This agent stays as it is.
         </Text>
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
