@@ -1230,7 +1230,7 @@ export class Service {
     }
 
     const openCodeCopy = agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER);
-    if (openCodeCopy) return { skipped: alreadyContinued(openCodeCopy.title ?? OPENCODE_LABEL) };
+    if (openCodeCopy) return { skipped: alreadyContinued(openCodeCopy.title ?? `${OPENCODE_LABEL} agent ${openCodeCopy.id}`) };
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
     const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other);
@@ -1592,7 +1592,7 @@ export class Service {
    */
   private async createOpenCodeFork(paseo: PaseoApi, agentId: string, original: Agent, source: "auto" | "user"): Promise<ForkOutcome> {
     const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
-    if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? chatGptCopy.id) };
+    if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? `${PROVIDER_NAME["codex"]} agent ${chatGptCopy.id}`) };
     const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
     const savedModel = this.prefs.forkOpenCodeModel;
