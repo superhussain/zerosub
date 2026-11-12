@@ -46,7 +46,7 @@ import { homesDir } from "./paths";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
+import { chooseAccount, isLimited, isUsable, mostAvailable, PENDING_MS, type Pacing } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -494,6 +494,22 @@ export class Service {
     }
   }
 
+  /** Agents placed on an account in the last `PENDING_MS`, which its latest usage reading may not show yet. */
+  private readonly placements: { accountId: string; at: number }[] = [];
+
+  private notePlacement(accountId: string, now: number): void {
+    this.placements.push({ accountId, at: now });
+    while (this.placements.length > 0 && this.placements[0]!.at <= now - PENDING_MS) this.placements.shift();
+  }
+
+  private pendingOn(accountId: string, now: number): number {
+    return this.placements.filter((placement) => placement.accountId === accountId && placement.at > now - PENDING_MS).length;
+  }
+
+  private pacing(now: number): Pacing | undefined {
+    return this.prefs.balanceNewAgents ? { pendingOf: (id) => this.pendingOn(id, now) } : undefined;
+  }
+
   private async route(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
@@ -513,8 +529,13 @@ export class Service {
       balanceNewAgents: this.prefs.balanceNewAgents,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
+      pendingOf: (id) => this.pendingOn(id, now),
     });
     if (!decision) return undefined;
+    // Recorded before any await, so concurrent creates see each other's placements.
+    if (request.purpose === "interactive" && (request.reason === "create" || decision.skipped)) {
+      this.notePlacement(decision.account.id, now);
+    }
     const { account } = decision;
 
     if (account.kind === "managed" && account.home) {
@@ -773,7 +794,8 @@ export class Service {
       }
       return;
     }
-    const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), this.pacing(now));
+    if (next) this.notePlacement(next.id, now);
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
@@ -1114,8 +1136,9 @@ export class Service {
         const now = Date.now();
         const latest = await this.store.read();
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
-        const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]));
+        const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), this.pacing(now));
         if (!next) return;
+        this.notePlacement(next.id, now);
         await this.store.update((draft) => {
           draft.bindings[agentId] = { accountId: next.id, source: "auto", at: new Date(now).toISOString() };
         });
@@ -1173,7 +1196,8 @@ export class Service {
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
-    const account = mostAvailable(state, other, (id) => this.usage.get(id), Date.now(), new Set());
+    const now = Date.now();
+    const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.pacing(now));
     if (!account) return { skipped: `Every ${name} account is at its limit too.` };
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
@@ -1370,15 +1394,17 @@ export class Service {
 
   /** Where routing would put this agent's next session, including skipping exhausted accounts. */
   private targetFor(state: StoredState, agentId: string, family: Family): string | undefined {
+    const now = Date.now();
     return chooseAccount(state, {
       agentId,
       family,
       reason: "refresh",
-      now: Date.now(),
+      now,
       autoSwitch: this.prefs.autoSwitch,
-      balanceNewAgents: false,
+      balanceNewAgents: this.prefs.balanceNewAgents,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
+      pendingOf: (id) => this.pendingOn(id, now),
     })?.account.id;
   }
 
