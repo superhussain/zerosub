@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountSubtitle, formatAge, formatCredits, formatPlan, formatResetIn, peakUsage, shortLabel, staleNotice, usageSummary } from "./format";
+import { accountSubtitle, formatAge, formatCredits, formatExtraUsage, formatPlan, formatResetIn, peakUsage, shortLabel, staleNotice, usageSummary } from "./format";
 import type { AccountView } from "./model";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -102,5 +102,18 @@ describe("staleNotice", () => {
     );
     expect(staleNotice(NOW - 5_000, "Plugin RPC timed out", NOW)).toBe("Showing data from a moment ago · couldn't refresh: Plugin RPC timed out");
     expect(staleNotice(null, "Plugin is not available", NOW)).toBe("Couldn't refresh: Plugin is not available");
+  });
+});
+
+describe("formatExtraUsage", () => {
+  it("shows spend and the monthly cap in the account's currency", () => {
+    expect(formatExtraUsage({ enabled: true, spend: 1234, limit: 5000, currency: "USD" })).toBe("Extra usage on · $12.34 of $50.00 this month");
+    expect(formatExtraUsage({ enabled: true, spend: 123456, limit: null, currency: "EUR" })).toBe("Extra usage on · €1,234.56 spent this month");
+    expect(formatExtraUsage({ enabled: true, spend: 50, limit: 1000, currency: "cad" })).toBe("Extra usage on · 0.50 CAD of 10.00 CAD this month");
+  });
+
+  it("says only that it's on when the spend isn't known, and nothing when it's off", () => {
+    expect(formatExtraUsage({ enabled: true, spend: null, limit: 5000, currency: "USD" })).toBe("Extra usage on");
+    expect(formatExtraUsage({ enabled: false, spend: 0, limit: 5000, currency: "USD" })).toBeNull();
   });
 });
