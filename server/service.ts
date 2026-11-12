@@ -1592,7 +1592,8 @@ export class Service {
   private async createOpenCodeFork(paseo: PaseoApi, agentId: string, original: Agent, source: "auto" | "user"): Promise<ForkOutcome> {
     const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
     if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? "another agent") };
-    const { models } = await paseo.providers.listModels(OPENCODE_PROVIDER);
+    const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
+    if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
     const savedModel = this.prefs.forkOpenCodeModel;
     const model = savedModel ? models?.find((entry) => entry.id === savedModel) : models?.find((entry) => entry.isDefault);
     if (savedModel && !model) {

@@ -39,7 +39,9 @@ export function ForkDestinationRows({
       .listModels(OPENCODE_PROVIDER)
       // A response with no models field and one with an empty list both mean: nothing to pick from.
       .then((result) => {
-        if (live) setCatalog((result.models ?? []).length > 0 ? { status: "ready", models: result.models ?? [] } : { status: "empty" });
+        if (!live) return;
+        if (result.error) setCatalog({ status: "error", message: String(result.error) });
+        else setCatalog((result.models ?? []).length > 0 ? { status: "ready", models: result.models ?? [] } : { status: "empty" });
       })
       .catch((error: unknown) => {
         if (live) setCatalog({ status: "error", message: error instanceof Error ? error.message : String(error) });

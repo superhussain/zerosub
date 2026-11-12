@@ -478,6 +478,8 @@ describe("forking to the other provider", () => {
       opencodeAvailable?: boolean;
       /** What `listModels` answers for OpenCode. */
       catalog?: Array<Record<string, unknown>>;
+      /** A failed `listModels` answer, which carries `error` instead of throwing. */
+      catalogError?: string;
       /** OpenCode's modes. */
       opencodeModes?: Array<{ id: string; label: string; colorTier?: string }>;
       /** No ChatGPT account is configured at all. */
@@ -567,7 +569,7 @@ describe("forking to the other provider", () => {
           hooks.onModes?.(provider);
           return { modes: modes[provider] };
         },
-        listModels: async (provider: string) => ({ models: models[provider] }),
+        listModels: async (provider: string) => (provider === "opencode" && options.catalogError ? { error: options.catalogError } : { models: models[provider] }),
       },
       workspaces: {
         ref: (workspaceId: string) => ({
@@ -1769,6 +1771,18 @@ describe("forking to the other provider", () => {
       const { created, service, paseo } = await setUpFork("bypassPermissions", [], {}, [openCodeAgent], { prefs: { autoSwitch: false } });
       await expect(service.forkAgent(paseo, AGENT)).rejects.toThrow(/already continued in “Fix the build \(continued on OpenCode\)”/);
       expect(created).toHaveLength(0);
+    });
+  });
+
+  describe("a failed catalog read", () => {
+    it("refuses with the read error, before any saved-model or default check", async () => {
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], {
+        prefs: { forkOtherProvider: true, claudeForkDestination: "opencode" },
+        catalogError: "daemon unreachable",
+      });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toBe("Couldn't read this host's OpenCode models: daemon unreachable");
     });
   });
 

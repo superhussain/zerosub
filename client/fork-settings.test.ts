@@ -13,8 +13,9 @@ const CATALOG = [
   { id: "opencode/other", label: "Other" },
 ];
 let catalog: Array<Record<string, unknown>> = CATALOG;
+let catalogError: string | undefined;
 vi.mock("@getpaseo/plugin/client", () => ({
-  usePaseo: () => ({ providers: { listModels: async () => ({ models: catalog }) } }),
+  usePaseo: () => ({ providers: { listModels: async () => (catalogError ? { error: catalogError } : { models: catalog }) } }),
 }));
 
 // The component is called as a function, so drive its hooks by hand: one state holder, effects run now.
@@ -54,10 +55,19 @@ const render = async (overrides: Partial<Preferences> = {}) => {
 
 beforeEach(() => {
   catalog = CATALOG;
+  catalogError = undefined;
   state = undefined;
 });
 
 describe("ForkDestinationRows", () => {
+  it("shows the read error, not an empty catalog, when listModels reports one", async () => {
+    catalogError = "daemon unreachable";
+    await render();
+    const draw = ForkDestinationRows({ values: values(), saving: false, onSave: () => undefined }) as { props: { children: Row[] } };
+    const rows = draw.props.children.flat() as Row[];
+    expect(rows.find((row) => row.props.label === "OpenCode model")?.props.hint).toBe("Couldn't read this host's OpenCode models: daemon unreachable");
+  });
+
   it("shows the model and thinking rows next to a disabled destination under factory defaults", async () => {
     // Factory defaults: destination codex, both automation flags off, no saved model. The model and
     // thinking rows still show, because a manual Continue on OpenCode uses them.
