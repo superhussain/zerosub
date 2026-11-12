@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { chooseAccount, fiveHourGated, mostAvailable } from "./routing";
+import { chooseAccount, fiveHourGated, mostAvailable, paceScore } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -175,7 +175,8 @@ describe("chooseAccount", () => {
         usageOf: (id) => reading(id === soon.id),
       });
       // Past its reset, the near window starts again empty: by headroom it is then the roomier one.
-      expect(decision?.account.id).toBe(condition === "past-reset" ? soon.id : later.id);
+      // Pacing still reads a cached or failed reading's windows, and the near reset is behind its week's pace.
+      expect(decision?.account.id).toBe(["past-reset", "cached", "error"].includes(condition) ? soon.id : later.id);
       expect(decision?.bind?.selectionReason).toBe("headroom");
     },
   );
@@ -411,5 +412,68 @@ describe("the 5-hour gate", () => {
     expect(fiveHourGated(null, NOW)).toBe(false);
     expect(fiveHourGated(reading(80, 0), NOW)).toBe(true);
     expect(fiveHourGated(reading(79, 0), NOW)).toBe(false);
+  });
+});
+
+describe("pacing", () => {
+  const PNOW = Date.parse("2026-09-23T17:00:00Z");
+  const hours = (h: number) => new Date(PNOW + h * 3_600_000).toISOString();
+  /** `fiveStarted` and `weekElapsed` are how long ago each window started, in hours and days. */
+  function pace(five: number, fiveStarted: number, week: number, weekElapsed: number): Usage {
+    return {
+      fetchedAt: new Date(PNOW).toISOString(),
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: five, resetsAt: hours(5 - fiveStarted) },
+        { id: "seven_day", label: "Weekly", usedPercent: week, resetsAt: hours((7 - weekElapsed) * 24) },
+      ],
+      error: null, cached: false, resets: null, credits: null,
+    };
+  }
+  const readings: Record<string, Usage> = {
+    "claude-main": pace(30, 0.5, 25, 3.5),
+    "claude-work": pace(45, 4, 50, 6),
+    "claude-personal": pace(20, 2, 70, 2),
+    "claude-spare": pace(35, 3.5, 40, 4),
+  };
+  const state = stateWith(Object.keys(readings).map((id) => account({ id, createdAt: id === "claude-main" ? "2026-08-01T00:00:00Z" : "2026-09-01T00:00:00Z" })), {
+    defaults: { claude: "claude-main", codex: null },
+  });
+  const usageOf = (id: string) => readings[id];
+
+  it("scores the example accounts", () => {
+    const score = (id: string, pending = 0) => paceScore(readings[id], pending, PNOW);
+    expect(score("claude-main")).toMatchObject({ fiveHour: 90, gated: true });
+    expect(score("claude-work").score).toBeCloseTo(58.33, 2);
+    expect(score("claude-spare").score).toBe(70);
+    expect(score("claude-personal").score).toBeCloseTo(245, 5);
+    expect(score("claude-work", 1).score).toBeCloseTo(66.25, 5);
+    expect(score("claude-work", 2).score).toBeCloseTo(76.25, 5);
+  });
+
+  it("places three paced creates on work, work, spare, where the unpaced pick is main", () => {
+    expect(mostAvailable(state, "claude", usageOf, PNOW)?.id).toBe("claude-main");
+    const picks: string[] = [];
+    const pending = new Map<string, number>();
+    for (let n = 0; n < 3; n += 1) {
+      const pick = mostAvailable(state, "claude", usageOf, PNOW, new Set(), { pendingOf: (id) => pending.get(id) ?? 0 })!;
+      picks.push(pick.id);
+      pending.set(pick.id, (pending.get(pick.id) ?? 0) + 1);
+    }
+    expect(picks).toEqual(["claude-work", "claude-work", "claude-spare"]);
+  });
+
+  it("gates a raw 5-hour reading at 80% even with a slow burn, and scores unknown usage in the middle", () => {
+    const slow = pace(85, 4.9, 10, 6);
+    expect(paceScore(slow, 0, PNOW).fiveHour).toBeLessThan(90);
+    expect(paceScore(slow, 0, PNOW).gated).toBe(true);
+    expect(paceScore(undefined, 2, PNOW).score).toBe(70);
+  });
+
+  it("ignores pending placements and ranks the legacy way when balancing is off", () => {
+    const decision = (balanceNewAgents: boolean) => chooseAccount(state, {
+      ...base, now: PNOW, balanceNewAgents, reason: "create", usageOf, pendingOf: () => 5,
+    });
+    expect(decision(false)?.account.id).toBe("claude-main");
+    expect(decision(true)?.account.id).toBe("claude-spare");
   });
 });
