@@ -37,6 +37,21 @@ describe("salvageState", () => {
     expect(Object.keys(state.bindings)).toEqual(["a"]);
     expect(state.defaults.claude).toBe("claude-main");
   });
+
+  it("keeps valid OpenCode fork records when an unrelated record is malformed", () => {
+    const record = {
+      forkAgentId: "fork-1",
+      seen: { epoch: "epoch-1", seq: 3 },
+      pending: { stage: "sending", targetId: "fork-1", messageId: "zerosub-handoff-m1", seen: { epoch: "epoch-1", seq: 3 }, sentDigest: "abc" },
+    };
+    const { state, dropped } = salvageState({
+      accounts: [account],
+      defaults: { claude: "claude-main", codex: null },
+      opencodeForks: { good: record, bad: { forkAgentId: 7 } },
+    });
+    expect(state.opencodeForks).toEqual({ good: record });
+    expect(dropped).toBe(true);
+  });
 });
 
 describe("StateStore", () => {
