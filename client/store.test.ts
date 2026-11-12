@@ -13,6 +13,7 @@ function view(overrides: Partial<StateView> = {}): StateView {
     canReopen: false,
     browserSignIn: true,
     showComposerPill: false,
+    openCodeAvailable: false,
     warnings: [],
     ...overrides,
   };

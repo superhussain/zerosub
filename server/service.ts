@@ -2165,8 +2165,18 @@ export class Service {
       canReopen: (await this.reopener.locate()) !== null,
       browserSignIn: this.browserSignIn,
       showComposerPill: this.prefs.showComposerPill,
+      openCodeAvailable: await this.openCodeAvailable(paseo),
       warnings: await this.warnings(),
     };
+  }
+
+  /** Whether Paseo lists OpenCode as available. A failed read must not break the whole state view. */
+  private async openCodeAvailable(paseo: PaseoApi): Promise<boolean> {
+    try {
+      return Boolean((await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === OPENCODE_PROVIDER && entry.available));
+    } catch {
+      return false;
+    }
   }
 
   /** Agents with a live session: the given ones (looked up fresh), or every one. */

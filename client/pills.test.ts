@@ -28,7 +28,7 @@ function account(id: string, isDefault: boolean, overrides: Partial<AccountView>
 }
 
 /** The account button's menu for one agent, routed as `route` says. */
-async function menu(route: Partial<AgentRoute>, family: "claude" | "codex" = "codex", accounts: AccountView[] = [account("work", true), account("home", false)]): Promise<readonly PluginButtonMenuEntry[]> {
+async function menu(route: Partial<AgentRoute>, family: "claude" | "codex" = "codex", accounts: AccountView[] = [account("work", true), account("home", false)], openCodeAvailable = true): Promise<readonly PluginButtonMenuEntry[]> {
   const state: StateView = {
     accounts,
     agents: [{ agentId: "agent-1", family, accountId: accounts[0]!.id, pinned: true, pendingAccountId: null, movable: false, ...route }],
@@ -37,6 +37,7 @@ async function menu(route: Partial<AgentRoute>, family: "claude" | "codex" = "co
     canReopen: true,
     browserSignIn: true,
     showComposerPill: true,
+    openCodeAvailable,
     warnings: [],
   };
   const buttons: PluginButton[] = [];
@@ -96,6 +97,47 @@ describe("the OpenCode entry", () => {
     expect(items).toContainEqual(expect.objectContaining({ id: "fork-opencode", title: "Continue on OpenCode (new agent)…", icon: "Bot" }));
   });
 
+  it("leaves the OpenCode entry out when this host has no OpenCode", async () => {
+    const items = await menu({}, "claude", [account("a", true, { family: "claude" }), account("b", false, { family: "claude" })], false);
+    expect(items.some((entry) => entry.id === "fork-opencode")).toBe(false);
+  });
+
+  it("hides the pill from a single ready Claude account when OpenCode is unavailable", async () => {
+    const buttons: PluginButton[] = [];
+    const state: StateView = {
+      accounts: [account("solo", true, { family: "claude", status: "ready" })],
+      agents: [{ agentId: "agent-1", family: "claude", accountId: "solo", pinned: true, pendingAccountId: null, movable: true }],
+      logins: [],
+      providers: { claude: "claude" },
+      canReopen: true,
+      browserSignIn: true,
+      showComposerPill: true,
+      openCodeAvailable: false,
+      warnings: [],
+    };
+    const client = {
+      addComposerPill: ({ button }: { button: PluginButton }) => {
+        buttons.push(button);
+        return { update: () => undefined, remove: () => undefined };
+      },
+      paseo: {
+        agents: {
+          list: async () => ({
+            subscription: {
+              subscribe: ({ snapshot }: { snapshot: (page: unknown) => void }) =>
+                snapshot({ entries: [{ agent: { id: "agent-1", workspaceId: "workspace-1", provider: "claude" } }], pageInfo: { hasMore: false } }),
+            },
+          }),
+        },
+      },
+    };
+    const store = { current: { state }, subscribe: () => () => undefined, refresh: async () => undefined };
+    const stop = contributePills(client as unknown as PluginClientContext, store as unknown as ZeroSubStore);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(buttons).toHaveLength(0);
+    stop();
+  });
+
   it("still hides the pill from a single ready Codex account", async () => {
     const buttons: PluginButton[] = [];
     const state: StateView = {
@@ -106,6 +148,7 @@ describe("the OpenCode entry", () => {
       canReopen: true,
       browserSignIn: true,
       showComposerPill: true,
+      openCodeAvailable: true,
       warnings: [],
     };
     const client = {
@@ -143,6 +186,7 @@ describe("the OpenCode entry", () => {
       canReopen: true,
       browserSignIn: true,
       showComposerPill: true,
+      openCodeAvailable: true,
       warnings: [],
     };
     const client = {

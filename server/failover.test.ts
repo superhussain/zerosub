@@ -1774,6 +1774,13 @@ describe("forking to the other provider", () => {
     });
   });
 
+  describe("OpenCode availability in the state view", () => {
+    it.each([[true], [false]])("reports openCodeAvailable %s from the host's provider list", async (present) => {
+      const { service, paseo } = await setUpFork("default", [], {}, [], { opencodeAvailable: present });
+      expect((await service.view(paseo)).openCodeAvailable).toBe(present);
+    });
+  });
+
   describe("a failed catalog read", () => {
     it("refuses with the read error, before any saved-model or default check", async () => {
       const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], {

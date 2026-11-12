@@ -164,6 +164,8 @@ export const StateViewSchema = z.object({
    */
   browserSignIn: z.boolean().default(true),
   showComposerPill: z.boolean(),
+  /** This host's Paseo lists OpenCode as available, so "Continue on OpenCode" can work. */
+  openCodeAvailable: z.boolean().default(false),
   warnings: z.array(z.string()),
 });
 export type StateView = z.infer<typeof StateViewSchema>;
