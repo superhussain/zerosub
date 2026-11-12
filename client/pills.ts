@@ -164,9 +164,10 @@ function buttonFor(
     accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
   // OpenCode is a harness, not an account: any Claude agent can continue there by hand, however its
-  // accounts are doing and whether or not automatic forking is on.
+  // accounts are doing and whether or not automatic forking is on. Even a single ready account gets
+  // the pill for that entry; Codex still only shows a pill with two accounts or a way out of a limit.
   const offerOpenCode = family === "claude";
-  if (accounts.length < 2 && !(current.status === "limited" && (offerReset || offerFork || offerOpenCode))) return null;
+  if (accounts.length < 2 && !(offerOpenCode || (current.status === "limited" && (offerReset || offerFork)))) return null;
 
   const choose = (accountId: string | null) => async () => {
     await store.rpc(setAgentAccount, { agentId: agent.id, accountId });

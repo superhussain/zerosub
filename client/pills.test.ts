@@ -89,6 +89,49 @@ describe("the OpenCode entry", () => {
     expect((await menu({})).map((entry) => entry.id)).not.toContain("fork-opencode");
   });
 
+  it("keeps the pill and the OpenCode entry for a single ready Claude account", async () => {
+    // Nothing is limited and there is no way out to offer — the hand "Continue on OpenCode" entry
+    // is reason enough for the pill to exist.
+    const items = await menu({}, "claude", [account("solo", true, { family: "claude", status: "ready" })]);
+    expect(items).toContainEqual(expect.objectContaining({ id: "fork-opencode", title: "Continue on OpenCode (new agent)…", icon: "Bot" }));
+  });
+
+  it("still hides the pill from a single ready Codex account", async () => {
+    const buttons: PluginButton[] = [];
+    const state: StateView = {
+      accounts: [account("solo", true)],
+      agents: [{ agentId: "agent-1", family: "codex", accountId: "solo", pinned: true, pendingAccountId: null, movable: true }],
+      logins: [],
+      providers: { codex: "codex" },
+      canReopen: true,
+      browserSignIn: true,
+      showComposerPill: true,
+      warnings: [],
+    };
+    const client = {
+      addComposerPill: ({ button }: { button: PluginButton }) => {
+        buttons.push(button);
+        return { update: () => undefined, remove: () => undefined };
+      },
+      paseo: {
+        agents: {
+          list: async () => ({
+            subscription: {
+              subscribe: ({ snapshot }: { snapshot: (page: unknown) => void }) =>
+                snapshot({ entries: [{ agent: { id: "agent-1", workspaceId: "workspace-1", provider: "codex" } }], pageInfo: { hasMore: false } }),
+            },
+          }),
+        },
+      },
+    };
+    const store = { current: { state }, subscribe: () => () => undefined, refresh: async () => undefined };
+    const stop = contributePills(client as unknown as PluginClientContext, store as unknown as ZeroSubStore);
+    // The snapshot has run by the time subscribe resolves; no pill may appear for it.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(buttons).toHaveLength(0);
+    stop();
+  });
+
   it("keeps the pill visible for a limited single-account Claude setup", async () => {
     // No reset to spend and no ChatGPT to fork to; the OpenCode entry is the pill's reason to exist.
     const buttons: PluginButton[] = [];
