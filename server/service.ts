@@ -54,7 +54,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
+import { chooseAccount, isLimited, isUsable, mostAvailable, PENDING_MS, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -857,6 +857,22 @@ export class Service {
     });
   }
 
+  /** Agents placed on an account in the last `PENDING_MS`, which its latest usage reading may not show yet. */
+  private readonly placements: { accountId: string; at: number }[] = [];
+
+  private notePlacement(accountId: string, now: number): void {
+    this.placements.push({ accountId, at: now });
+    while (this.placements.length > 0 && this.placements[0]!.at <= now - PENDING_MS) this.placements.shift();
+  }
+
+  private pendingOn(accountId: string, now: number): number {
+    return this.placements.filter((placement) => placement.accountId === accountId && placement.at > now - PENDING_MS).length;
+  }
+
+  private pacing(now: number): Pacing | undefined {
+    return this.prefs.balanceNewAgents ? { pendingOf: (id) => this.pendingOn(id, now) } : undefined;
+  }
+
   private async route(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
@@ -886,9 +902,12 @@ export class Service {
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
       allowNextPick: takesNextPick(request),
+      pendingOf: (id) => this.pendingOn(id, now),
     };
     const first = chooseAccount(state, input);
     if (!first) return undefined;
+    // Recorded before any await, so concurrent creates see each other's placements.
+    if (interactive && (request.reason === "create" || first.skipped)) this.notePlacement(first.account.id, now);
     let decision = first;
     const prepare = async (account: StoredAccount) => {
       // Taken before anything else waits, so a move of this home that hasn't finished gives way (see
@@ -1264,7 +1283,8 @@ export class Service {
       return;
     }
     const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
-    const next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    const next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), this.pacing(now));
+    if (next) this.notePlacement(next.id, now);
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
@@ -1645,7 +1665,8 @@ export class Service {
   private nextAccount(state: StoredState, agentId: string, family: Family, exhausted: string): { account: StoredAccount; pin: boolean } | undefined {
     const routed = this.routeFor(state, agentId, family, exhausted);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]));
+    const now = Date.now();
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), this.pacing(now));
     return roomiest && { account: roomiest, pin: true };
   }
 
@@ -1694,6 +1715,7 @@ export class Service {
         const move = this.nextAccount(latest, agentId, family, accountId);
         if (!move) return;
         const next = move.account;
+        this.notePlacement(next.id, now);
         if (move.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
         this.switchGuard.note(agentId, now);
         const row: SwitchRow = {
@@ -1761,7 +1783,8 @@ export class Service {
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
-    const account = mostAvailable(state, other, (id) => this.usage.get(id), Date.now(), new Set());
+    const now = Date.now();
+    const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.pacing(now));
     if (!account) return { skipped: `Every ${name} account is at its limit too.` };
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
@@ -2427,16 +2450,18 @@ export class Service {
    * `current` is the account its session runs on, which it keeps while that can stand in.
    */
   private routeFor(state: StoredState, agentId: string, family: Family, current?: string): RouteDecision | null {
+    const now = Date.now();
     return chooseAccount(state, {
       agentId,
       family,
       reason: "refresh",
-      now: Date.now(),
+      now,
       autoSwitch: this.prefs.autoSwitch,
-      balanceNewAgents: false,
+      balanceNewAgents: this.prefs.balanceNewAgents,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,
+      pendingOf: (id) => this.pendingOn(id, now),
     });
   }
 

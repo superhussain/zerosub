@@ -4017,3 +4017,24 @@ describe("the account button's reason row", () => {
     expect((await route())?.selectionReason).toBeUndefined();
   });
 });
+
+describe("pending placements", () => {
+  it("spreads concurrent new agents by pending placements", async () => {
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const context = { paseo } as never;
+    const create = (agentId: string) =>
+      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", env: {} } as never, context);
+    await Promise.all([create("new-a"), create("new-b")]);
+    const { sessions } = await store.read();
+    expect(new Set([sessions["new-a"]?.accountId, sessions["new-b"]?.accountId])).toEqual(new Set([MAIN, HELLO]));
+  });
+});
