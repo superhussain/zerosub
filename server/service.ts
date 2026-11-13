@@ -45,6 +45,7 @@ import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent
 import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
+import { reapLeftovers } from "./leftovers";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode, withinMode } from "./modes";
@@ -99,6 +100,7 @@ const LIMIT_TRUST_MS = 15 * 60_000;
 const LOGIN_TTL_MS = 15 * 60_000;
 const LOGIN_GRACE_MS = 3_000;
 const PRUNE_MS = 10 * 60_000;
+const REAP_MS = 5 * 60_000;
 /** Cleanup passes a home's sign-out (or sign-in check) may fail in before it's given up on. */
 const CLEANUP_TRIES = 3;
 /** After a reset, limit notices from turns that were already running are stale. */
@@ -419,6 +421,7 @@ export class Service {
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
   private lastPrune = 0;
+  private lastReap = 0;
   private cleaning: Promise<void> | null = null;
   /** Failed cleanup attempts this run, by home. */
   private readonly cleanupFailures = new Map<string, number>();
@@ -541,6 +544,10 @@ export class Service {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
+    if (this.paseo && now - this.lastReap >= REAP_MS) {
+      this.lastReap = now;
+      void this.reapLeftovers(this.paseo).catch((error: unknown) => log("could not check for leftover Claude processes", error));
+    }
     // Keep added Pi homes in step with Pi's own directory (shared entries, sign-ins, settings) even
     // when they're only used from a terminal, which ZeroSub never sees start.
     for (const account of state.accounts) {
@@ -557,6 +564,29 @@ export class Service {
       void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
       await this.cleanUpHomes(this.paseo);
     }
+  }
+
+  /** Stops Claude processes Paseo left running for closed, archived or gone agents, or replaced by a newer session. */
+  private async reapLeftovers(paseo: PaseoApi): Promise<void> {
+    const { agents, complete } = await listAgents(paseo, true);
+    if (!complete) return;
+    const known = new Map(agents.map((agent) => [agent.id, { archived: agent.archived, status: agent.status }]));
+    for (const { pid, agentId, reason } of await reapLeftovers(known, { resolve: (id) => this.lookUpAgent(paseo, id) })) {
+      console.log(`[ZeroSub] stopped leftover Claude process ${pid} of agent ${agentId} (${reason}); Paseo had left it running`);
+    }
+  }
+
+  /** An agent Paseo's list left out (background workspaces): its status, `"gone"` if Paseo doesn't know it or it's an internal helper, `null` when there's no answer yet. */
+  private async lookUpAgent(paseo: PaseoApi, id: string): Promise<{ archived: boolean; status: string } | "gone" | null> {
+    const agent = await paseo.agents
+      .ref(id)
+      .refresh()
+      .then((result) => result?.agent ?? null)
+      .catch((error: unknown) => (/Agent not found/.test(describe(error)) ? null : undefined));
+    if (agent === undefined) return null;
+    if (agent === null || (agent as { internal?: boolean }).internal) return "gone";
+    const { archived, status } = toAgentInfo(agent);
+    return { archived, status };
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {
