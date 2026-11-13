@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
+  agentIdFrom,
   descendants,
   findLeftovers,
   isClaudeSession,
@@ -38,6 +39,14 @@ describe("parsing", () => {
     expect(isClaudeSession("claude --output-format stream-json --input-format=stream-json")).toBe(true);
     expect(isClaudeSession("claude --output-format stream-json")).toBe(false);
     expect(isClaudeSession("node --output-format stream-json --input-format stream-json")).toBe(false);
+  });
+});
+
+describe("agentIdFrom", () => {
+  it("takes the environment's id, not one in the command line", () => {
+    expect(agentIdFrom("claude --prompt PASEO_AGENT_ID=fake HOME=/x PASEO_AGENT_ID=real PATH=/bin")).toBe("real");
+    expect(agentIdFrom("A=1\0PASEO_AGENT_ID=real\0B=2")).toBe("real");
+    expect(agentIdFrom("claude HOME=/x")).toBeNull();
   });
 });
 
@@ -126,4 +135,21 @@ describe.skipIf(process.platform === "win32")("reapLeftovers", () => {
       stranger.kill();
     }
   });
+
+  it("resolves agents the list left out: a live one keeps its process, an unanswered one is skipped, a gone one waits out the 10 minute floor", async () => {
+    const run = async (resolve: (id: string) => Promise<AgentStatus | "gone" | null>) => {
+      const session = start(fakeArgs(idle), { PASEO_AGENT_ID: "background-agent" });
+      await settle();
+      const stopped = await reapLeftovers(new Map(), { daemonPids: [process.pid], minAgeMs: 0, graceMs: 300, resolve });
+      await settle();
+      const survived = alive(session.pid!);
+      session.kill();
+      return { stopped, survived };
+    };
+    expect((await run(async () => ({ archived: false, status: "idle" }))).stopped).toEqual([]);
+    expect((await run(async () => null)).survived).toBe(true);
+    const gone = await run(async () => "gone");
+    expect(gone.stopped).toEqual([]);
+    expect(gone.survived).toBe(true);
+  }, 20_000);
 });

@@ -571,9 +571,22 @@ export class Service {
     const { agents, complete } = await listAgents(paseo, true);
     if (!complete) return;
     const known = new Map(agents.map((agent) => [agent.id, { archived: agent.archived, status: agent.status }]));
-    for (const { pid, agentId, reason } of await reapLeftovers(known)) {
+    for (const { pid, agentId, reason } of await reapLeftovers(known, { resolve: (id) => this.lookUpAgent(paseo, id) })) {
       console.log(`[ZeroSub] stopped leftover Claude process ${pid} of agent ${agentId} (${reason}); Paseo had left it running`);
     }
+  }
+
+  /** An agent Paseo's list left out (background workspaces): its status, `"gone"` if Paseo doesn't know it or it's an internal helper, `null` when there's no answer yet. */
+  private async lookUpAgent(paseo: PaseoApi, id: string): Promise<{ archived: boolean; status: string } | "gone" | null> {
+    const agent = await paseo.agents
+      .ref(id)
+      .refresh()
+      .then((result) => result?.agent ?? null)
+      .catch((error: unknown) => (/Agent not found/.test(describe(error)) ? null : undefined));
+    if (agent === undefined) return null;
+    if (agent === null || (agent as { internal?: boolean }).internal) return "gone";
+    const { archived, status } = toAgentInfo(agent);
+    return { archived, status };
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {

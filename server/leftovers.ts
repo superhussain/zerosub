@@ -35,8 +35,8 @@ const PS_TIMEOUT_MS = 10_000;
 export function parseEtime(value: string): number | null {
   const match = /^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$/.exec(value.trim());
   if (!match) return null;
-  const [days = 0, hours = 0, minutes = 0, seconds = 0] = match.slice(1).map((part) => Number(part ?? 0));
-  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+  const part = (index: number) => Number(match[index] ?? 0);
+  return (((part(1) * 24 + part(2)) * 60 + part(3)) * 60 + part(4)) * 1000;
 }
 
 /** Parses `ps -o pid=,ppid=,etime=,args=` output; lines that don't fit are skipped. */
@@ -94,12 +94,16 @@ export function findLeftovers(
   return leftovers;
 }
 
+/** The agent id in a process's environment text. On macOS the command line comes first, so the last match is the environment's. */
+export const agentIdFrom = (text: string): string | null =>
+  [...text.matchAll(/(?:^|[\s\0])PASEO_AGENT_ID=([^\s\0]+)/g)].at(-1)?.[1] ?? null;
+
 async function agentIdOf(pid: number): Promise<string | null> {
   const text =
     process.platform === "linux"
       ? await readFile(`/proc/${pid}/environ`, "utf8").catch(() => "")
       : (await run("ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { timeoutMs: PS_TIMEOUT_MS })).stdout;
-  return /(?:^|[\s\0])PASEO_AGENT_ID=([^\s\0]+)/.exec(text)?.[1] ?? null;
+  return agentIdFrom(text);
 }
 
 async function listProcesses(): Promise<ProcessRow[] | null> {
@@ -115,13 +119,16 @@ function signal(pid: number, name: NodeJS.Signals): void {
   }
 }
 
+/** What `resolve` says about an agent the list left out: its status, `"gone"`, or `null` for no answer yet. */
+export type AgentLookup = (agentId: string) => Promise<AgentStatus | "gone" | null>;
+
 /**
  * Stops the leftover Claude session processes of Paseo's daemon, with their descendants: SIGTERM,
  * then SIGKILL for any that outlast `graceMs`. Stops nothing when `ps` fails.
  */
 export async function reapLeftovers(
   agents: ReadonlyMap<string, AgentStatus>,
-  options: { daemonPids?: readonly number[]; minAgeMs?: number; graceMs?: number } = {},
+  options: { daemonPids?: readonly number[]; minAgeMs?: number; graceMs?: number; resolve?: AgentLookup } = {},
 ): Promise<Leftover[]> {
   if (process.platform !== "darwin" && process.platform !== "linux") return [];
   const daemonPids = (options.daemonPids ?? [process.ppid, process.pid]).filter((pid) => pid !== 1);
@@ -133,7 +140,19 @@ export async function reapLeftovers(
     const agentId = await agentIdOf(row.pid);
     if (agentId) sessions.push({ ...row, agentId });
   }
-  const leftovers = findLeftovers(sessions, agents, options.minAgeMs);
+  const known = new Map(agents);
+  const unanswered = new Set<string>();
+  for (const agentId of new Set(sessions.map((session) => session.agentId))) {
+    if (known.has(agentId) || !options.resolve) continue;
+    const found = await options.resolve(agentId);
+    if (found === null) unanswered.add(agentId);
+    else if (found !== "gone") known.set(agentId, found);
+  }
+  const leftovers = findLeftovers(
+    sessions.filter((session) => !unanswered.has(session.agentId)),
+    known,
+    options.minAgeMs,
+  );
   const targets = leftovers.flatMap(({ pid }) => [pid, ...descendants(rows, pid)]);
   for (const pid of targets) signal(pid, "SIGTERM");
   if (targets.length === 0) return leftovers;
