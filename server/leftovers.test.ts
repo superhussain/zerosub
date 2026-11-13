@@ -8,6 +8,7 @@ import {
   parseEtime,
   parsePs,
   reapLeftovers,
+  sameProcess,
   type AgentStatus,
   type SessionProcess,
 } from "./leftovers";
@@ -39,6 +40,13 @@ describe("parsing", () => {
     expect(isClaudeSession("claude --output-format stream-json --input-format=stream-json")).toBe(true);
     expect(isClaudeSession("claude --output-format stream-json")).toBe(false);
     expect(isClaudeSession("node --output-format stream-json --input-format stream-json")).toBe(false);
+  });
+
+  it("sameProcess matches pid and start time", () => {
+    const before = { pid: 4102, ppid: 4101, ageMs: 10_000, args: "" };
+    expect(sameProcess(before, 1_000_000, { ...before, ppid: 1, ageMs: 15_400 }, 1_005_000)).toBe(true);
+    expect(sameProcess(before, 1_000_000, { ...before, ageMs: 1_000 }, 1_005_000)).toBe(false);
+    expect(sameProcess(before, 1_000_000, { ...before, pid: 4103, ageMs: 15_400 }, 1_005_000)).toBe(false);
   });
 });
 
@@ -133,6 +141,28 @@ describe.skipIf(process.platform === "win32")("reapLeftovers", () => {
     for (const stranger of strangers) {
       expect(alive(stranger.pid!)).toBe(true);
       stranger.kill();
+    }
+  });
+
+  it("kills a child that ignores SIGTERM once its session has exited", async () => {
+    const stubborn = 'process.on("SIGTERM",()=>{});setInterval(()=>{},1e3)';
+    const agents = new Map<string, AgentStatus>([["test-agent", { archived: true, status: "idle" }]]);
+    const session = start(
+      fakeArgs(`console.log(require("child_process").spawn(process.execPath,["-e",${JSON.stringify(stubborn)}],{stdio:"ignore"}).pid);${idle}`),
+      { PASEO_AGENT_ID: "test-agent" },
+    );
+    const child = Number(await new Promise<string>((resolve) => session.stdout!.once("data", (chunk) => resolve(String(chunk)))));
+    try {
+      await settle();
+      await reapLeftovers(agents, { daemonPids: [process.pid], minAgeMs: 0, graceMs: 500 });
+      await settle();
+      expect(alive(child)).toBe(false);
+    } finally {
+      try {
+        process.kill(child, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
     }
   });
 
