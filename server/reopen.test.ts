@@ -68,7 +68,7 @@ describe("reopening through the host", () => {
 
   it("falls back to the CLI on a host without its own reload", async () => {
     withoutCli();
-    const result = await new Reopener().reopen("a", { agents: { ref: () => ({ refresh: async () => null }) } });
+    const result = await new Reopener(async () => null).reopen("a", { agents: { ref: () => ({ refresh: async () => null }) } });
     expect(result).toMatchObject({ ok: false, error: expect.stringMatching(/command-line tool was not found/) });
   });
 
