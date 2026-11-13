@@ -7,6 +7,7 @@ import {
   findAccount,
   mainAccount,
   type Binding,
+  type NextAgentPick,
   type StoredAccount,
   type StoredState,
 } from "./state";
@@ -19,7 +20,8 @@ const NEAR_RESET_MS = 24 * 60 * 60_000;
 const NEAR_RESET_MAX_USED_PERCENT = 80;
 /**
  * An account that has used this much of its 5-hour window is about to run out of it: when spreading
- * new agents, any account under this ranks ahead of every account past it.
+ * new agents, any account under this ranks ahead of every account past it, unless a window that caps
+ * it is full (see `mostAvailable`).
  */
 const FIVE_HOUR_GATE_PERCENT = 80;
 
@@ -47,6 +49,15 @@ export function isLimited(account: StoredAccount, now: number): boolean {
 
 export function isUsable(account: StoredAccount, now: number): boolean {
   return account.signedIn && !account.disabled && !isLimited(account, now);
+}
+
+/**
+ * Routing may put agents on this account by itself: it's usable and not billed per use. No Pi
+ * account is ever picked that way: an added one is an API key, and Pi's own login may be one too,
+ * so moving work onto either would move it onto a bill nobody chose.
+ */
+export function canStandIn(account: StoredAccount, now: number): boolean {
+  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now);
 }
 
 /**
@@ -142,7 +153,9 @@ export function paceScore(usage: Usage | null | undefined, pending: number, now:
 /**
  * The usable account with the most room: one under the 5-hour gate before one past it (by peak alone,
  * an account at 81% of its 5 hours beats one at 88% of its week, and runs out minutes later), then
- * the lowest peak, preferring the default, then the CLI login, on ties.
+ * the lowest peak, preferring the default, then the CLI login, on ties. An account with a full window
+ * that caps it ranks last, gate or not, though it's usable: its limit lifted at the 5-hour reset with
+ * its week still full, say, or ChatGPT credits keep it going.
  */
 export function mostAvailable(
   state: StoredState,
@@ -154,13 +167,15 @@ export function mostAvailable(
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const candidates = accountsOf(state, family).filter(
-    (account) => !exclude.has(account.id) && isUsable(account, now),
+    (account) => !exclude.has(account.id) && canStandIn(account, now),
   );
   const rank = (account: StoredAccount) => {
-    const pace = pacing ? paceScore(usageOf(account.id), pacing.pendingOf(account.id), now) : undefined;
+    const usage = usageOf(account.id);
+    const score = headroomScore(usage, now);
+    const pace = pacing ? paceScore(usage, pacing.pendingOf(account.id), now) : undefined;
     return [
-      pace ? (pace.gated ? 1 : 0) : fiveHourGated(usageOf(account.id), now) ? 1 : 0,
-      pace ? pace.score : headroomScore(usageOf(account.id), now),
+      score >= 100 ? 2 : (pace ? pace.gated : fiveHourGated(usage, now)) ? 1 : 0,
+      pace ? pace.score : score,
       account.id === preferred ? 0 : 1,
       account.kind === "main" ? 0 : 1,
       Date.parse(account.createdAt) || 0,
@@ -213,6 +228,17 @@ export interface RouteInput {
    */
   portable: boolean;
   usageOf(accountId: string): Usage | null | undefined;
+  /**
+   * The account the agent's session runs on now. When the account it's routed to has to be skipped
+   * and this one can stand in, the agent stays on it rather than following whichever account ranks
+   * first at the moment, which would move it again each time two accounts swap places.
+   */
+  current?: string;
+  /**
+   * Whether this session may take the one-time "next new agent" pick: one the user's own agents
+   * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
+   */
+  allowNextPick?: boolean;
   /** Agents recently placed on an account; only read while `balanceNewAgents` is on. */
   pendingOf?(accountId: string): number;
 }
@@ -223,14 +249,21 @@ export interface RouteDecision {
   bind: Binding | null;
   /** Why the preferred account was skipped, if it was. */
   skipped: { account: StoredAccount; why: "limited" | "signed_out" | "disabled" } | null;
+  /**
+   * The "next new agent" pick routing looked at, to be cleared: it's spent whether the agent starts
+   * on its account or that account couldn't take it.
+   */
+  nextPick?: NextAgentPick;
 }
 
 /**
  * Which account a session opens on: the agent's own binding, else (for balanced new agents) the
- * roomiest account, else the default. An exhausted or signed-out choice is swapped for the roomiest
- * usable account when automatic switching is on — for new agents always, and for existing ones
- * only when their conversation can move between accounts. A disabled choice is always swapped,
- * and the agent keeps its own binding so it returns once the account is enabled again.
+ * roomiest account, else the default (the CLI login for an existing Codex thread ZeroSub never
+ * routed). An exhausted or signed-out choice is swapped for the roomiest usable account when
+ * automatic switching is on — for new agents always, and for existing ones only when their
+ * conversation can move between accounts. A disabled choice is always swapped,
+ * and the agent keeps its own binding so it returns once the account is enabled again. An agent
+ * already running on a usable stand-in keeps it (see `RouteInput.current`).
  */
 export function chooseAccount(state: StoredState, input: RouteInput): RouteDecision | null {
   const accounts = accountsOf(state, input.family);
@@ -246,6 +279,17 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
 
+  // A pick whose account can't take the agent (at its limit, signed out, disabled, removed) is spent
+  // all the same, and the agent routes as usual: kept, it would send every new agent to whichever
+  // account stands in for its own until it expires.
+  const nextPick = !account && fresh && input.allowNextPick ? (state.nextAgent?.[input.family] ?? undefined) : undefined;
+  if (nextPick && Date.parse(nextPick.until) > input.now) {
+    const picked = findAccount(state, nextPick.accountId);
+    if (picked?.family === input.family && picked.signedIn && !picked.disabled && !(input.autoSwitch && isLimited(picked, input.now))) {
+      account = picked;
+      bind = { accountId: picked.id, source: "user", at };
+    }
+  }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
     account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, undefined, pacing);
@@ -266,7 +310,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
-    const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), pacing);
+    const staying = findAccount(state, input.current);
+    const alternative =
+      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now)
+        ? staying
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), pacing);
     if (alternative) {
       skipped = { account, why };
       account = alternative;
@@ -280,7 +328,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
             : { accountId: alternative.id, source: "auto", at };
     }
   }
-  return { account, bind, skipped };
+  return { account, bind, skipped, nextPick };
 }
 
 /** The account an agent is routed to right now, without side effects (for display). */

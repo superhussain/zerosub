@@ -4,20 +4,26 @@ import { join } from "node:path";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter } from "./adapter";
-import { CodexContinuations, fitInstructions } from "./continuations";
+import { CodexContinuations, fitInstructions, readUpdates } from "./continuations";
 import { Service } from "./service";
 import { StateStore, StoredAccountSchema, salvageState } from "./state";
 import type { FamilyResolver } from "./families";
 import { preferences } from "../shared/preferences";
 import type { SwitchRow } from "../shared/timeline";
+import { absentPi } from "./fakes.test-support";
 
 type PaseoApi = PluginHookContext["paseo"];
 type Create = Parameters<ReturnType<PaseoApi["workspaces"]["ref"]>["agents"]["create"]>[0];
 type Snapshot = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
 type Entry = { item: AgentTimelineItem; timestamp: string; seqStart: number; seqEnd: number; turnId?: string };
 let dir: string;
+/** The services the current test made, stopped once it ends. */
+const services: Service[] = [];
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-")); });
-afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+afterEach(async () => {
+  await Promise.all(services.splice(0).map((service) => service.stop()));
+  await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+});
 
 async function setup() {
   const path = join(dir, "state.json");
@@ -106,7 +112,11 @@ async function setup() {
     detectSignOut: () => null, env: async (home: string) => ({ CODEX_HOME: home }), prepareHome: async () => {},
     redeemReset: async () => ({ outcome: "reset", message: "Synthetic reset", left: 0 }),
   } as unknown as FamilyAdapter;
-  const service = () => new Service({ codex: adapter, claude: adapter }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+  const service = () => {
+    const made = new Service({ codex: adapter, claude: adapter, pi: absentPi() }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+    services.push(made);
+    return made;
+  };
   const restart = () => { store = new StateStore(path); return new CodexContinuations(store); };
   return { path, get store() { return store; }, accounts, agents, addAgent, timelines, epochs, add, created, sent, notes, create, send, refetch, paseo, switchTo, manager, service, restart };
 }
@@ -303,13 +313,50 @@ describe("Codex account continuations", () => {
     const switching = service.setAgentAccount(t.paseo, "root", "b");
     await entered;
     await expect(service.forkAgent(t.paseo, "root")).rejects.toThrow(/already switching/);
-    await service.onTurnEnded({ agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] } as never, { paseo: t.paseo } as never);
+    // The limit waits for the switch, which continues the task once: failover then finds it continued.
+    const limited = service.onTurnEnded({ agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] } as never, { paseo: t.paseo } as never);
+    await vi.waitFor(async () => expect((await t.store.read()).accounts.find((account) => account.id === "a")!.limitedUntil).not.toBeNull());
     release();
     await switching;
+    await limited;
     expect(t.created).toHaveLength(1);
     expect(t.send).toHaveBeenCalledTimes(1);
     expect((await t.store.read()).accounts.find((account) => account.id === "a")!.limitedUntil).not.toBeNull();
     expect((await t.store.read()).accounts.find((account) => account.id === "b")!.limitedUntil).toBeNull();
+  });
+
+  it.each([
+    ["finishes it", null, { outcome: "continued", to: "B", continued: true }],
+    ["says so when it can't finish it", new Error("The workspace is gone"), { outcome: "stayed", to: "B", detail: "Couldn't continue on B: The workspace is gone" }],
+  ])("answers a switch before Paseo gives up, and %s in the background", async (_, failure, row) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const t = await setup();
+      const service = t.service();
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      let release!: () => void;
+      let started!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const entered = new Promise<void>((resolve) => { started = resolve; });
+      const create = t.create.getMockImplementation()!;
+      t.create.mockImplementationOnce(async (request) => {
+        started();
+        await gate;
+        if (failure) throw failure;
+        await create(request);
+      });
+      const switching = service.setAgentAccount(t.paseo, "root", "b");
+      await entered;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(await switching).toMatchObject({ pending: ["root"], continuedIn: null });
+      expect(t.notes).toEqual([]);
+
+      release();
+      await vi.waitFor(() => expect(t.notes.at(-1)).toMatchObject({ agentId: "root", row }));
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
   });
 
   it("does not send a snapshot made before a newer source instruction", async () => {
@@ -990,5 +1037,17 @@ describe("fitting pending instructions", () => {
     expect(text).toContain("[… 1 earlier instruction omitted to fit this update …]");
     expect(text).not.toContain("middle");
     expect(text).toMatch(/TAIL$/);
+  });
+});
+
+describe("reading a source's updates", () => {
+  it("refuses older history it can't page instead of treating the scan as complete", async () => {
+    // Older rows exist past the watermark, but the page gives no cursor to reach them.
+    const page = {
+      epoch: "e1", window: { maxSeq: 900 }, hasOlder: true, startCursor: null, gap: false, staleCursor: false,
+      entries: [{ item: { type: "user_message", text: "STOP" }, seqStart: 400, seqEnd: 900 }],
+    };
+    const paseo = { agents: { ref: () => ({ timeline: { refetch: async () => page } }) } } as unknown as PaseoApi;
+    await expect(readUpdates(paseo, "source", { epoch: "e1", seq: 5 })).rejects.toThrow(/complete handoff history/);
   });
 });

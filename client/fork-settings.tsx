@@ -17,12 +17,43 @@ type Catalog =
   | { status: "error"; message: string }
   | { status: "empty" };
 
-/**
- * Where a stopped Claude chat continues when the fork option is on: the destination, and for
- * OpenCode the model and thinking option, read from this host's catalog. Rendered under the fork
- * toggle wherever it appears.
- */
+/** Where a stopped Claude chat continues when the fork option is on. Rendered under the fork toggle. */
 export function ForkDestinationRows({
+  values,
+  saving,
+  onSave,
+}: {
+  values: Preferences;
+  saving: boolean;
+  onSave(patch: Partial<Preferences>): void;
+}) {
+  const destinationEnabled = !saving && values.forkOtherProvider && values.autoSwitch;
+  return (
+    <SettingsSelect
+      key="destination"
+      label="Fork a stopped Claude chat to"
+      hint={
+        values.claudeForkDestination === "opencode"
+          ? "Applies when every Claude account is out. OpenCode runs this host's permission policy, so Build can edit files and run shell without asking. That can allow more than Claude does."
+          : "Applies when every Claude account is out. ChatGPT uses the account with the most room left."
+      }
+      value={values.claudeForkDestination}
+      options={[
+        { label: "ChatGPT", value: "codex" },
+        { label: OPENCODE_LABEL, value: "opencode" },
+      ]}
+      disabled={!destinationEnabled}
+      onValueChange={(claudeForkDestination) => onSave({ claudeForkDestination })}
+    />
+  );
+}
+
+/**
+ * The OpenCode model and thinking option, read from this host's catalog. Always visible and editable:
+ * a hand "Continue on OpenCode" uses them in every state, and the automatic fork uses them when its
+ * destination is OpenCode.
+ */
+export function OpenCodeForkRows({
   values,
   saving,
   onSave,
@@ -39,7 +70,9 @@ export function ForkDestinationRows({
       .listModels(OPENCODE_PROVIDER)
       // A response with no models field and one with an empty list both mean: nothing to pick from.
       .then((result) => {
-        if (live) setCatalog((result.models ?? []).length > 0 ? { status: "ready", models: result.models ?? [] } : { status: "empty" });
+        if (!live) return;
+        if (result.error) setCatalog({ status: "error", message: String(result.error) });
+        else setCatalog((result.models ?? []).length > 0 ? { status: "ready", models: result.models ?? [] } : { status: "empty" });
       })
       .catch((error: unknown) => {
         if (live) setCatalog({ status: "error", message: error instanceof Error ? error.message : String(error) });
@@ -49,27 +82,6 @@ export function ForkDestinationRows({
     };
   }, [paseo]);
 
-  const enabled = !saving && values.forkOtherProvider && values.autoSwitch;
-  const rows = [
-    <SettingsSelect
-      key="destination"
-      label="Fork a stopped Claude chat to"
-      hint={
-        values.claudeForkDestination === "opencode"
-          ? "Applies when every Claude account is out. Pick the model and thinking below."
-          : "Applies when every Claude account is out. ChatGPT uses the account with the most room left."
-      }
-      value={values.claudeForkDestination}
-      options={[
-        { label: "ChatGPT", value: "codex" },
-        { label: OPENCODE_LABEL, value: "opencode" },
-      ]}
-      disabled={!enabled}
-      onValueChange={(claudeForkDestination) => onSave({ claudeForkDestination })}
-    />,
-  ];
-  if (values.claudeForkDestination !== "opencode") return <>{rows}</>;
-
   if (catalog.status !== "ready") {
     const hint =
       catalog.status === "loading"
@@ -77,54 +89,55 @@ export function ForkDestinationRows({
         : catalog.status === "empty"
           ? "This host's OpenCode reported no models."
           : `Couldn't read this host's OpenCode models: ${catalog.message}`;
-    return (
-      <>
-        {rows}
-        <SettingsRow label="OpenCode model" hint={hint} />
-      </>
-    );
+    return <SettingsRow label="OpenCode model" hint={hint} />;
   }
 
-  const model = values.forkOpenCodeModel
-    ? catalog.models.find((entry) => entry.id === values.forkOpenCodeModel)
-    : catalog.models.find((entry) => entry.isDefault);
-  rows.push(
+  const hostDefault = catalog.models.find((entry) => entry.isDefault);
+  const saved = values.forkOpenCodeModel ? catalog.models.find((entry) => entry.id === values.forkOpenCodeModel) : undefined;
+  // The model a fork would use: the saved one, else the one the host marks default. Never a guess.
+  const model = values.forkOpenCodeModel ? saved : hostDefault;
+  const rows = [
     <SettingsSelect
       key="model"
       label="OpenCode model"
       hint={
-        values.forkOpenCodeModel && !model
+        values.forkOpenCodeModel && !saved
           ? "That model is no longer in this host's catalog; pick another."
-          : "Used by the OpenCode fork agent on this host. Empty uses the host's default."
+          : !hostDefault && !values.forkOpenCodeModel
+            ? "This host marks no OpenCode default; pick a model."
+            : "Used by Continue on OpenCode in the account menu, and by the automatic fork when its destination is OpenCode."
       }
       value={values.forkOpenCodeModel}
-      options={[{ label: "Host default", value: "" }, ...catalog.models.map((entry) => ({ label: entry.label, value: entry.id }))]}
-      disabled={!enabled}
+      options={[
+        ...(hostDefault ? [{ label: "Host default", value: "" }] : []),
+        ...catalog.models.map((entry) => ({ label: entry.label, value: entry.id })),
+      ]}
+      disabled={saving}
       onValueChange={(forkOpenCodeModel) => {
-        // A thinking option the newly picked model doesn't offer can't stand.
-        const next = forkOpenCodeModel ? catalog.models.find((entry) => entry.id === forkOpenCodeModel) : undefined;
+        // A thinking option the newly chosen model doesn't offer can't stand.
+        const next = forkOpenCodeModel ? catalog.models.find((entry) => entry.id === forkOpenCodeModel) : hostDefault;
         const keep = next?.thinkingOptions?.some((option) => option.id === values.forkOpenCodeThinking);
         onSave(keep ? { forkOpenCodeModel } : { forkOpenCodeModel, forkOpenCodeThinking: "" });
       }}
     />,
-  );
-  // The thinking select waits for a specifically picked model: with "Host default" the options depend
-  // on which model the host resolves to, so there'd be nothing honest to list.
-  if (values.forkOpenCodeModel) {
-    rows.push(
-      <SettingsSelect
-        key="thinking"
-        label="OpenCode thinking"
-        hint="How hard the model thinks on the fork. Empty uses the model's default."
-        value={values.forkOpenCodeThinking}
-        options={[
-          { label: "Model default", value: "" },
-          ...(model?.thinkingOptions ?? []).map((option) => ({ label: option.label, value: option.id })),
-        ]}
-        disabled={!enabled}
-        onValueChange={(forkOpenCodeThinking) => onSave({ forkOpenCodeThinking })}
-      />,
-    );
-  }
+    <SettingsSelect
+      key="thinking"
+      label="OpenCode thinking"
+      hint={
+        !model
+          ? "Pick a model above to choose its thinking option."
+          : values.forkOpenCodeModel
+            ? "How hard the model thinks on the fork. Empty uses the model's default."
+            : `How hard the host default, “${model.label}”, thinks on the fork. Empty uses the model's default.`
+      }
+      value={values.forkOpenCodeThinking}
+      options={[
+        { label: "Model default", value: "" },
+        ...(model?.thinkingOptions ?? []).map((option) => ({ label: option.label, value: option.id })),
+      ]}
+      disabled={saving || !model}
+      onValueChange={(forkOpenCodeThinking) => onSave({ forkOpenCodeThinking })}
+    />,
+  ];
   return <>{rows}</>;
 }
