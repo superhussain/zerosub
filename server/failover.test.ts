@@ -1,14 +1,19 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentTimelineItem, FamilyAdapter, LimitHit, UsageRead } from "./adapter";
+import type { AgentTimelineItem, FamilyAdapter, Identity, LimitHit, UsageRead } from "./adapter";
 import type { FamilyResolver } from "./families";
 import { detectClaudeLimit } from "./limits";
 import type { Reopener } from "./reopen";
+import type { SwitchGuard } from "./switch-guard";
 import { Service } from "./service";
-import { MAIN_ACCOUNT_ID, StateStore, type StoredAccount, type StoredState } from "./state";
+import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, type StoredState } from "./state";
+import { buildTranscript, continuationPrompt } from "./handoff";
+import { saveReadings } from "./usage";
 import { preferences } from "../shared/preferences";
+import { absentPi } from "./fakes.test-support";
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
 const HELLO = "claude-hello";
@@ -16,6 +21,8 @@ const AGENT = "agent-1";
 
 let root: string;
 let previousHome: string | undefined;
+/** The services the current test made, stopped once it ends. */
+const services: Service[] = [];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-failover-"));
@@ -24,9 +31,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // A reading is saved 3 s after it lands. Stopping saves it now, while PASEO_HOME is still this
+  // test's folder, rather than in whatever folder a later test has set by then.
+  await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 function account(id: string, label: string, kind: "main" | "managed") {
@@ -68,7 +78,13 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
   const sent: string[] = [];
   const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null }> = [];
   const refetches: Array<{ direction?: string; limit?: number }> = [];
-  const agent = { id: AGENT, provider: "claude", status: "idle", archivedAt: null, lastUserMessageAt: "2026-09-23T07:00:00.000Z" };
+  const agent: { id: string; provider: string; status: string; archivedAt: null; lastUserMessageAt: string } = {
+    id: AGENT,
+    provider: "claude",
+    status: "idle",
+    archivedAt: null,
+    lastUserMessageAt: "2026-09-23T07:00:00.000Z",
+  };
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: {
@@ -87,18 +103,26 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
       }),
     },
   };
-  return { paseo, sent, notes, refetches };
+  return { paseo, sent, notes, refetches, agent };
 }
 
 interface SetUpOptions {
-  /** How `paseo agent reload` ends. */
-  reload?: "works" | "fails" | "times out";
+  /** How `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
+  reload?: "works" | "fails" | "times out" | "fails after another";
+  /** Runs when `paseo agent reload` starts, before Paseo asks where the new session opens. */
+  reloading?: () => Promise<void>;
+  /** Replaces parts of the Claude adapter. */
+  claude?: Partial<FamilyAdapter>;
   /** Reads turns with a real detector instead of taking every failed turn for a limit. */
   detectLimit?: FamilyAdapter["detectLimit"];
   /** The tail of the agent's timeline as Paseo returns it when asked. */
   recent?: Parameters<typeof fakePaseo>[0];
   /** What every usage reading returns. */
   usage?: () => UsageRead;
+  /** Who the adapter says is signed in. */
+  identity?: () => Identity;
+  /** Reads turns for a sign-out with this instead of finding none. */
+  detectSignOut?: FamilyAdapter["detectSignOut"];
 }
 
 async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: SetUpOptions = {}) {
@@ -115,7 +139,13 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     locate: async () => "/usr/local/bin/paseo",
     reopen: async (id: string) => {
       reopened.push(id);
+      await options.reloading?.();
       await reopenedSession();
+      if (options.reload === "fails after another") {
+        // Paseo runs one reload of an agent at a time, so the other one opened its session after this one.
+        await reopenedSession();
+        return { ok: false as const, error: "Timed out closing previous session during refresh", timedOut: false };
+      }
       if (options.reload === "fails") {
         return { ok: false as const, error: "Timed out closing previous session during refresh", timedOut: false };
       }
@@ -128,13 +158,17 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     ...claudeAdapter(hit),
     ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}),
     ...(options.usage ? { usage: async () => options.usage!() } : {}),
+    ...(options.identity ? { identity: async () => options.identity!() } : {}),
+    ...(options.detectSignOut ? { detectSignOut: options.detectSignOut } : {}),
+    ...options.claude,
   };
   const service = new Service(
-    { claude, codex: claudeAdapter(hit) },
+    { claude, codex: claudeAdapter(hit), pi: absentPi() },
     store,
     families as unknown as FamilyResolver,
     reopener as unknown as Reopener,
   );
+  services.push(service);
   const limitTurn = () =>
     service.onTurnEnded(
       { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
@@ -143,8 +177,226 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
   return { service, store, reopened, limitTurn, ...fake };
 }
 
+/**
+ * Uses a reset with timers held: the usage read it schedules for a few seconds later would
+ * otherwise land in whichever test runs then, maybe while that one's folder is being deleted.
+ */
+async function redeemNow(service: Service, paseo: unknown, accountId: string, agentId?: string) {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    return await service.redeem(paseo as never, accountId, agentId);
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 const inFuture = () => new Date(Date.now() + 30 * 60_000).toISOString();
 const inPast = () => new Date(Date.now() - 60_000).toISOString();
+
+const TWIN = "claude-twin";
+const signedInAs = (key: string) => ({ ...account(key, key, "managed"), identity: key, email: `${key}@example.com` });
+
+describe("one subscription, one limit", () => {
+  const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
+  const twinOfMain = (): StoredAccount => ({ ...account(MAIN, "main", "main"), identity: "org|x", email: "x@example.com" }) as never;
+  const twin = (): StoredAccount => ({ ...account(TWIN, "twin", "managed"), identity: "org|x", email: "x@example.com" }) as never;
+
+  it("limits the twin slot too and moves the agent to a different subscription", async () => {
+    const other = { ...account(HELLO, "hello", "managed"), identity: "org|y", email: "y@example.com" } as never;
+    const { store, reopened, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin(), other], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    const state = await store.read();
+    const byId = (id: string) => state.accounts.find((a) => a.id === id);
+    expect(byId(TWIN)?.limitedUntil).toBe(byId(MAIN)?.limitedUntil);
+    expect(byId(TWIN)).toMatchObject({ limitKind: "window", limitSource: "turn" });
+    expect(byId(HELLO)?.limitedUntil).toBeNull();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(reopened).toEqual([AGENT]);
+  });
+
+  it("doesn't move the agent onto a twin that shares the exhausted quota", async () => {
+    const { reopened, notes, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    expect(reopened).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+  });
+
+  it("lifts the twin's limit along with the one the user marks available", async () => {
+    const { service, store, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    await service.clearLimit(TWIN);
+    const state = await store.read();
+    expect(state.accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
+  });
+
+  const reset = { redeemReset: async () => ({ outcome: "reset" as const, message: "Limits reset.", left: 0 }) };
+
+  it("lifts the twin's limit along with a banked reset", async () => {
+    const { service, store, paseo, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+      { claude: reset },
+    );
+    await limitTurn();
+    expect((await redeemNow(service, paseo, TWIN)).outcome).toBe("reset");
+    expect((await store.read()).accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
+  });
+
+  it("doesn't let a stale notice from the twin limit the subscription a reset just refilled", async () => {
+    const { service, store, paseo, sent, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+      { claude: reset },
+    );
+    await limitTurn();
+    expect((await redeemNow(service, paseo, TWIN)).outcome).toBe("reset");
+    // A turn on the CLI login ran into the limit before the reset on the twin, and ends just after it.
+    await limitTurn();
+    expect((await store.read()).accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
+    expect(sent).toHaveLength(1); // It carries on where it is.
+  });
+});
+
+describe("when the CLI login changes hands", () => {
+  const reading = (percent: number) => (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [{ id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: inFuture() }],
+    error: null,
+    cached: false,
+    resets: null,
+  });
+  const as = (key: string): Identity => ({ signedIn: true, email: `${key}@example.com`, plan: null, organization: null, identity: key });
+  const stale = { ...signedInAs("old"), ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast(), limitSource: "turn" };
+
+  async function handOver(others: StoredAccount[]) {
+    let percent = 0;
+    let who = "old";
+    const { service, store } = await setUp(
+      { accounts: [stale as never, ...others], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "" }),
+      { usage: () => reading(percent)(), identity: () => as(who) },
+    );
+    await service.refreshUsage(MAIN, true);
+    who = "new";
+    percent = 40;
+    await (service as unknown as { refreshIdentity(id: string): Promise<void> }).refreshIdentity(MAIN);
+    await service.refreshUsage(MAIN, true);
+    const main = (await store.read()).accounts.find((a) => a.id === MAIN)!;
+    const shown = (await service.view(fakePaseo().paseo as never)).accounts.find((a) => a.id === MAIN);
+    return { main, shown };
+  }
+
+  it("drops the previous person's limit and reading", async () => {
+    const { main, shown } = await handOver([]);
+    expect(main).toMatchObject({ identity: "new", limitedUntil: null, limitKind: null, limitedAt: null });
+    expect(shown?.usage?.windows.map((w) => w.usedPercent)).toEqual([40]);
+  });
+
+  it("takes over the limit of another slot already signed into the new account", async () => {
+    const until = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    const { main } = await handOver([{ ...signedInAs("new"), limitedUntil: until, limitKind: "window", limitedAt: inPast(), limitSource: "reading" } as never]);
+    expect(main).toMatchObject({ identity: "new", limitedUntil: until, limitKind: "window", limitSource: "reading" });
+  });
+
+  const hit = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+  const checkIdentity = (service: Service) => (service as unknown as { refreshIdentity(id: string): Promise<void> }).refreshIdentity(MAIN);
+  const card = async (service: Service, paseo: unknown) => (await service.view(paseo as never)).accounts.find((a) => a.id === MAIN);
+  /** The new person's reading, which lands once `land` is called. */
+  function slowReading(percent: number) {
+    let land = () => {};
+    const landed = new Promise<void>((resolve) => (land = resolve));
+    return { land, read: () => landed.then(reading(percent)) };
+  }
+  /** Another slot, signed into the new person's account and at its limit. */
+  const newAtLimit = (until: string) =>
+    ({ ...signedInAs("new"), limitedUntil: until, limitKind: "window", limitedAt: inPast(), limitSource: "reading" }) as never;
+
+  it("shows the new person on the card at once, without the previous person's limit or reading", async () => {
+    let who = "old";
+    const next = slowReading(40);
+    const { service, paseo } = await setUp(
+      { accounts: [stale as never], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      hit,
+      { identity: () => as(who), claude: { usage: async () => (who === "old" ? reading(97)() : next.read()) } },
+    );
+    await service.refreshUsage(MAIN, true);
+    expect(await card(service, paseo)).toMatchObject({ status: "limited", usage: { windows: [{ usedPercent: 97 }] } });
+    who = "new";
+    await checkIdentity(service);
+    // Nobody asked for a refresh: until the new person's reading lands, the card shows none.
+    expect(await card(service, paseo)).toMatchObject({ email: "new@example.com", status: "ready", limitedUntil: null, usage: null });
+    next.land();
+    await vi.waitFor(async () => expect((await card(service, paseo))?.usage?.windows.map((w) => w.usedPercent)).toEqual([40]));
+  });
+
+  it("finds a change of hands at startup, and drops the previous person's saved reading and limit", async () => {
+    await saveReadings(new Map([[MAIN, { ...reading(97)(), credits: null }]]));
+    const next = slowReading(40);
+    const { service, store, paseo } = await setUp(
+      { accounts: [stale as never], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      hit,
+      { identity: () => as("new"), claude: { usage: next.read } },
+    );
+    await service.start();
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)).toMatchObject({ identity: "new", limitedUntil: null, limitedAt: null });
+    expect(await card(service, paseo)).toMatchObject({ status: "ready", usage: null });
+    next.land();
+    await vi.waitFor(async () => expect((await card(service, paseo))?.usage?.windows.map((w) => w.usedPercent)).toEqual([40]));
+  });
+
+  it("takes over another slot's limit when the CLI login is signed in here as that slot's account", async () => {
+    const until = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    let who = "old";
+    const { service, store } = await setUp(
+      { accounts: [stale as never, newAtLimit(until)], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      hit,
+      {
+        identity: () => as(who),
+        claude: {
+          login: async () => {
+            who = "new";
+            return {
+              progress: { step: "starting", url: null, codeUrl: null, userCode: null, message: null },
+              onProgress: () => undefined,
+              submitCode: async () => undefined,
+              cancel: () => undefined,
+              finished: Promise.resolve({ ok: true, message: null }),
+            };
+          },
+        },
+      },
+    );
+    const { id } = await service.startLogin("claude", "browser", MAIN);
+    await vi.waitFor(async () => expect((await service.submitCode(id, "")).step).toBe("done"));
+    const main = (await store.read()).accounts.find((a) => a.id === MAIN);
+    expect(main).toMatchObject({ identity: "new", limitedUntil: until, limitKind: "window", limitSource: "reading" });
+  });
+
+  it("spends a reset for the new person at once, though one was just spent for the previous person", async () => {
+    const until = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    let who = "old";
+    const { service, store, paseo } = await setUp(
+      { accounts: [stale as never, newAtLimit(until)], defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      hit,
+      { identity: () => as(who), claude: { redeemReset: async () => ({ outcome: "reset", message: "Limits reset.", left: 0 }) } },
+    );
+    expect((await redeemNow(service, paseo, MAIN)).outcome).toBe("reset");
+    who = "new";
+    await checkIdentity(service);
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil).toBe(until);
+    expect((await redeemNow(service, paseo, MAIN)).outcome).toBe("reset");
+    expect((await store.read()).accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
+  });
+});
 
 describe("failover", () => {
   it("blames the CLI login for a session ZeroSub never routed, even when the agent is bound elsewhere", async () => {
@@ -152,7 +404,7 @@ describe("failover", () => {
     const { store, reopened, sent, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: {},
       },
@@ -168,12 +420,36 @@ describe("failover", () => {
     expect(sent).toHaveLength(1);
   });
 
+  it("doesn't tell an agent to continue once someone has written to it or put it away", async () => {
+    // Paseo's send cancels a turn that's running and unarchives an archived agent.
+    for (const meanwhile of ["writes to it", "archives it"] as const) {
+      let act = async () => {};
+      const { service, paseo, agent, reopened, sent, notes, limitTurn } = await setUp(
+        {
+          accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+          defaults: { claude: MAIN, codex: null, pi: null },
+          sessions: {},
+        },
+        () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
+        { reloading: () => act() },
+      );
+      act = async () => {
+        if (meanwhile === "writes to it") await service.onTurnStarted({ id: AGENT, provider: "claude" }, { paseo } as never);
+        else (agent as { archivedAt: string | null }).archivedAt = new Date().toISOString();
+      };
+      await limitTurn();
+      expect(reopened).toEqual([AGENT]);
+      expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched" });
+      expect(sent).toHaveLength(0);
+    }
+  });
+
   it("moves on again when the next account runs out too", async () => {
     let resetsAt = inPast(); // marketing's window has already reset when hello runs out
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt, message: "You've hit your session limit" }),
@@ -190,7 +466,7 @@ describe("failover", () => {
     const { reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt: inPast(), message: "You've hit your session limit" }),
@@ -208,7 +484,7 @@ describe("failover", () => {
     const { service, store, reopened, notes, paseo } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: {},
       },
       () => {
@@ -253,7 +529,7 @@ describe("failover", () => {
         const { service, store, reopened, sent, notes, paseo } = await setUp(
           {
             accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-            defaults: { claude: MAIN, codex: null },
+            defaults: { claude: MAIN, codex: null, pi: null },
             bindings: {},
             sessions: {},
           },
@@ -288,7 +564,7 @@ describe("failover", () => {
     const notice = "You've hit your session limit · resets 3pm (UTC)";
     const twoAccounts = () => ({
       accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-      defaults: { claude: MAIN, codex: null },
+      defaults: { claude: MAIN, codex: null, pi: null },
       sessions: {},
     });
     const unused = () => {
@@ -418,7 +694,7 @@ describe("failover", () => {
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -437,7 +713,7 @@ describe("failover", () => {
     const { store, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -455,6 +731,7 @@ describe("forking to the other provider", () => {
       { id: "plan", label: "Plan Mode", colorTier: "planning" },
       { id: "default", label: "Always Ask", colorTier: "safe" },
       { id: "acceptEdits", label: "Accept File Edits", colorTier: "moderate" },
+      { id: "auto", label: "Auto", colorTier: "moderate" },
       { id: "bypassPermissions", label: "Bypass", colorTier: "dangerous" },
     ],
     codex: [
@@ -475,6 +752,8 @@ describe("forking to the other provider", () => {
       opencodeAvailable?: boolean;
       /** What `listModels` answers for OpenCode. */
       catalog?: Array<Record<string, unknown>>;
+      /** A failed `listModels` answer, which carries `error` instead of throwing. */
+      catalogError?: string;
       /** OpenCode's modes. */
       opencodeModes?: Array<{ id: string; label: string; colorTier?: string }>;
       /** No ChatGPT account is configured at all. */
@@ -486,12 +765,20 @@ describe("forking to the other provider", () => {
     } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
+    /** Seams for the network boundary: a test can act between reads, or make a send or read throw. */
+    const hooks: {
+      onRefetch?: (id: string) => void;
+      onRefresh?: (id: string) => void;
+      onModes?: (provider: string) => void;
+      send?: (id: string, text: string, messageId: string | undefined) => void;
+      createdStatus?: string;
+    } = {};
     await store.update((draft) =>
       Object.assign(draft, {
         accounts: options.noChatGPT
           ? [account(MAIN, "marketing", "main")]
           : [account(MAIN, "marketing", "main"), { ...account(CODEX_MAIN, "hello", "main"), family: "codex" }],
-        defaults: { claude: MAIN, codex: options.noChatGPT ? null : CODEX_MAIN },
+        defaults: { claude: MAIN, codex: options.noChatGPT ? null : CODEX_MAIN, pi: null },
       }),
     );
     const source = {
@@ -506,14 +793,37 @@ describe("forking to the other provider", () => {
       lastUserMessageAt: "2026-09-23T07:00:00.000Z",
       labels,
     };
+    /** Every timeline read, so tests can count how many pages a check needed. */
+    const timelineReads: Array<{ id: string; direction?: string }> = [];
+    const epochOf = (id: string) => (id === AGENT ? sourceEpoch : "epoch-1");
     const agents: Array<Record<string, unknown>> = [source, ...others];
-    const created: Array<{ agentId: string; config: { provider: string; modeId?: string }; title: string; prompt: string; labels: Record<string, string> }> = [];
-    const notes: Array<{ to: string; outcome: string; toFamily: string | null; toProvider: string | null; detail: string | null; continuedIn: { agentId: string } | null }> = [];
+    const byId = new Map(agents.map((agent) => [agent.id as string, agent]));
+    const created: Array<{ agentId: string; workspaceId?: string; idempotencyKey?: string; config: { provider: string; modeId?: string }; title: string; prompt?: string; labels: Record<string, string> }> = [];
+    const notes: Array<{ to: string; outcome: string; toFamily: string | null; toProvider: string | null; delivery?: string; detail: string | null; continuedIn: { agentId: string } | null }> = [];
+    /** Every prompt the plugin sent, and the message ID it was sent under. */
+    const sends: Array<{ agentId: string; text: string; messageId?: string }> = [];
+    /** Per-agent timelines in Paseo's canonical projection; the fake tags every turn it accepts. */
+    const timelines = new Map<string, Array<{ item: AgentTimelineItem; turnId?: string; seqEnd: number }>>();
+    let seq = 0;
+    const setTimeline = (id: string, rows: readonly Row[]) =>
+      timelines.set(id, rows.map((row) => ({ ...row, seqEnd: ++seq })));
+    setTimeline(AGENT, conversation);
+    /** Adds one turn to an agent's timeline, as Paseo would when the user types. */
+    const addTurn = (id: string, item: AgentTimelineItem, clientMessageId?: string) => {
+      const rows = timelines.get(id) ?? [];
+      const entry = clientMessageId && item.type === "user_message" ? { ...item, clientMessageId } : item;
+      rows.push({ item: entry, turnId: `turn-${++seq}`, seqEnd: ++seq });
+      timelines.set(id, rows);
+    };
+    /** Makes the next source read fail, as a history gap does; `fork` gaps every other timeline. */
+    const gap = { source: false, fork: false };
+    let sourceEpoch = "epoch-1";
     const modes: Record<string, Array<{ id: string; label: string; colorTier?: string }>> = {
       ...MODES,
       opencode: options.opencodeModes ?? [
+        // Paseo's real OpenCode catalog.
         { id: "build", label: "Build", colorTier: "moderate" },
-        { id: "code", label: "Code", colorTier: "dangerous" },
+        { id: "plan", label: "Plan", colorTier: "planning" },
       ],
     };
     const models: Record<string, Array<Record<string, unknown>>> = {
@@ -529,22 +839,29 @@ describe("forking to the other provider", () => {
       config: { get: async () => ({ config: { providers: {} } }) },
       providers: {
         listAvailable: async () => ({ providers: available }),
-        listModes: async (provider: string) => ({ modes: modes[provider] }),
-        listModels: async (provider: string) => ({ models: models[provider] }),
+        listModes: async (provider: string) => {
+          hooks.onModes?.(provider);
+          return { modes: modes[provider] };
+        },
+        listModels: async (provider: string) => (provider === "opencode" && options.catalogError ? { error: options.catalogError } : { models: models[provider] }),
       },
       workspaces: {
-        ref: () => ({
+        ref: (workspaceId: string) => ({
           agents: {
             create: async (request: (typeof created)[number]) => {
-              created.push(request);
-              agents.push({
+              created.push({ ...request, workspaceId });
+              const agent = {
                 id: request.agentId,
                 provider: request.config.provider.split("/")[0],
-                status: "running",
+                status: hooks.createdStatus ?? "idle",
+                currentModeId: request.config.modeId,
                 title: request.title,
+                workspaceId: "ws-1",
                 archivedAt: null,
                 labels: request.labels,
-              });
+              };
+              agents.push(agent);
+              byId.set(agent.id, agent);
             },
           },
         }),
@@ -552,11 +869,40 @@ describe("forking to the other provider", () => {
       agents: {
         list: async () => ({ entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } }),
         ref: (id: string) => ({
-          refresh: async () => ({ agent: others.find((agent) => agent.id === id) ?? source }),
-          send: async () => undefined,
+          refresh: async () => {
+            hooks.onRefresh?.(id);
+            return { agent: byId.get(id) ?? null };
+          },
+          send: async (text: string, options: { messageId?: string } = {}) => {
+            if (hooks.send) return hooks.send(id, text, options.messageId);
+            sends.push({ agentId: id, text, messageId: options.messageId });
+            addTurn(id, { type: "user_message", text }, options.messageId);
+          },
           timeline: {
-            append: async (item: { data: (typeof notes)[number] }) => void notes.push(item.data),
-            refetch: async ({ limit = 0 }: { limit?: number } = {}) => ({ entries: limit > 0 ? conversation.slice(-limit) : conversation }),
+            append: async (item: { type: "plugin"; id: string; kind: string; version: number; data: (typeof notes)[number] }) => {
+              notes.push(item.data);
+              addTurn(id, { ...item, pluginId: "zerosub" } as AgentTimelineItem);
+            },
+            refetch: async (options: { direction?: string; cursor?: { epoch: string; seq: number } | null; limit?: number } = {}) => {
+              timelineReads.push({ id, direction: options.direction });
+              hooks.onRefetch?.(id);
+              if ((gap.source && id === AGENT) || (gap.fork && id !== AGENT)) {
+                return { entries: [], gap: true, staleCursor: false, epoch: epochOf(id), window: { maxSeq: 0 }, hasOlder: false, startCursor: null };
+              }
+              const rows = timelines.get(id) ?? [];
+              const limit = options.limit ?? 500;
+              const older = options.direction === "before" && options.cursor ? rows.filter((row) => row.seqEnd < options.cursor!.seq) : rows;
+              const page = older.slice(-limit);
+              return {
+                entries: page,
+                gap: false,
+                staleCursor: false,
+                epoch: epochOf(id),
+                window: { maxSeq: rows.reduce((max, row) => Math.max(max, row.seqEnd), 0) },
+                hasOlder: older.length > page.length,
+                startCursor: page.length ? { epoch: epochOf(id), seq: page[0]!.seqEnd } : null,
+              };
+            },
           },
         }),
       },
@@ -565,11 +911,13 @@ describe("forking to the other provider", () => {
       {
         claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" })),
         codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        pi: absentPi(),
       },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
       { locate: async () => "/usr/local/bin/paseo", reopen: async () => ({ ok: true as const }) } as unknown as Reopener,
     );
+    services.push(service);
     service.setPreferences(preferences.schema.parse({ forkOtherProvider: true, ...options.prefs }));
     const context = { paseo } as never;
     const limitTurn = () =>
@@ -577,7 +925,7 @@ describe("forking to the other provider", () => {
         { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
         context,
       );
-    return { service, store, created, notes, limitTurn, paseo: paseo as never };
+    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents, hooks, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
   }
 
   it("carries the work on with the other provider, at the same permission level", async () => {
@@ -647,18 +995,25 @@ describe("forking to the other provider", () => {
     };
 
     it("continues a stopped Claude chat on OpenCode with the saved model, thinking, and no account", async () => {
-      const { store, created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      const { store, created, notes, sends, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
       await limitTurn();
       expect(created).toHaveLength(1);
       const fork = created[0];
       expect(fork?.config).toEqual({
         provider: "opencode/opencode/glm-5p3-flash",
-        modeId: "code", // no more permissive than Bypass
+        modeId: "build", // Bypass is as loose as Build gets
         thinkingOptionId: "high",
       });
       expect(fork?.title).toBe("Fix the build (continued on OpenCode)");
       expect(fork?.labels).toEqual({ "zerosub.continued-from": AGENT });
-      expect(fork?.prompt).toMatch(/earlier Claude Code session that stopped because every Claude account reached its usage limit/);
+      expect(fork?.idempotencyKey).toBe(fork?.agentId);
+      // The fork is created promptless; the handoff is delivered afterwards under a reserved ID.
+      expect(created[0]?.prompt).toBeUndefined();
+      expect(sends).toHaveLength(1);
+      expect(sends[0]?.agentId).toBe(fork?.agentId);
+      expect(sends[0]?.text).toMatch(/earlier Claude Code session that stopped because every Claude account reached its usage limit/);
+      expect(sends[0]?.messageId).toMatch(/^zerosub-handoff-/);
+      expect(sends[0]?.text).toContain(`zerosub transfer ${sends[0]?.messageId}`);
       // OpenCode is a harness, not an account provider: no binding, so no account store entry.
       expect((await store.read()).bindings[fork?.agentId ?? ""]).toBeUndefined();
       expect(notes.at(-1)).toMatchObject({
@@ -673,10 +1028,9 @@ describe("forking to the other provider", () => {
     it("uses the host's default model, and no thinking override, when none was saved", async () => {
       const { created, limitTurn } = await setUpFork("default", [], {}, [], {
         prefs: { forkOtherProvider: true, claudeForkDestination: "opencode" },
-        opencodeModes: [{ id: "ask", label: "Ask", colorTier: "safe" }],
       });
       await limitTurn();
-      expect(created[0]?.config).toEqual({ provider: "opencode/opencode/glm-5p3-flash", modeId: "ask" });
+      expect(created[0]?.config).toEqual({ provider: "opencode/opencode/glm-5p3-flash", modeId: "plan" });
     });
 
     it("points at the earlier OpenCode fork instead of starting another", async () => {
@@ -684,6 +1038,996 @@ describe("forking to the other provider", () => {
       await limitTurn();
       await limitTurn();
       expect(created).toHaveLength(1);
+    });
+
+    const RESERVED = { targetId: "fork-reserved", messageId: "zerosub-handoff-reserved" };
+    const MARK = { epoch: "epoch-1", seq: 0 };
+    const opencodeAgent = (id: string, overrides: Record<string, unknown> = {}) => ({
+      id,
+      provider: "opencode",
+      status: "idle",
+      title: "Fix the build (continued on OpenCode)",
+      currentModeId: "build",
+      workspaceId: "ws-1",
+      archivedAt: null,
+      labels: { "zerosub.continued-from": AGENT },
+      ...overrides,
+    });
+    const digestOf = (text: string) => createHash("sha256").update(text).digest("hex");
+    const whyOf = (source: "auto" | "user") => (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
+    const CREATE_CONFIG = {
+      provider: "opencode/opencode/glm-5p3-flash",
+      modeId: "build",
+      thinkingOptionId: "high",
+      workspaceId: "ws-1",
+      cwd: null,
+      parentId: null,
+      title: "Fix the build (continued on OpenCode)",
+      why: whyOf("user"),
+    };
+    const initialDigest = (source: "auto" | "user" = "user") =>
+      digestOf([continuationPrompt(buildTranscript([]), whyOf(source), "Claude Code"), `zerosub transfer ${RESERVED.messageId}`].join("\n"));
+    /** A harness with an existing, settled fork record and its live target agent. */
+    const setUpReuse = async (fork: Record<string, unknown> = {}, record: Omit<OpenCodeFork, "forkAgentId"> = {}) => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId, ...record };
+      });
+      setup.byId.set(RESERVED.targetId, opencodeAgent(RESERVED.targetId, fork));
+      return setup;
+    };
+    const seededPending = (pending: NonNullable<OpenCodeFork["pending"]>): OpenCodeFork => ({
+      forkAgentId: RESERVED.targetId,
+      pending,
+    });
+    const reservedCreation = (source: "auto" | "user" = "user", sentDigest = initialDigest(source)): OpenCodeFork =>
+      seededPending({
+        stage: "creating",
+        targetId: RESERVED.targetId,
+        messageId: RESERVED.messageId,
+        seen: MARK,
+        config: { ...CREATE_CONFIG, why: whyOf(source) },
+        sentDigest,
+      });
+
+    it("sends new instructions to the existing fork exactly once, then nothing new on a third fork", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      const forkId = setup.created[0]!.agentId;
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      const updates = setup.sends.filter((send) => send.text.includes("Now also update the CHANGELOG"));
+      expect(updates).toHaveLength(1);
+      expect(updates[0]!.agentId).toBe(forkId);
+      expect(updates[0]!.messageId).toMatch(/^zerosub-handoff-/);
+      expect(updates[0]!.text).toContain(`zerosub transfer ${updates[0]!.messageId}`);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "continued", continuedIn: { agentId: forkId } });
+      // Nothing new on the source: nothing is sent, and the row says so instead of claiming a handoff.
+      await setup.limitTurn();
+      expect(setup.sends).toHaveLength(2);
+      expect(setup.notes.at(-1)).toMatchObject({
+        outcome: "stayed",
+        detail: "No update was sent: the OpenCode continuation already has everything from this agent.",
+        continuedIn: { agentId: forkId },
+      });
+    });
+
+    /** A settled fork whose source gained only a plugin note, with `act` run once as its watermark is saved. */
+    const duringWatermarkWrite = async (act: (setup: Awaited<ReturnType<typeof setUpFork>>) => void) => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "plugin", id: "external-note", pluginId: "synthetic", kind: "note", version: 1, data: {} });
+      const inspected = setup.timelines.get(AGENT)!.at(-1)!.seqEnd;
+      const save = setup.store.update.bind(setup.store);
+      let done = false;
+      setup.store.update = async (change) => {
+        const next = await save(change);
+        if (!done && next.opencodeForks[AGENT]?.seen?.seq === inspected) {
+          done = true;
+          act(setup);
+        }
+        return next;
+      };
+      return { setup, inspected };
+    };
+
+    it("reports an instruction that arrives while an empty update's watermark is saved, then sends it once", async () => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) =>
+        setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2"));
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual({ epoch: "epoch-1", seq: inspected });
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("Now also update the CHANGELOG");
+      expect(setup.created).toHaveLength(0);
+    });
+
+    it("reports an instruction that lands between the history recheck and the final refresh", async () => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) => {
+        // The history recheck has nothing new; the instruction lands just before the last source refresh.
+        let reads = 0;
+        setup.hooks.onRefetch = (id) => {
+          if (id !== AGENT || ++reads !== 1) return;
+          setup.hooks.onRefresh = (refreshed) => {
+            if (refreshed !== AGENT) return;
+            setup.hooks.onRefresh = undefined;
+            setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+            setup.byId.get(AGENT)!.lastUserMessageAt = "2026-09-23T07:30:00.000Z";
+          };
+        };
+      });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(inspected);
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("Now also update the CHANGELOG");
+    });
+
+    it("refuses up-to-date when the source starts working while the watermark is saved", async () => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) => { setup.byId.get(AGENT)!.status = "running"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/working or waiting for permission/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(inspected);
+    });
+
+    it.each([
+      ["a history gap", "gap", /couldn't read this agent's handoff history/],
+      ["an epoch reset", "epoch", /couldn't tell what it has already received/],
+    ])("calls %s while the watermark is saved an inspection, not up-to-date", async (_, kind, detail) => {
+      const { setup, inspected } = await duringWatermarkWrite((setup) => {
+        if (kind === "gap") setup.gap.source = true;
+        else setup.setSourceEpoch("epoch-2");
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("found");
+      expect(setup.notes.at(-1)?.detail).toMatch(detail);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(inspected);
+    });
+
+    it("never sends to a recorded fork that names a different source", async () => {
+      const setup = await setUpReuse({ labels: { "zerosub.continued-from": "different-source" } }, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.sends).toHaveLength(0);
+    });
+
+    it("advances past plugin-only notes without sending an empty update or feeding a repeat", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, {
+        type: "plugin",
+        id: "external-note",
+        pluginId: "synthetic",
+        kind: "note",
+        version: 1,
+        data: {},
+      });
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("up-to-date");
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("up-to-date");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.timelines.get(AGENT)).toHaveLength(3);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual({
+        epoch: "epoch-1",
+        seq: setup.timelines.get(AGENT)!.at(-2)!.seqEnd,
+      });
+      expect(setup.notes).toHaveLength(2);
+      expect(setup.notes.every((note) => note.delivery === "up-to-date")).toBe(true);
+    });
+
+    it("returns an inspection result instead of replaying history after a source epoch reset", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "OLD already sent" });
+      setup.setSourceEpoch("epoch-2");
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("found");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", delivery: "found" });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't tell what it has already received/);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual(MARK);
+    });
+
+    it("retries a lost create acknowledgement with the same target, idempotency key, and message ID", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation();
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({
+        agentId: RESERVED.targetId,
+        idempotencyKey: RESERVED.targetId,
+        title: CREATE_CONFIG.title,
+        config: { provider: CREATE_CONFIG.provider, modeId: CREATE_CONFIG.modeId, thinkingOptionId: CREATE_CONFIG.thinkingOptionId },
+        labels: { "zerosub.continued-from": AGENT },
+      });
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("retries a failed create with a new model pick and a renamed source, under the same target ID", async () => {
+      const catalog = [
+        { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] },
+        { id: "opencode/kimi-k3", label: "Kimi K3", thinkingOptions: [{ id: "high", label: "High" }] },
+      ];
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog });
+      const paseo = setup.paseo as { workspaces: { ref: unknown } };
+      const workspaces = paseo.workspaces.ref;
+      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("GLM is down"); } } });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      paseo.workspaces.ref = workspaces;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
+      setup.byId.get(AGENT)!.title = "Fix the build and the tests";
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      // The target ID stays the create's idempotency key: a first create that did land can't double.
+      expect(setup.created[0]).toMatchObject({
+        agentId: reserved.targetId,
+        idempotencyKey: reserved.targetId,
+        title: "Fix the build and the tests (continued on OpenCode)",
+        config: { provider: "opencode/opencode/kimi-k3" },
+      });
+      expect(setup.sends).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    const damage = {
+      "the registry is not JSON": "{ not json",
+      "the source's record doesn't validate": JSON.stringify({ accounts: [], opencodeForks: { [AGENT]: { forkAgentId: 7 } } }),
+    };
+    const targets = {
+      "absent": [] as Array<Record<string, unknown>>,
+      "archived": [opencodeAgent(RESERVED.targetId, { archivedAt: "2026-09-23T08:00:00.000Z" })],
+    };
+    describe.each(Object.entries(damage))("after a restart where %s", (name, broken) => {
+      // An unreadable registry holds only the sources Paseo still lists an OpenCode continuation for.
+      const held = name === "the registry is not JSON" ? { archived: targets.archived } : targets;
+      /** A reservation is unconfirmed when the registry breaks; the restarted service can't see it. */
+      const restart = async (target: Array<Record<string, unknown>>) => {
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+        await setUpReuse(
+          {},
+          seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf("unconfirmed") }),
+        );
+        await writeFile(join(root, "state.json"), broken);
+        return setUpFork("bypassPermissions", [], {}, target, { prefs: PREFS });
+      };
+
+      it.each(Object.entries(held))("never forks again on its own when the reserved target is %s", async (_, target) => {
+        const second = await restart(target);
+        await second.limitTurn();
+        expect(second.created).toHaveLength(0);
+        expect(second.sends).toHaveLength(0);
+        expect(second.notes.at(-1)).toMatchObject({ outcome: "stayed" });
+        expect(second.notes.at(-1)?.detail).toMatch(/record of what it sent to OpenCode/);
+      });
+
+      it.each(Object.entries(held))("asks before a manual fork when the reserved target is %s, then starts one", async (_, target) => {
+        const second = await restart(target);
+        await expect(second.service.forkAgent(second.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+        expect(second.created).toHaveLength(0);
+        expect(second.sends).toHaveLength(0);
+        await second.service.forkAgent(second.paseo, AGENT, "opencode");
+        expect(second.created).toHaveLength(1);
+        expect(second.sends).toHaveLength(1);
+      });
+    });
+
+    it("settles a recovered registry's global hold, so an agent with no OpenCode continuation forks automatically", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await writeFile(join(root, "state.json"), "{ not json");
+      // Another agent's OpenCode continuation, whose record went with the damaged registry.
+      const older = opencodeAgent("oc-older", { labels: { "zerosub.continued-from": "agent-older" } });
+      const second = await setUpFork("bypassPermissions", [], {}, [older], { prefs: PREFS });
+      expect(Object.keys((await second.store.read()).opencodeHolds)).toEqual(["*"]);
+      await second.limitTurn();
+      expect(second.created).toHaveLength(1);
+      expect(second.sends).toHaveLength(1);
+      // Only the agent whose continuation is listed keeps a hold; the global one is gone.
+      expect(Object.keys((await second.store.read()).opencodeHolds)).toEqual(["agent-older"]);
+    });
+
+    describe("a global hold that can't be settled", () => {
+      const holdAndFork = async () => {
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+        await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+        await writeFile(join(root, "state.json"), "{ not json");
+        return setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      };
+
+      it("keeps the hold when the agent list can't be read", async () => {
+        const second = await holdAndFork();
+        (second.paseo as { agents: { list: unknown } }).agents.list = async () => {
+          throw new Error("Not connected");
+        };
+        await expect(second.service.forkAgent(second.paseo, AGENT, "opencode")).rejects.toThrow("Not connected");
+        expect(second.created).toHaveLength(0);
+        expect(Object.keys((await second.store.read()).opencodeHolds)).toEqual(["*"]);
+      });
+
+      it("keeps the hold when the agent list is incomplete", async () => {
+        const second = await holdAndFork();
+        (second.paseo as { agents: { list: unknown } }).agents.list = async () => ({ entries: [], pageInfo: { hasMore: true, nextCursor: "more" } });
+        await second.service.forkAgent(second.paseo, AGENT, "opencode").catch(() => undefined);
+        expect(Object.keys((await second.store.read()).opencodeHolds)).toContain("*");
+        expect(second.created).toHaveLength(0);
+      });
+    });
+
+    /** Runs `change` when `continueInNewAgent` itself refreshes the source, after every earlier check. */
+    const atHelperRefresh = (setup: Awaited<ReturnType<typeof setUpFork>>, change: (source: Record<string, unknown>) => void) => {
+      setup.hooks.onRefresh = (id) => {
+        if (id === AGENT && new Error().stack?.includes("continueInNewAgent")) change(setup.byId.get(AGENT)!);
+      };
+    };
+
+    it("repeats a reserved create with its frozen title even when the source is renamed at the create", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = reservedCreation(); });
+      atHelperRefresh(setup, (source) => { source.title = "Other task"; });
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode").catch(() => undefined);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({
+        agentId: RESERVED.targetId,
+        idempotencyKey: RESERVED.targetId,
+        workspaceId: CREATE_CONFIG.workspaceId,
+        title: CREATE_CONFIG.title,
+        config: { provider: CREATE_CONFIG.provider, modeId: CREATE_CONFIG.modeId, thinkingOptionId: CREATE_CONFIG.thinkingOptionId },
+      });
+    });
+
+    it("refuses a reserved create when the source moves workspace at the create, instead of changing it", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = reservedCreation(); });
+      atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    });
+
+    it.each([
+      ["a history gap before the write", 2, "gap"],
+      ["a history gap after the write", 3, "gap"],
+      ["an epoch reset before the write", 2, "epoch"],
+      ["an epoch reset after the write", 3, "epoch"],
+    ])("calls %s on an update an inspection, not a newer message", async (_, read, kind) => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      let reads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id !== AGENT || ++reads !== read) return;
+        if (kind === "gap") setup.gap.source = true;
+        else setup.setSourceEpoch("epoch-2");
+      };
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("found");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)?.detail).not.toMatch(/newer message/);
+      expect(setup.notes.at(-1)?.detail).toMatch(kind === "gap" ? /couldn't read this agent's handoff history/ : /couldn't tell what it has already received/);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.seen).toEqual(MARK);
+      expect(record.pending).toBeUndefined();
+    });
+
+    it.each([
+      ["before the write", 3],
+      ["after the write", 4],
+    ])("keeps a creation reserved and uncertain on a history gap %s", async (_, read) => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      let reads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && ++reads === read) setup.gap.source = true;
+      };
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed" });
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    });
+
+    /** Rewrites the registry file as a restart would find it. */
+    const editRegistry = async (edit: (raw: Record<string, Record<string, unknown>>) => void) => {
+      const raw = JSON.parse(await readFile(join(root, "state.json"), "utf8"));
+      edit(raw);
+      await writeFile(join(root, "state.json"), JSON.stringify(raw));
+    };
+
+    it("keeps holding a source when its hold is corrupted before a second restart", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await setUpReuse({}, seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: "d" }));
+      await writeFile(join(root, "state.json"), "{ not json");
+      await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS }); // the first restart records the hold
+      await editRegistry((raw) => { raw.opencodeHolds = { [AGENT]: { at: 7 } }; });
+      const third = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await third.limitTurn();
+      expect(third.created).toHaveLength(0);
+      expect(third.sends).toHaveLength(0);
+      expect(third.notes.at(-1)?.detail).toMatch(/record of what it sent to OpenCode/);
+    });
+
+    it("asks again after a second loss, even though the first one was acknowledged", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await setUpReuse({}, seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: "d" }));
+      await editRegistry((raw) => { raw.opencodeForks = { [AGENT]: { forkAgentId: 7 } }; });
+      const first = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await expect(first.service.forkAgent(first.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+      await first.service.forkAgent(first.paseo, AGENT, "opencode");
+      expect(first.created).toHaveLength(1);
+      // The new record is lost too: that is a new event the first acknowledgement doesn't cover.
+      await editRegistry((raw) => { raw.opencodeForks = { [AGENT]: { forkAgentId: 7 } }; });
+      const second = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await expect(second.service.forkAgent(second.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+      expect(second.created).toHaveLength(0);
+      expect(second.sends).toHaveLength(0);
+    });
+
+    it.each(Object.entries(targets))("never replaces a fork whose record has no checkpoint when the target is %s", async (_, target) => {
+      const setup = await setUpFork("bypassPermissions", [], {}, target, { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId }; });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(0);
+      expect(setup.sends).toHaveLength(0);
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
+      expect(setup.created).toHaveLength(0);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created).toHaveLength(1);
+    });
+
+    it("refuses an update when the source's parent changes while the mode catalog is read", async () => {
+      const parents = ["parent-a", "parent-b"].map((id) => ({ id, provider: "claude", status: "idle", workspaceId: "ws-1", archivedAt: null, labels: {} }));
+      const setup = await setUpFork("bypassPermissions", [], { "paseo.parent-agent-id": "parent-a" }, parents, { prefs: PREFS });
+      await setup.store.update((draft) => { draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId, seen: MARK }; });
+      setup.byId.set(RESERVED.targetId, opencodeAgent(RESERVED.targetId, { labels: { "zerosub.continued-from": AGENT, "paseo.parent-agent-id": "parent-a" } }));
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      // Calls 1-4 are the earlier checks; call 5 is the catalog read inside the check right before the send.
+      let reads = 0;
+      setup.hooks.onModes = () => {
+        if (++reads === 5) (setup.byId.get(AGENT)!.labels as Record<string, string>)["paseo.parent-agent-id"] = "parent-b";
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.sends).toHaveLength(0);
+    });
+
+    it("refuses a reserved creation when the source and fork move together while modes are read", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      // Calls 1-4 are the create's own and the check before the write; call 5 is inside the check
+      // right before the send, after that check has already compared the source with its record.
+      let reads = 0;
+      setup.hooks.onModes = () => {
+        if (++reads === 5) for (const agent of setup.byId.values()) agent.workspaceId = "ws-2";
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    });
+
+    it("re-reads the persisted reservation after a restart-shaped rebuild of the service", async () => {
+      const first = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await first.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation();
+      });
+      // A second service over the same state file: what a worker restart re-reads.
+      const second = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      const done = await second.service.forkAgent(second.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(first.created).toHaveLength(0);
+      expect(second.created).toHaveLength(1);
+      expect(second.created[0]!.agentId).toBe(RESERVED.targetId);
+    });
+
+    it.each([
+      ["moved workspace", { workspaceId: "ws-2" }],
+      ["busy target", { status: "running" }],
+      ["pending permission", { pendingPermissions: [{ id: "p1" }] }],
+      ["changed parent", { labels: { "zerosub.continued-from": AGENT, "paseo.parent-agent-id": "elsewhere" } }],
+      ["changed provider", { provider: "claude" }],
+    ])("keeps a resumed creation reserved when its target has a %s", async (_, overrides) => {
+      const setup = await setUpReuse(overrides, reservedCreation());
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", delivery: "uncertain" });
+    });
+
+    it("refuses a resumed creation whose rebuilt prompt differs from its frozen digest", async () => {
+      const setup = await setUpReuse({}, reservedCreation("user", digestOf("a different reserved prompt")));
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.sentDigest).toBe(digestOf("a different reserved prompt"));
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", delivery: "uncertain" });
+    });
+
+    it("rebuilds an automatic fork with its reserved reason when a manual retry delivers it", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation("auto");
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
+      expect(setup.sends[0]!.text).toContain("every Claude account reached its usage limit");
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("keeps a manually reserved reason when the retry is automatic", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation("user");
+      });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("the work was moved to OpenCode");
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("keeps a legacy reservation without a saved reason uncertain instead of guessing the trigger", async () => {
+      const setup = await setUpReuse({}, reservedCreation("auto"));
+      await setup.store.update((draft) => {
+        const config = draft.opencodeForks[AGENT]!.pending!.config!;
+        delete config.why;
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.created).toHaveLength(0);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    });
+
+    it("names the reserved fork by its known ID when it has no title to show", async () => {
+      const setup = await setUpReuse({ title: null }, reservedCreation("user", digestOf("a different reserved prompt")));
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(done.title).toBe(`OpenCode agent ${RESERVED.targetId}`);
+      expect(setup.notes.at(-1)?.continuedIn).toEqual({ agentId: RESERVED.targetId, title: `OpenCode agent ${RESERVED.targetId}` });
+    });
+
+    it("finds a receipt older than the last 500 rows without sending again", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // The receipt sits at row 1, behind 500 newer rows: one tail page misses it.
+      const rows = [
+        { item: { type: "user_message", text: sent } as AgentTimelineItem, seqEnd: 1 },
+        ...Array.from({ length: 500 }, (_, row) => ({ item: { type: "assistant_message", text: `Row ${row}` } as AgentTimelineItem, seqEnd: row + 2 })),
+      ];
+      setup.timelines.set(RESERVED.targetId, rows);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.pending).toBeUndefined();
+      expect(setup.sends.filter((send) => send.agentId === RESERVED.targetId)).toHaveLength(0);
+      expect(setup.timelineReads.filter((read) => read.id === RESERVED.targetId)).toHaveLength(2);
+    });
+
+    it("stops a receipt scan at its page budget and stays uncertain", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // More non-matching rows than any budget: the scan can't finish, so nothing is claimed.
+      setup.timelines.set(
+        RESERVED.targetId,
+        Array.from({ length: 5_500 }, (_, row) => ({ item: { type: "assistant_message", text: `Row ${row}` } as AgentTimelineItem, seqEnd: row + 1 })),
+      );
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
+      expect(setup.timelineReads.filter((read) => read.id === RESERVED.targetId).length).toBeLessThanOrEqual(10);
+    });
+
+    it("stays uncertain when the fork's history has a gap instead of calling it undelivered", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      setup.gap.fork = true;
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
+    });
+
+    it("settles a pending send by marker and digest when a reload dropped the message ID", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // A provider reload changed the epoch and dropped clientMessageId and turnId from the row.
+      setup.timelines.set(RESERVED.targetId, [{ item: { type: "user_message", text: sent }, seqEnd: 1 }]);
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.pending).toBeUndefined();
+      // The settled reservation's mark, then the update's mark on top of it.
+      expect(record.seen).toEqual({ epoch: "epoch-1", seq: 2 });
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("Now also update the CHANGELOG");
+    });
+
+    it("reconciles a first-page receipt with a single read of the fork's timeline", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      setup.timelines.set(RESERVED.targetId, [{ item: { type: "user_message", text: sent }, seqEnd: 1 }]);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("up-to-date");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+      expect(setup.timelineReads.filter((read) => read.id === RESERVED.targetId)).toHaveLength(1);
+    });
+
+    it("keeps an unconfirmed send reserved and reports uncertainty instead of resending", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // The fork's timeline holds no marker: no trustworthy receipt either way.
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", continuedIn: { agentId: RESERVED.targetId } });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't be confirmed \(transfer zerosub-handoff-m1\)/);
+    });
+
+    it.each([
+      ["archived", true],
+      ["gone", false],
+    ])("continues on OpenCode again once the fork of an unconfirmed send is %s", async (_, archived) => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("uncertain");
+      if (archived) setup.byId.get(RESERVED.targetId)!.archivedAt = "2026-09-23T08:00:00.000Z";
+      else setup.byId.delete(RESERVED.targetId);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(done.agentId).not.toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.forkAgentId).toBe(done.agentId);
+      expect(record.pending).toBeUndefined();
+    });
+
+    it("reuses the same message ID when an update's acknowledgement was lost", async () => {
+      const sent = "The update text.\nzerosub transfer zerosub-handoff-u1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-u1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      // The send arrived; the service stopped before it could record the receipt.
+      setup.timelines.set(RESERVED.targetId, [
+        { item: { type: "user_message", text: sent, clientMessageId: "zerosub-handoff-u1" }, turnId: "turn-x", seqEnd: 1 },
+      ]);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(0); // reconciled, not resent
+      const rows = setup.timelines.get(RESERVED.targetId)!;
+      expect(rows.filter((row) => row.item.type === "user_message" && row.item.clientMessageId === "zerosub-handoff-u1")).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("replaces a settled fork that was archived later", async () => {
+      const setup = await setUpReuse({ archivedAt: "2026-09-23T08:00:00.000Z" }, { seen: MARK });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).not.toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.forkAgentId).toBe(done.agentId);
+    });
+
+    it("transfers an imported handoff as instructions, filtering only its own message IDs", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.limitTurn();
+      setup.addTurn(
+        AGENT,
+        { type: "user_message", text: "This task is continuing from an earlier session that stopped because it hit its limit." },
+        "user-2",
+      );
+      setup.addTurn(AGENT, { type: "user_message", text: "Old reserved copy" }, "zerosub-handoff-old");
+      await setup.limitTurn();
+      const update = setup.sends.at(-1)!;
+      expect(update.text).toContain("This task is continuing from an earlier session");
+      expect(update.text).not.toContain("Old reserved copy");
+    });
+
+    it("reports found for an earlier fork without a state record and sends nothing", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [opencodeAgent("fork-old")], { prefs: PREFS });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done).toMatchObject({ agentId: "fork-old", delivery: "found" });
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", continuedIn: { agentId: "fork-old" } });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't tell what it has already received/);
+    });
+
+    it("refuses to send into a fork that moved, is working, changed parent, or waits for permission", async () => {
+      const refused = async (overrides: Record<string, unknown>) => {
+        const setup = await setUpReuse(overrides, { seen: MARK });
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved, is working or is waiting for permission/);
+        expect(setup.sends).toHaveLength(0);
+      };
+      await refused({ workspaceId: "ws-2" });
+      await refused({ status: "running" });
+      await refused({ labels: { "zerosub.continued-from": AGENT, "paseo.parent-agent-id": "elsewhere" } });
+      await refused({ pendingPermissions: [{ id: "p1" }] });
+    });
+
+    it("refuses honestly when the source's handoff history has a gap", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.gap.source = true;
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(0);
+      expect(setup.notes.at(-1)).toMatchObject({ outcome: "stayed", continuedIn: { agentId: RESERVED.targetId } });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't read this agent's handoff history/);
+    });
+
+    it("refuses to keep sending to an older fork once the source moved to a more careful mode", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.byId.get(AGENT)!.currentModeId = "plan";
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/mode changed/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual(MARK);
+    });
+
+    it.each([
+      ["a broader mode than the source's", "build", "plan"],
+      ["a mode the catalog doesn't list", "mystery", "bypassPermissions"],
+    ])("refuses a fork now in %s", async (_, forkMode, sourceMode) => {
+      const setup = await setUpReuse({ currentModeId: forkMode }, { seen: MARK });
+      setup.byId.get(AGENT)!.currentModeId = sourceMode;
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/mode changed/);
+      expect(setup.sends).toHaveLength(0);
+    });
+
+    it("still sends to a fork in a more careful mode than the source's", async () => {
+      const setup = await setUpReuse({ currentModeId: "build" }, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("refuses an update when the source gained a newer instruction after it was read", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      let sourceReads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && ++sourceReads === 2) setup.addTurn(AGENT, { type: "user_message", text: "STOP" }, "user-3");
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual(MARK);
+    });
+
+    it("rebuilds an undelivered reserved creation with the source's newer instruction", async () => {
+      const setup = await setUpReuse({}, reservedCreation());
+      setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2");
+      const stopSeq = setup.timelines.get(AGENT)!.at(-1)!.seqEnd;
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+      // The rebuilt reservation's mark covers the STOP, not the row ZeroSub appended afterwards.
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen?.seq).toBe(stopSeq);
+    });
+
+    /** Runs `act` once, right after the store commits a sending reservation. */
+    const duringSendingWrite = (setup: Awaited<ReturnType<typeof setUpFork>>, act: () => void) => {
+      const save = setup.store.update.bind(setup.store);
+      let done = false;
+      setup.store.update = async (change) => {
+        const next = await save(change);
+        if (!done && next.opencodeForks[AGENT]?.pending?.stage === "sending") {
+          done = true;
+          act();
+        }
+        return next;
+      };
+    };
+
+    it("releases an update reservation when a STOP lands while it is being written", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      duringSendingWrite(setup, () => setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-3"));
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.pending).toBeUndefined();
+      expect(record.seen).toEqual(MARK);
+      // Nothing was dispatched, so the next call carries both instructions in one send.
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+    });
+
+    it("returns a creation to its reserved state when a STOP lands while it is being written", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      duringSendingWrite(setup, () => setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2"));
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/newer message/);
+      expect(setup.sends).toHaveLength(0);
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(pending.stage).toBe("creating");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).toBe(pending.messageId);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+    });
+
+    it.each([
+      ["the freshness read", 2],
+      ["the read after the reservation is written", 3],
+    ])("refuses when the source moves to Plan during %s", async (_, read) => {
+      const setup = await setUpReuse({ currentModeId: "build" }, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      let reads = 0;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && ++reads === read) setup.byId.get(AGENT)!.currentModeId = "plan";
+      };
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/mode changed/);
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("never sends a reservation whose original prompt doesn't match its digest, even with newer input", async () => {
+      const setup = await setUpReuse({}, reservedCreation("user", digestOf("a different reserved prompt")));
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.sentDigest).toBe(digestOf("a different reserved prompt"));
+    });
+
+    it("waits for an automatic source that reports idle just after its turn ended", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, sourceStatus: "running" });
+      setTimeout(() => { setup.byId.get(AGENT)!.status = "idle"; }, 500);
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("keeps an oversized todo inside the update's bounds with the latest STOP last", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "todo", items: [{ text: "t".repeat(200_000), completed: false }] });
+      setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const text = setup.sends[0]!.text;
+      expect(text.length).toBeLessThan(42_000);
+      expect(text).toContain("[… omitted …]");
+      expect(text.indexOf("Task list at the time it stopped:")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+    });
+
+    it("never sends the older initial request when a STOP lands after it was gathered", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.addTurn(AGENT, { type: "user_message", text: "Fix the build" }, "user-1");
+      // The STOP arrives after the create gathered the window it reserved, before the delivery.
+      let added = false;
+      setup.hooks.onRefetch = (id) => {
+        if (id === AGENT && setup.created.length === 1 && !added) {
+          added = true;
+          setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-2");
+        }
+      };
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.text).toContain("STOP, DO NOT MODIFY ANYTHING");
+    });
+
+    it("waits for a created fork that is still initializing, then delivers once", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createdStatus = "initializing";
+      // The fork reports idle a moment after it is created, as a promptless OpenCode agent does.
+      const settle = setInterval(() => {
+        for (const agent of setup.byId.values()) if (agent.status === "initializing") setTimeout(() => { agent.status = "idle"; }, 500);
+      }, 100);
+      try {
+        expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      } finally {
+        clearInterval(settle);
+      }
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("keeps the reservation when a created fork never finishes initializing", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createdStatus = "initializing";
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+    }, 15_000);
+
+    it("settles a send whose acknowledgement was lost when the receipt is there", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      setup.hooks.send = (id, text, messageId) => {
+        setup.sends.push({ agentId: id, text, messageId });
+        setup.addTurn(id, { type: "user_message", text }, messageId);
+        throw new Error("socket hang up");
+      };
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("sent");
+      expect(setup.sends).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("stays uncertain, keeping the transfer, when the send and the receipt read both throw", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+      setup.hooks.send = (id, text, messageId) => {
+        setup.sends.push({ agentId: id, text, messageId });
+        setup.hooks.onRefetch = (read) => {
+          if (read === RESERVED.targetId) throw new Error("timeline read failed");
+        };
+        throw new Error("socket hang up");
+      };
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("uncertain");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending;
+      expect(pending?.messageId).toBe(setup.sends[0]!.messageId);
+      expect(setup.notes.at(-1)?.detail).toContain(setup.sends[0]!.messageId!);
+      expect(setup.sends).toHaveLength(1);
+    });
+
+    it("puts the latest instruction after older progress and todos in an update", async () => {
+      const setup = await setUpReuse({}, { seen: MARK });
+      setup.addTurn(AGENT, { type: "user_message", text: "CONTINUE EVERYTHING" }, "user-2");
+      setup.addTurn(AGENT, { type: "assistant_message", text: "Continuing with the release." });
+      setup.addTurn(AGENT, { type: "todo", items: [{ text: "Ship it", completed: false }] });
+      setup.addTurn(AGENT, { type: "user_message", text: "STOP, DO NOT MODIFY ANYTHING" }, "user-3");
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      const text = setup.sends[0]!.text;
+      expect(text.indexOf("Continuing with the release.")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+      expect(text.indexOf("- [ ] Ship it")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+      expect(text.indexOf("CONTINUE EVERYTHING")).toBeLessThan(text.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+    });
+
+    it("keeps the update's watermark when older history has no usable cursor", async () => {
+      const setup = await setUpReuse({}, { seen: { epoch: "epoch-1", seq: 1 } });
+      setup.timelines.set(
+        AGENT,
+        Array.from({ length: 600 }, (_, row) => ({ item: { type: "assistant_message", text: `Row ${row}` } as AgentTimelineItem, seqEnd: row + 1 })),
+      );
+      const timeline = setup.paseo as unknown as { agents: { ref: (id: string) => { timeline: { refetch: (o: unknown) => Promise<Record<string, unknown>> } } } };
+      const ref = timeline.agents.ref;
+      timeline.agents.ref = (id: string) => {
+        const real = ref(id);
+        if (id !== AGENT) return real;
+        const refetch = real.timeline.refetch;
+        real.timeline.refetch = async (options: unknown) => ({ ...(await refetch(options)), startCursor: null });
+        return real;
+      };
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.sends).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.seen).toEqual({ epoch: "epoch-1", seq: 1 });
+      expect(setup.notes.at(-1)?.detail).toMatch(/couldn't read this agent's handoff history/);
     });
 
     const refusalCases: Array<{
@@ -746,6 +2090,126 @@ describe("forking to the other provider", () => {
   });
   });
 
+  describe("a continuation of the other kind", () => {
+    const chatGptAgent = {
+      id: "gpt-fork",
+      provider: "codex",
+      status: "idle",
+      title: "Fix the build (continued on ChatGPT)",
+      workspaceId: "ws-1",
+      archivedAt: null,
+      labels: { "zerosub.continued-from": AGENT },
+    };
+    const openCodeAgent = { ...chatGptAgent, id: "oc-fork", provider: "opencode", title: "Fix the build (continued on OpenCode)" };
+    const AUTO = { forkOtherProvider: true };
+
+    it("creates no OpenCode fork when ChatGPT already continued the agent", async () => {
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [chatGptAgent], {
+        prefs: { ...AUTO, claudeForkDestination: "opencode" },
+      });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toMatch(/already continued in “Fix the build \(continued on ChatGPT\)”/);
+    });
+
+    it("creates no ChatGPT fork when OpenCode already continued the agent", async () => {
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [openCodeAgent], { prefs: AUTO });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toMatch(/already continued in “Fix the build \(continued on OpenCode\)”/);
+    });
+
+    it("refuses a manual OpenCode fork that names the ChatGPT chat", async () => {
+      const { created, service, paseo } = await setUpFork("bypassPermissions", [], {}, [chatGptAgent], { prefs: { autoSwitch: false } });
+      await expect(service.forkAgent(paseo, AGENT, "opencode")).rejects.toThrow(/already continued in “Fix the build \(continued on ChatGPT\)”/);
+      expect(created).toHaveLength(0);
+    });
+
+    it("refuses a manual ChatGPT fork that names the OpenCode chat", async () => {
+      const { created, service, paseo } = await setUpFork("bypassPermissions", [], {}, [openCodeAgent], { prefs: { autoSwitch: false } });
+      await expect(service.forkAgent(paseo, AGENT)).rejects.toThrow(/already continued in “Fix the build \(continued on OpenCode\)”/);
+      expect(created).toHaveLength(0);
+    });
+
+    it("never ends with two continuations after a failed OpenCode create, a ChatGPT fork, then Continue on OpenCode", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
+      const paseo = setup.paseo as { workspaces: { ref: unknown } };
+      const workspaces = paseo.workspaces.ref;
+      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
+      paseo.workspaces.ref = workspaces;
+      expect((await setup.store.read()).opencodeForks[AGENT]?.pending?.stage).toBe("creating");
+      await setup.service.forkAgent(setup.paseo, AGENT);
+      expect(setup.created.map((agent) => agent.config.provider.split("/")[0])).toEqual(["codex"]);
+      // The OpenCode create never landed, so the ChatGPT fork took the work and its reservation went.
+      expect((await setup.store.read()).opencodeForks[AGENT]).toBeUndefined();
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/already continued in “Fix the build \(continued on ChatGPT\)”/);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(0);
+    });
+
+    it("keeps an OpenCode reservation when a later ChatGPT fork is refused before it starts", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false }, noChatGPT: true });
+      const paseo = setup.paseo as { workspaces: { ref: unknown } };
+      const workspaces = paseo.workspaces.ref;
+      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
+      paseo.workspaces.ref = workspaces;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      await expect(setup.service.forkAgent(setup.paseo, AGENT)).rejects.toThrow();
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]?.pending?.targetId).toBe(reserved.targetId);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created[0]?.agentId).toBe(reserved.targetId);
+    });
+
+    it("creates no ChatGPT fork while an OpenCode reservation's fork exists", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = { forkAgentId: "oc-fork", pending: { stage: "creating", targetId: "oc-fork", messageId: "zerosub-handoff-m1", seen: { epoch: "epoch-1", seq: 0 } } };
+      });
+      // Paseo doesn't list it yet, but it answers for its ID.
+      setup.byId.set("oc-fork", openCodeAgent);
+      await expect(setup.service.forkAgent(setup.paseo, AGENT)).rejects.toThrow(/already continued in “Fix the build \(continued on OpenCode\)”/);
+      expect(setup.created).toHaveLength(0);
+    });
+  });
+
+  describe("OpenCode availability in the state view", () => {
+    it.each([[true], [false]])("reports openCodeAvailable %s from the host's provider list", async (present) => {
+      const { service, paseo } = await setUpFork("default", [], {}, [], { opencodeAvailable: present });
+      expect((await service.view(paseo)).openCodeAvailable).toBe(present);
+    });
+  });
+
+  describe("a failed catalog read", () => {
+    it("refuses with the read error, before any saved-model or default check", async () => {
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], {
+        prefs: { forkOtherProvider: true, claudeForkDestination: "opencode" },
+        catalogError: "daemon unreachable",
+      });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toBe("Couldn't read this host's OpenCode models: daemon unreachable");
+    });
+  });
+
+  describe("OpenCode mode choice", () => {
+    it.each([
+      ["plan", "plan"],
+      ["default", "plan"],
+      ["acceptEdits", "build"],
+      ["auto", "build"],
+      ["bypassPermissions", "build"],
+    ])("sends a %s Claude agent to OpenCode %s", async (claudeMode, openCodeMode) => {
+      const { created, limitTurn } = await setUpFork(claudeMode, [], {}, [], {
+        prefs: { forkOtherProvider: true, claudeForkDestination: "opencode" },
+      });
+      await limitTurn();
+      expect(created[0]?.config.modeId).toBe(openCodeMode);
+    });
+  });
+
   describe("manual OpenCode continuation", () => {
     const PREFS = { autoSwitch: false, forkOtherProvider: false, forkOpenCodeModel: "opencode/glm-5p3-flash", forkOpenCodeThinking: "high" };
     const manually = async (options: { modeId?: string } & Parameters<typeof setUpFork>[4] = {}) => {
@@ -755,17 +2219,17 @@ describe("forking to the other provider", () => {
     };
 
     it("continues a stopped Claude chat on OpenCode with every toggle off and no ChatGPT accounts", async () => {
-      const { store, created, notes, fork } = await manually({ prefs: PREFS, noChatGPT: true });
+      const { store, created, notes, sends, fork } = await manually({ prefs: PREFS, noChatGPT: true });
       const done = await fork();
       expect(created).toHaveLength(1);
-      expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)" });
+      expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)", delivery: "sent" });
       expect(created[0]?.config).toEqual({
         provider: "opencode/opencode/glm-5p3-flash",
-        modeId: "code", // no more permissive than Bypass
+        modeId: "build", // Bypass is as loose as Build gets
         thinkingOptionId: "high",
       });
       expect(created[0]?.title).toBe("Fix the build (continued on OpenCode)");
-      expect(created[0]?.prompt).toMatch(/stopped because the work was moved to OpenCode/);
+      expect(sends[0]?.text).toMatch(/stopped because the work was moved to OpenCode/);
       // OpenCode is a harness, not an account provider: no binding, so no account store entry.
       expect((await store.read()).bindings[done.agentId]).toBeUndefined();
       expect(notes.at(-1)).toMatchObject({
@@ -829,7 +2293,7 @@ describe("disabling an account", () => {
     const { service, store, reopened } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
       },
@@ -851,6 +2315,26 @@ describe("disabling an account", () => {
     expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
     expect(reopened).toHaveLength(2);
   });
+
+  it("won't disable an account whose agents routing would leave on it", async () => {
+    // Routing never moves agents onto an account at its limit, so they'd stay put.
+    const others = {
+      "a limit": { ...account(HELLO, "hello", "managed"), limitedUntil: inFuture(), limitKind: "window" },
+    };
+    for (const [why, other] of Object.entries(others)) {
+      const { service, store, reopened, paseo } = await setUp(
+        {
+          accounts: [account(MAIN, "marketing", "main"), other] as never,
+          defaults: { claude: MAIN, codex: null, pi: null },
+          sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+        },
+        () => ({ kind: "window", resetsAt: inFuture(), message: "" }),
+      );
+      await expect(service.setAccountEnabled(paseo as never, MAIN, false), why).rejects.toThrow(/nowhere to go/);
+      expect((await store.read()).accounts.find((entry) => entry.id === MAIN)?.disabled, why).toBe(false);
+      expect(reopened).toEqual([]);
+    }
+  });
 });
 
 describe("usage readings", () => {
@@ -867,7 +2351,7 @@ describe("usage readings", () => {
   });
   const state = (limit: Partial<StoredAccount> = {}) => ({
     accounts: [{ ...account(MAIN, "marketing", "main"), ...limit }, account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
   });
   const limitedUntil = async (store: StateStore) => (await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil ?? null;
   const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
@@ -974,7 +2458,7 @@ describe("changing the default account", () => {
   const openedAt = "2026-09-23T07:00:00.000Z";
   const stateWithLiveAgent = () => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     bindings: {},
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
@@ -1012,26 +2496,61 @@ describe("changing the default account", () => {
     expect(state.bindings[AGENT]).toMatchObject({ accountId: MAIN });
   });
 
+  it("keeps the old default when Paseo can't list the open agents to keep them where they are", async () => {
+    const { service, store, reopened } = await setUp(stateWithLiveAgent(), () => ({ kind: "window", resetsAt: inFuture(), message: "" }));
+    service.setPreferences(preferences.schema.parse({ moveAgentsOnDefaultChange: false }));
+    const { paseo } = fakePaseo();
+    paseo.agents.list = async () => {
+      throw new Error("Not connected");
+    };
+
+    await expect(service.setDefault(paseo as never, HELLO)).rejects.toThrow("Not connected");
+    expect((await store.read()).defaults.claude).toBe(MAIN);
+    // Alignment then has nothing to move them for.
+    paseo.agents.list = fakePaseo().paseo.agents.list;
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+  });
+
+  it("answers, with the agents it didn't get to, when moving them fails", async () => {
+    const { service, store, reopened } = await setUp(stateWithLiveAgent(), () => ({ kind: "window", resetsAt: inFuture(), message: "" }));
+    const { paseo } = fakePaseo();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // The first read is setDefault's own; the second is where the move goes wrong.
+    const read = store.read.bind(store);
+    let reads = 0;
+    vi.spyOn(store, "read").mockImplementation(async () => {
+      reads += 1;
+      if (reads === 4) throw new Error("state.json can't be read");
+      return read();
+    });
+
+    expect(await service.setDefault(paseo as never, HELLO)).toMatchObject({ reopened: [], failed: [] });
+    expect((await read()).defaults.claude).toBe(HELLO);
+    expect(reopened).toEqual([]);
+  });
+
   const WORK = "claude-work";
   const CODEX_MAIN = MAIN_ACCOUNT_ID.codex;
-  const KEEP = preferences.schema.parse({ moveAgentsOnDefaultChange: false });
-  const NOTHING_MOVED = { reopened: [], deferred: [], failed: [], continuedIn: null };
+  const KEEP = preferences.schema.parse({ autoSwitch: true, moveAgentsOnDefaultChange: false });
+  const NOTHING_MOVED = { reopened: [], deferred: [], failed: [], pending: [], continuedIn: null };
   const session = (accountId: string) => ({ accountId, family: "claude" as const, openedAt });
 
   /** Several agents, each answering for itself. `reopened` lists the ones Paseo was asked to reload. */
   async function setUpAgents(
     state: Partial<StoredState>,
-    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean }>,
+    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number }>,
     options: { claude?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) => Object.assign(draft, state));
-    const agents = listed.map(({ id, status, provider, archived }) => ({
+    const agents = listed.map(({ id, status, provider, archived, backgroundWork }) => ({
       id,
       provider: provider ?? "claude",
       status,
       archivedAt: archived ? "2026-09-23T08:00:00.000Z" : null,
       lastUserMessageAt: openedAt,
+      backgroundWork: { count: backgroundWork ?? 0 },
     }));
     const paseo = {
       config: { get: async () => ({ config: { providers: {} } }) },
@@ -1051,7 +2570,7 @@ describe("changing the default account", () => {
     const reopened: string[] = [];
     const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
     const service: Service = new Service(
-      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false } as FamilyAdapter },
+      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
       {
@@ -1064,9 +2583,240 @@ describe("changing the default account", () => {
         },
       } as unknown as Reopener,
     );
+    services.push(service);
     service.setPreferences(KEEP);
-    return { service, store, paseo: paseo as never, context, reopened };
+    return { service, store, paseo: paseo as never, context, reopened, agents };
   }
+
+  it("moves an agent whose last turn failed off an account it can't work on", async () => {
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { drifted: session(MAIN) },
+        bindings: { drifted: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [{ id: "drifted", status: "error" }],
+    );
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "drifted")).toMatchObject({ accountId: WORK, pendingAccountId: MAIN });
+    await service.alignSessions(paseo);
+    expect(reopened).toEqual(["drifted"]);
+    expect((await store.read()).sessions.drifted?.accountId).toBe(WORK);
+  });
+
+  it("leaves an agent on an account it can still work on, however it's routed now", async () => {
+    // A reload cancels what the agent is doing (background helpers too), so nothing moves it unasked.
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: WORK, codex: null, pi: null },
+        sessions: { picked: session(MAIN), followed: session(MAIN) },
+        bindings: { picked: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [
+        { id: "picked", status: "idle" },
+        { id: "followed", status: "idle" },
+      ],
+    );
+    expect((await service.alignSessions(paseo)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+    const { agents } = await service.view(paseo);
+    expect(agents.find((route) => route.agentId === "picked")).toMatchObject({ accountId: WORK, pendingAccountId: MAIN });
+    expect((await store.read()).sessions.followed?.accountId).toBe(MAIN);
+  });
+
+  it("waits for an agent's background work before moving it off an account it can't work on", async () => {
+    const { service, store, paseo, reopened, agents } = await setUpAgents(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
+        defaults: { claude: WORK, codex: null, pi: null },
+        sessions: { working: session(MAIN) },
+      },
+      [{ id: "working", status: "idle", backgroundWork: 1 }],
+    );
+    await service.alignSessions(paseo);
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions.working?.accountId).toBe(MAIN);
+
+    agents[0]!.backgroundWork.count = 0;
+    await service.alignSessions(paseo);
+    expect(reopened).toEqual(["working"]);
+    expect((await store.read()).sessions.working?.accountId).toBe(WORK);
+  });
+
+  it("doesn't wait for background work when an agent is switched by hand or fails over at a limit", async () => {
+    // A dev server can run for hours: only moves nobody asked for wait for it.
+    const { service, store, paseo, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { picked: session(MAIN), failing: session(MAIN) },
+      },
+      [
+        { id: "picked", status: "idle", backgroundWork: 1 },
+        { id: "failing", status: "idle", backgroundWork: 1 },
+      ],
+    );
+    await service.setAgentAccount(paseo, "picked", WORK);
+    expect(reopened).toEqual(["picked"]);
+    expect((await store.read()).sessions.picked?.accountId).toBe(WORK);
+
+    await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    expect(reopened).toEqual(["picked", "failing"]);
+    expect((await store.read()).sessions.failing?.accountId).toBe(WORK);
+  });
+
+  it("carries an agent on at a limit once the move that had it is done, background work and all", async () => {
+    const { service, store, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { failing: session(MAIN) },
+      },
+      [{ id: "failing", status: "idle", backgroundWork: 1 }],
+    );
+    // Alignment has the agent (looking it over, say) as its turn ends at the limit.
+    const release = (service as unknown as { tryClaim(agentId: string): (() => void) | null }).tryClaim("failing")!;
+    const ended = service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    await vi.waitFor(async () => expect((await store.read()).accounts.find((entry) => entry.id === MAIN)?.limitedUntil).not.toBeNull());
+    expect(reopened).toEqual([]);
+    release();
+    await ended;
+    expect(reopened).toEqual(["failing"]);
+    expect((await store.read()).sessions.failing?.accountId).toBe(WORK);
+  });
+
+  it("leaves an agent alone when the move alignment was about to finish was dropped meanwhile", async () => {
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { serving: session(MAIN) },
+        bindings: { serving: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [{ id: "serving", status: "idle", backgroundWork: 1 }],
+    );
+    // As when alignment reaches an agent whose waiting move a turn end has just dropped.
+    await (service as unknown as { finishDeferred(paseo: unknown, agentId: string, family: string, polled: boolean): Promise<void> }).finishDeferred(paseo, "serving", "claude", true);
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions.serving?.accountId).toBe(MAIN);
+  });
+
+  it("doesn't promise a move left for the turn that will be dropped when it ends", async () => {
+    const { service, paseo } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { busy: session(MAIN) },
+        bindings: { busy: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [{ id: "busy", status: "running" }],
+    );
+    // Left by alignment for the turn, though the agent's account works: it's dropped at the turn's end.
+    (service as unknown as { deferred: Map<string, { row: null; unattended: boolean }> }).deferred.set("busy", { row: null, unattended: true });
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "busy")?.waiting).toBe("restart");
+    // One the user asked for still happens when the turn ends.
+    (service as unknown as { deferred: Map<string, { row: null; unattended: boolean }> }).deferred.set("busy", { row: null, unattended: false });
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "busy")?.waiting).toBe("turn");
+  });
+
+  it("leaves an agent with background work when moving idle agents off an account at its limit", async () => {
+    const { service, store, paseo, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { failing: session(MAIN), quiet: session(MAIN), serving: session(MAIN) },
+      },
+      [
+        { id: "failing", status: "idle" },
+        // Looked at first, so it's been passed over by the time "quiet" moves.
+        { id: "serving", status: "idle", backgroundWork: 1 },
+        { id: "quiet", status: "idle" },
+      ],
+    );
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue: false, moveAgentsOnDefaultChange: false }));
+    await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    await vi.waitFor(() => expect(reopened).toContain("quiet"));
+    expect(reopened).not.toContain("serving");
+    const state = await store.read();
+    expect(state.sessions.serving?.accountId).toBe(MAIN);
+    // Passed over, not pinned to the next account and left waiting: alignment moves it once its work stops.
+    expect(state.bindings.serving).toBeUndefined();
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "serving")?.waiting).toBe("background");
+  });
+
+  it("keeps a deferred move waiting for background work only when nobody asked for it", async () => {
+    const { service, store, paseo, context, reopened, agents } = await setUpAgents(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed"), account("claude-spare", "spare", "managed")] as never,
+        defaults: { claude: WORK, codex: null, pi: null },
+        sessions: { drifted: session(MAIN), picked: session(WORK) },
+      },
+      [
+        { id: "drifted", status: "running" },
+        { id: "picked", status: "running" },
+      ],
+    );
+    // Alignment's move waits for the turn; the turn ends with a dev server still running.
+    expect((await service.alignSessions(paseo)).deferred).toEqual(["drifted"]);
+    agents[0]!.status = "idle";
+    agents[0]!.backgroundWork.count = 1;
+    await service.onTurnEnded({ agent: { id: "drifted", provider: "claude" }, turnId: null, outcome: { kind: "completed" }, timeline: [] } as never, context);
+    expect(reopened).toEqual([]);
+
+    // A switch the user asked for waits for the turn, and once alignment finds it idle, not for background work.
+    await service.setAgentAccount(paseo, "picked", "claude-spare");
+    expect(reopened).toEqual([]);
+    agents[1]!.status = "idle";
+    agents[1]!.backgroundWork.count = 1;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 5_000); // past the daemon's cached list of agents
+      await service.alignSessions(paseo);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(reopened).toEqual(["picked"]);
+    expect((await store.read()).sessions.picked?.accountId).toBe("claude-spare");
+  });
+
+  it("says when each pending move happens", async () => {
+    const limited = await setUpAgents(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
+        defaults: { claude: WORK, codex: null, pi: null },
+        sessions: { idle: session(MAIN), working: session(MAIN), busy: session(MAIN) },
+      },
+      [
+        { id: "idle", status: "idle" },
+        { id: "working", status: "idle", backgroundWork: 2 },
+        { id: "busy", status: "running", backgroundWork: 2 },
+      ],
+    );
+    // Off a limited account, alignment moves it once it's idle, its background work stops, or its turn ends.
+    const off = Object.fromEntries((await limited.service.view(limited.paseo)).agents.map((route) => [route.agentId, route.waiting]));
+    expect(off).toEqual({ idle: "idle", working: "background", busy: "turn" });
+
+    // Off an account that still works, nothing moves it unasked: it moves when its session next starts.
+    const working = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { picked: session(MAIN), busy: session(MAIN) },
+        bindings: { picked: { accountId: WORK, source: "user", at: openedAt }, busy: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [
+        { id: "picked", status: "idle" },
+        { id: "busy", status: "running", backgroundWork: 1 },
+      ],
+    );
+    // Nothing moves either when the turn ends, so not "when its current turn ends".
+    const later = (await working.service.view(working.paseo)).agents;
+    expect(later).toEqual([
+      expect.objectContaining({ agentId: "picked", pendingAccountId: MAIN, waiting: "restart" }),
+      expect.objectContaining({ agentId: "busy", pendingAccountId: MAIN, waiting: "restart" }),
+    ]);
+  });
 
   it("moves an agent whose last turn failed when it's switched", async () => {
     // A failed turn leaves the agent in "error" with its session still open: its next message goes to
@@ -1074,7 +2824,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { failed: session(MAIN) },
       },
       [{ id: "failed", status: "error" }],
@@ -1089,7 +2839,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         bindings: { chosen: { accountId: MAIN, source: "user", at: openedAt } },
         sessions: {
           idle: session(WORK),
@@ -1145,7 +2895,7 @@ describe("changing the default account", () => {
             ...(work ? [{ ...account(WORK, "work", "managed"), ...work }] : []),
             account(HELLO, "hello", "managed"),
           ] as never,
-          defaults: { claude: MAIN, codex: null },
+          defaults: { claude: MAIN, codex: null, pi: null },
           bindings: {},
           sessions: { stuck: session(WORK), fine: session(MAIN) },
         },
@@ -1173,7 +2923,7 @@ describe("changing the default account", () => {
     ];
     for (const prefs of [KEEP, preferences.schema.parse({})]) {
       const { service, store, paseo, reopened } = await setUpAgents(
-        { accounts, defaults: { claude: WORK, codex: null }, bindings: {}, sessions: { idle: session(WORK), busy: session(WORK) } },
+        { accounts, defaults: { claude: WORK, codex: null, pi: null }, bindings: {}, sessions: { idle: session(WORK), busy: session(WORK) } },
         agents,
       );
       service.setPreferences(prefs);
@@ -1184,7 +2934,7 @@ describe("changing the default account", () => {
 
     // Until another account is chosen, the CLI login is the default.
     const { service, store, paseo, reopened } = await setUpAgents(
-      { accounts, defaults: { claude: null, codex: null }, bindings: {}, sessions: { idle: session(MAIN), busy: session(MAIN) } },
+      { accounts, defaults: { claude: null, codex: null, pi: null }, bindings: {}, sessions: { idle: session(MAIN), busy: session(MAIN) } },
       agents,
     );
     expect(await service.setDefault(paseo, MAIN)).toEqual(NOTHING_MOVED);
@@ -1201,7 +2951,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
       },
       [{ id: "starting", status: "initializing" }],
       {
@@ -1242,7 +2992,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         bindings: {},
         sessions: { reloading: session(WORK) },
       },
@@ -1275,7 +3025,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: null, codex: null },
+        defaults: { claude: null, codex: null, pi: null },
         sessions: { routed: session(MAIN) },
       },
       [
@@ -1328,7 +3078,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [codex(CODEX_MAIN, "chatgpt", "main"), codex("codex-work", "work", "managed")] as never,
-        defaults: { claude: null, codex: CODEX_MAIN },
+        defaults: { claude: null, codex: CODEX_MAIN, pi: null },
         sessions: { thread: { accountId: CODEX_MAIN, family: "codex", openedAt } },
       },
       [
@@ -1342,6 +3092,727 @@ describe("changing the default account", () => {
     expect(bindings.archived).toMatchObject({ accountId: CODEX_MAIN, source: "thread" });
     expect(reopened).toEqual([]);
   });
+
+  it("doesn't let alignment move open agents before they're kept", async () => {
+    // The new default is in place while a session still being routed holds up keeping the open
+    // agents, for up to 5 s. An alignment pass then would take them for agents that follow it.
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let preparing = false;
+    const { service, store, paseo, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: WORK, codex: null, pi: null },
+        bindings: {},
+        sessions: { idle: session(WORK) },
+      },
+      [
+        { id: "starting", status: "initializing" },
+        { id: "idle", status: "idle" },
+      ],
+      {
+        claude: {
+          prepareHome: async () => {
+            if (preparing) return;
+            preparing = true;
+            await gate;
+          },
+        },
+      },
+    );
+    const opening = service.onSessionOpen(
+      { agentId: "starting", provider: "claude", reason: "create", purpose: "interactive", env: {} } as never,
+      context,
+    );
+    await vi.waitFor(() => expect(preparing).toBe(true));
+    const changing = service.setDefault(paseo, HELLO);
+    await vi.waitFor(async () => expect((await store.read()).defaults.claude).toBe(HELLO));
+    expect(await service.alignSessions(paseo)).toEqual(NOTHING_MOVED);
+    release();
+    await Promise.all([changing, opening]);
+
+    expect(reopened).toEqual([]);
+    expect((await store.read()).bindings.idle).toMatchObject({ accountId: WORK, source: "auto" });
+  });
+});
+
+describe("a limit hit while the agent is being moved", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const OTHER = "agent-2";
+  const state = (bindings: StoredState["bindings"] = {}) => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    bindings,
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
+  const limitedUntil = async (store: StateStore, id: string) => (await store.read()).accounts.find((entry) => entry.id === id)?.limitedUntil ?? null;
+
+  it("records the limit on the account the turn ran on, and leaves the agent where it went meanwhile", async () => {
+    let moveAway = async () => {};
+    const { store, reopened, notes, limitTurn } = await setUp(state(), hit, {
+      recent: async () => {
+        await moveAway(); // the user picked hello while the turn's timeline was being read
+        return { entries: [] };
+      },
+    });
+    moveAway = async () => {
+      await store.update((draft) => {
+        draft.bindings[AGENT] = { accountId: HELLO, source: "user", at: new Date().toISOString() };
+        draft.sessions[AGENT] = { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() };
+      });
+    };
+    await limitTurn();
+    expect(await limitedUntil(store, MAIN)).not.toBeNull();
+    expect(await limitedUntil(store, HELLO)).toBeNull();
+    expect(reopened).toEqual([]);
+    expect(notes).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("records the limit when another move has the agent, and leaves the agent where that move put it", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let started = () => {};
+    const reloading = new Promise<void>((resolve) => (started = resolve));
+    const { service, store, reopened, paseo, limitTurn } = await setUp(state(), hit, {
+      reloading: () => {
+        started();
+        return gate;
+      },
+    });
+    const moving = service.setAgentAccount(paseo as never, AGENT, HELLO);
+    await reloading;
+    // Recorded at once; failover waits for the move, then finds the agent already moved.
+    const limiting = limitTurn();
+    await vi.waitFor(async () => expect(await limitedUntil(store, MAIN)).not.toBeNull());
+    release();
+    expect((await moving).reopened).toEqual([AGENT]);
+    await limiting;
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("leaves the other idle agents on an account a reset refilled just before the limit came in", async () => {
+    const { service, store, reopened, paseo, limitTurn } = await setUp(
+      { ...state(), sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt }, [OTHER]: { accountId: MAIN, family: "claude", openedAt } } },
+      hit,
+      { claude: { redeemReset: async () => ({ outcome: "reset", message: "Limits reset", left: 0 }) } },
+    );
+    const { agent } = await paseo.agents.ref().refresh();
+    const other = { ...agent, id: OTHER };
+    paseo.agents.list = async () => ({ entries: [{ agent }, { agent: other }], pageInfo: { hasMore: false, nextCursor: null } });
+    const { ref } = paseo.agents;
+    paseo.agents.ref = ((id: string) => {
+      const handle = ref();
+      return { ...handle, refresh: async () => ({ agent: id === OTHER ? other : agent }) };
+    }) as typeof ref;
+    expect((await redeemNow(service, paseo, MAIN)).outcome).toBe("reset");
+    await limitTurn();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(reopened).toEqual([]);
+    expect(await limitedUntil(store, MAIN)).toBeNull();
+    expect((await store.read()).sessions[OTHER]?.accountId).toBe(MAIN);
+  });
+});
+
+describe("using a reset for a stopped agent", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const state = () => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
+  const reset = { redeemReset: async () => ({ outcome: "reset" as const, message: "Limits reset.", left: 0 }) };
+
+  it("carries on an agent whose last turn stopped at the limit", async () => {
+    const { service, paseo, sent } = await setUp(state(), hit, {
+      claude: reset,
+      recent: inTurn("t", { type: "assistant_message", text: "You've hit your session limit · resets 3pm" }),
+      detectLimit: detectClaudeLimit,
+    });
+    expect(await redeemNow(service, paseo, MAIN, AGENT)).toMatchObject({ outcome: "reset", continued: true });
+    expect(sent).toHaveLength(1);
+  });
+
+  it("leaves the agent alone when its timeline can't be read, as nothing says the limit stopped it", async () => {
+    const { service, paseo, sent } = await setUp(state(), hit, {
+      claude: reset,
+      recent: async () => {
+        throw new Error("Not connected");
+      },
+      detectLimit: detectClaudeLimit,
+    });
+    expect(await redeemNow(service, paseo, MAIN, AGENT)).toMatchObject({ outcome: "reset", continued: false });
+    expect(sent).toEqual([]);
+  });
+});
+
+describe("aligning agents with their accounts", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const onMarketing = (bindings: StoredState["bindings"] = {}) => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    bindings,
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
+  const full = (accountId: string) => (draft: StoredState) => {
+    const target = draft.accounts.find((entry) => entry.id === accountId);
+    if (target) target.limitedUntil = inFuture();
+  };
+  const turnEnded = { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "completed" }, timeline: [] } as never;
+
+  it("leaves an agent on a working account when switching no longer skips the one picked for it", async () => {
+    // hello was full when the user picked it, so the agent stayed on marketing while switching was
+    // on. Turning switching off routes it to hello, but marketing still works: a reload would cancel
+    // what it's doing, so it moves when its session next opens, and its button says so meanwhile.
+    const { service, store, reopened, notes, paseo } = await setUp(
+      onMarketing({ [AGENT]: { accountId: HELLO, source: "user", at: openedAt } }),
+      hit,
+    );
+    await store.update(full(HELLO));
+    service.attach(paseo as never);
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+
+    service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+    expect(notes).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    const route = (await service.view(paseo as never)).agents.find((entry) => entry.agentId === AGENT);
+    expect(route).toMatchObject({ accountId: HELLO, pendingAccountId: MAIN });
+  });
+
+  it("moves an idle agent off an account a usage reading found full when switching is on", async () => {
+    const { service, store, notes, paseo } = await setUp(onMarketing(), hit);
+    await store.update(full(MAIN));
+
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([AGENT]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "auto" });
+    expect(notes[0]).toMatchObject({ from: "marketing", to: "hello", reason: "limit", outcome: "switched" });
+  });
+
+  it("leaves an agent on a full account when switching is off", async () => {
+    const { service, store, reopened, paseo } = await setUp(onMarketing(), hit);
+    service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    await store.update(full(MAIN));
+
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+  });
+
+  it("drops a move it left for the turn when the account came back meanwhile", async () => {
+    const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit);
+    await store.update((draft) => {
+      full(MAIN)(draft);
+      draft.defaults.claude = HELLO;
+    });
+    agent.status = "running";
+    expect((await service.alignSessions(paseo as never)).deferred).toEqual([AGENT]);
+    // The limit lifts during the turn: marketing works again, so nobody's asked for the move any more.
+    await store.update((draft) => {
+      const target = draft.accounts.find((entry) => entry.id === MAIN);
+      if (target) target.limitedUntil = null;
+    });
+    agent.status = "idle";
+    await service.onTurnEnded(turnEnded, { paseo } as never);
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+  });
+
+  it("moves a busy agent after its turn", async () => {
+    const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit);
+    await store.update(full(MAIN));
+    agent.status = "running";
+
+    expect((await service.alignSessions(paseo as never)).deferred).toEqual([AGENT]);
+    expect(reopened).toEqual([]);
+    agent.status = "idle";
+    await service.onTurnEnded(turnEnded, { paseo } as never);
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("leaves an agent whose turn just ended to failover", async () => {
+    const { service, store, reopened, paseo } = await setUp(onMarketing(), hit);
+    await service.onTurnEnded(turnEnded, { paseo } as never);
+    await store.update(full(MAIN));
+
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+  });
+
+  it("doesn't try a move that didn't land again right away", async () => {
+    const { service, store, reopened, paseo } = await setUp(onMarketing(), hit, { reload: "fails" });
+    await store.update(full(MAIN));
+
+    expect((await service.alignSessions(paseo as never)).failed).toHaveLength(1);
+    await service.alignSessions(paseo as never);
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+  });
+
+  it("doesn't promise a move alignment holds back after a try that didn't land, until it tries again", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { service, store, reopened, paseo } = await setUp(onMarketing(), hit);
+      await store.update((draft) => {
+        const marketing = draft.accounts.find((entry) => entry.id === MAIN);
+        if (marketing) marketing.limitedUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+      });
+      const waiting = async () => (await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)?.waiting;
+      expect(await waiting()).toBe("idle");
+      // As alignment records a reload of it that didn't land (see `alignSessions`).
+      const target = (await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)!.accountId;
+      (service as unknown as { alignedAt: Map<string, { accountId: string; at: number }> }).alignedAt.set(AGENT, { accountId: target, at: Date.now() });
+      // Alignment won't try again for a while, so the button doesn't say "once it's idle" meanwhile.
+      expect(await waiting()).toBe("restart");
+      expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      expect(await waiting()).toBe("idle");
+      expect((await service.alignSessions(paseo as never)).reopened).toEqual([AGENT]);
+      expect(reopened).toEqual([AGENT]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("doesn't promise a move the switch guard holds back", async () => {
+    const { service, store, paseo } = await setUp(onMarketing(), hit);
+    await store.update(full(MAIN));
+    const waiting = async () => (await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)?.waiting;
+    expect(await waiting()).toBe("idle");
+    const guard = (service as unknown as { switchGuard: SwitchGuard }).switchGuard;
+    for (let move = 0; move < guard.limit; move++) guard.note(AGENT, Date.now());
+    expect(await waiting()).toBe("restart");
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+  });
+
+  it("says once that it couldn't move an agent, not at every retry", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { service, store, reopened, notes, paseo } = await setUp(onMarketing(), hit, { reload: "fails" });
+      await store.update((draft) => {
+        const marketing = draft.accounts.find((entry) => entry.id === MAIN);
+        if (marketing) marketing.limitedUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+      });
+      await service.alignSessions(paseo as never);
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      await service.alignSessions(paseo as never);
+      expect(reopened).toEqual([AGENT, AGENT]);
+      expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "hello", outcome: "pending" })]);
+      expect(notes[0]?.detail).toMatch(/^Reloading it didn't work: Timed out closing previous session during refresh\.$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves an agent on a usable stand-in for its disabled account, whichever ranks first", async () => {
+    const WORK = "claude-work";
+    const { service, store, reopened, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), { ...account(HELLO, "hello", "managed"), disabled: true }, account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        bindings: { [AGENT]: { accountId: HELLO, source: "user", at: openedAt } },
+        sessions: { [AGENT]: { accountId: WORK, family: "claude", openedAt } },
+      },
+      hit,
+    );
+    // Marketing, the default, ranks first among the stand-ins now, but work does just as well.
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+    expect((await service.view(paseo as never)).agents).toEqual([expect.objectContaining({ accountId: WORK, pendingAccountId: null })]);
+
+    // Once work can't stand in, the agent moves to one that can, and still returns when hello is back.
+    await store.update(full(WORK));
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([AGENT]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(state.bindings[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("reopens a closed agent on the roomiest stand-in, not on the CLI login it no longer runs on", async () => {
+    const WORK = "claude-work";
+    const used = (percent: number): UsageRead => ({
+      fetchedAt: new Date().toISOString(),
+      windows: [{ id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: null }],
+      error: null,
+      cached: false,
+      resets: null,
+    });
+    const { service, store, paseo, agent } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: {},
+      },
+      hit,
+      { claude: { usage: async (home: string | null) => used(home === null ? 80 : 10) } },
+    );
+    await store.update(full(HELLO));
+    for (const id of [MAIN, WORK]) await service.refreshUsage(id, true);
+    // Open with no session of its own on record, it runs on the CLI login, and stays there.
+    expect((await service.view(paseo as never)).agents).toEqual([expect.objectContaining({ accountId: MAIN })]);
+
+    // Closed, it runs on none: it goes where there's the most room, and its account button says so first.
+    agent.status = "closed";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 5_000); // past the daemon's cached list of agents
+      expect((await service.view(paseo as never)).agents).toEqual([expect.objectContaining({ accountId: WORK })]);
+    } finally {
+      vi.useRealTimers();
+    }
+    const opened = await service.onSessionOpen(
+      { agentId: AGENT, provider: "claude", reason: "resume", purpose: "interactive", env: {} } as never,
+      { paseo } as never,
+    );
+    expect(opened?.env.CLAUDE_CONFIG_DIR).toBe(join(tmpdir(), WORK));
+  });
+
+  it("leaves an agent the user has just sent a message to until it's quiet", async () => {
+    const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit);
+    await store.update(full(MAIN));
+    agent.lastUserMessageAt = new Date().toISOString(); // its turn hasn't started yet
+
+    expect(await service.alignSessions(paseo as never)).toMatchObject({ reopened: [], deferred: [] });
+    expect(reopened).toEqual([]);
+    // A turn starting is the same signal.
+    agent.lastUserMessageAt = openedAt;
+    await service.onTurnStarted({ id: AGENT, provider: "claude" }, { paseo } as never);
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+  });
+
+  it("tries again at the next check, without a note, when Paseo can't say what the agent is doing", async () => {
+    const { service, store, reopened, notes, paseo } = await setUp(onMarketing(), hit);
+    await store.update(full(MAIN));
+    // The connection drops after alignment found the agent: the second look is the one in the move.
+    const { ref } = paseo.agents;
+    let looks = 0;
+    paseo.agents.ref = () => {
+      const handle = ref();
+      return {
+        ...handle,
+        refresh: async () => {
+          looks += 1;
+          if (looks === 2) throw new Error("Not connected");
+          return handle.refresh();
+        },
+      };
+    };
+
+    expect((await service.alignSessions(paseo as never)).failed).toEqual([{ agentId: AGENT, error: expect.stringContaining("Not connected") }]);
+    expect(reopened).toEqual([]);
+    expect(notes).toEqual([]);
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("looks at the agent again right before reloading it, and waits for the turn the user just started", async () => {
+    const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit);
+    await store.update(full(MAIN));
+    // The message arrives while alignment gets ready: the third look is the one just before the reload.
+    const { ref } = paseo.agents;
+    let looks = 0;
+    paseo.agents.ref = () => {
+      const handle = ref();
+      return {
+        ...handle,
+        refresh: async () => {
+          looks += 1;
+          if (looks === 3) agent.lastUserMessageAt = new Date().toISOString();
+          return handle.refresh();
+        },
+      };
+    };
+
+    expect((await service.alignSessions(paseo as never)).deferred).toEqual([AGENT]);
+    expect(reopened).toEqual([]);
+    await service.onTurnEnded(turnEnded, { paseo } as never);
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+});
+
+describe("a move asked for during a turn", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const WORK = "claude-work";
+  const threeAccounts = () => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed"), account(WORK, "work", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const limit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
+
+  it("still happens when the turn ends at a limit and automatic switching is off", async () => {
+    const { service, store, reopened, notes, paseo, agent, limitTurn } = await setUp(threeAccounts(), limit);
+    service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    agent.status = "running";
+    expect((await service.setAgentAccount(paseo as never, AGENT, WORK)).deferred).toEqual([AGENT]);
+    agent.status = "idle";
+    await limitTurn();
+
+    const state = await store.read();
+    expect(state.accounts.find((entry) => entry.id === MAIN)?.limitedUntil).not.toBeNull();
+    expect(state.sessions[AGENT]?.accountId).toBe(WORK);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "work", reason: "manual", outcome: "switched" })]);
+  });
+
+  it("goes where it was asked to when automatic switching moves the agent at that limit", async () => {
+    const { service, store, reopened, notes, paseo, agent, limitTurn } = await setUp(threeAccounts(), limit);
+    agent.status = "running";
+    await service.setAgentAccount(paseo as never, AGENT, WORK);
+    agent.status = "idle";
+    await limitTurn();
+
+    // Hello has the most room by the usual ranking, but the user asked for work.
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(WORK);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: WORK, source: "user" });
+    expect(reopened).toEqual([AGENT]);
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "work", reason: "limit", outcome: "switched" })]);
+  });
+
+  it("happens once an agent that was only starting is idle, without a turn", async () => {
+    const { service, store, reopened, notes, paseo, agent } = await setUp(threeAccounts(), limit);
+    agent.status = "initializing";
+    expect((await service.setAgentAccount(paseo as never, AGENT, WORK)).deferred).toEqual([AGENT]);
+    agent.status = "idle";
+    await service.alignSessions(paseo as never);
+
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(WORK);
+    expect(notes).toEqual([expect.objectContaining({ to: "work", reason: "manual", outcome: "switched" })]);
+  });
+});
+
+describe("moves that overlap", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const onMarketing = () => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
+
+  it("reload an agent once, and note it once", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let started = () => {};
+    const reloading = new Promise<void>((resolve) => (started = resolve));
+    const { service, store, reopened, notes, paseo } = await setUp(onMarketing(), hit, {
+      reloading: () => {
+        started();
+        return gate;
+      },
+    });
+    const picking = service.setAgentAccount(paseo as never, AGENT, HELLO);
+    await reloading;
+    // The 30-second upkeep comes round while the user's switch is reloading the agent.
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    release();
+
+    expect((await picking).reopened).toEqual([AGENT]);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes).toHaveLength(1);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("don't undo a session another reload opened after one that failed", async () => {
+    const { service, store, paseo } = await setUp(onMarketing(), hit, { reload: "fails after another" });
+    expect((await service.setAgentAccount(paseo as never, AGENT, HELLO)).failed).toHaveLength(1);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+});
+
+describe("picking an account by hand", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const WORK = "claude-work";
+  const threeAccounts = (hello: Partial<StoredAccount> = {}) => ({
+    accounts: [account(MAIN, "marketing", "main"), { ...account(HELLO, "hello", "managed"), ...hello }, account(WORK, "work", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const limit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
+
+  it("refuses an account at its limit while switching is on, rather than quietly using another", async () => {
+    const { service, store, reopened, paseo } = await setUp(threeAccounts({ limitedUntil: inFuture(), limitKind: "window" }), limit);
+    await expect(service.setAgentAccount(paseo as never, AGENT, HELLO)).rejects.toThrow(/hello is at its limit/);
+    expect((await store.read()).bindings[AGENT]).toBeUndefined();
+    expect(reopened).toEqual([]);
+    expect((await service.view(paseo as never)).autoSwitch).toBe(true); // so the account button can say so too
+
+    // With switching off, the agent goes there and stops at the limit, as the user asked.
+    service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    expect((await service.setAgentAccount(paseo as never, AGENT, HELLO)).reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("goes where the user picked during a failover, and keeps the pick", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let asked = () => {};
+    const reading = new Promise<void>((resolve) => (asked = resolve));
+    const { service, store, reopened, paseo, limitTurn } = await setUp(threeAccounts(), limit, {
+      claude: {
+        // Failover reads the full account's usage before it picks where to go.
+        usage: async () => {
+          asked();
+          await gate;
+          return { fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null };
+        },
+      },
+    });
+    const failing = limitTurn();
+    await reading;
+    const picking = service.setAgentAccount(paseo as never, AGENT, WORK);
+    await vi.waitFor(async () => expect((await store.read()).bindings[AGENT]?.accountId).toBe(WORK));
+    release();
+    const [, picked] = await Promise.all([failing, picking]);
+
+    const state = await store.read();
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: WORK, source: "user" });
+    expect(state.sessions[AGENT]?.accountId).toBe(WORK);
+    expect(reopened).toEqual([AGENT]);
+    expect(picked).toMatchObject({ reopened: [], failed: [], pending: [] }); // failover already moved it there
+  });
+});
+
+describe("telling the user how a move went", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const onMarketing = () => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
+
+  it("notes a switch whose reload didn't work, and says the agent moves when its session next starts", async () => {
+    const { service, notes, paseo } = await setUp(onMarketing(), hit, { reload: "fails" });
+    const summary = await service.setAgentAccount(paseo as never, AGENT, HELLO);
+    expect(summary.failed).toEqual([{ agentId: AGENT, error: "Timed out closing previous session during refresh" }]);
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "hello", reason: "manual", outcome: "pending" })]);
+    expect(notes[0]?.detail).toBe("Reloading it didn't work: Timed out closing previous session during refresh.");
+    expect((await service.view(paseo as never)).agents).toEqual([
+      expect.objectContaining({ accountId: HELLO, pendingAccountId: MAIN, waiting: "restart" }),
+    ]);
+  });
+
+  it("says a busy agent moves when its turn ends", async () => {
+    const { service, paseo, agent } = await setUp(onMarketing(), hit);
+    agent.status = "running";
+    expect((await service.setAgentAccount(paseo as never, AGENT, HELLO)).deferred).toEqual([AGENT]);
+    expect((await service.view(paseo as never)).agents).toEqual([
+      expect.objectContaining({ accountId: HELLO, pendingAccountId: MAIN, waiting: "turn" }),
+    ]);
+  });
+});
+
+describe("answering before Paseo gives up", () => {
+  // Paseo fails an RPC after 30 s but doesn't stop it, so a user who retries could start it twice.
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const onMarketing = () => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
+  });
+  const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
+
+  beforeEach(() => void vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }));
+  afterEach(() => void vi.useRealTimers());
+
+  it("answers a move that takes long, and finishes it in the background", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let started = () => {};
+    const reloading = new Promise<void>((resolve) => (started = resolve));
+    const { service, store, notes, paseo } = await setUp(onMarketing(), hit, {
+      reloading: () => {
+        started();
+        return gate;
+      },
+    });
+    const answer = service.setAgentAccount(paseo as never, AGENT, HELLO);
+    await reloading;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(await answer).toMatchObject({ reopened: [], failed: [], pending: [AGENT] });
+
+    release();
+    await vi.waitFor(() => expect(notes).toHaveLength(1));
+    expect(notes[0]).toMatchObject({ to: "hello", outcome: "switched" });
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("answers removing an account whose agents take long to move", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let started = () => {};
+    const reloading = new Promise<void>((resolve) => (started = resolve));
+    const { service, store, paseo } = await setUp(
+      { ...onMarketing(), sessions: { [AGENT]: { accountId: HELLO, family: "claude" as const, openedAt } } },
+      hit,
+      {
+        reloading: () => {
+          started();
+          return gate;
+        },
+      },
+    );
+    const answer = service.remove(paseo as never, HELLO);
+    await reloading;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(await answer).toEqual({ affected: 1, moves: { reopened: [], deferred: [], failed: [], pending: [AGENT], continuedIn: null } });
+
+    release();
+    await vi.waitFor(async () => expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN));
+  });
+
+  it("answers a reset that takes long, and never spends a second one", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let spent = 0;
+    const { service, paseo } = await setUp(onMarketing(), hit, {
+      claude: {
+        redeemReset: async () => {
+          spent += 1;
+          await gate;
+          return { outcome: "reset", message: "Limits reset.", left: 0 };
+        },
+      },
+    });
+    const first = service.redeem(paseo as never, HELLO);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(await first).toMatchObject({ outcome: "pending" });
+    // Paseo had given up on it, so the user tries again.
+    expect(await service.redeem(paseo as never, HELLO)).toMatchObject({ outcome: "pending", message: expect.stringMatching(/already being used/) });
+
+    release();
+    await vi.waitFor(async () => expect((await service.redeem(paseo as never, HELLO)).outcome).toBe("already_used"));
+    expect(spent).toBe(1);
+  });
+
+  it("answers a usage refresh that has to renew a sign-in", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { service, paseo } = await setUp(onMarketing(), hit, {
+      claude: {
+        usage: async () => {
+          await gate;
+          return { fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null };
+        },
+      },
+    });
+    const viewing = service.view(paseo as never, true);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect((await viewing).accounts).toHaveLength(2);
+    release();
+  });
 });
 
 describe("a reading past its reset", () => {
@@ -1351,7 +3822,7 @@ describe("a reading past its reset", () => {
     try {
       vi.setSystemTime(NOW);
       const store = new StateStore(join(root, "state.json"));
-      await store.update((draft) => Object.assign(draft, { accounts: [account(MAIN, "main", "main")], defaults: { claude: MAIN, codex: null } }));
+      await store.update((draft) => Object.assign(draft, { accounts: [account(MAIN, "main", "main")], defaults: { claude: MAIN, codex: null, pi: null } }));
       const windows = (weekly: number) => [{ id: "seven_day", label: "Weekly", usedPercent: weekly, resetsAt: new Date(NOW + 72 * 3_600_000).toISOString() }];
       // Like Claude with an expired sign-in: nothing is read unless the CLI renews it first.
       const renewals: boolean[] = [];
@@ -1364,11 +3835,12 @@ describe("a reading past its reset", () => {
       };
       const claude = { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), usage };
       const service = new Service(
-        { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter },
+        { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
         store,
         { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
         { locate: async () => "/usr/local/bin/paseo" } as unknown as Reopener,
       );
+      services.push(service);
       service.setPreferences(preferences.schema.parse({}));
       await service.refreshUsage(MAIN, true);
       signedIn = false;
@@ -1405,15 +3877,16 @@ describe("renewing an expired sign-in in the background", () => {
   async function setUpAccount(usage: FamilyAdapter["usage"], patch: Partial<StoredAccount> = {}) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) =>
-      Object.assign(draft, { accounts: [{ ...account(MAIN, "main", "main"), ...patch }], defaults: { claude: MAIN, codex: null } }),
+      Object.assign(draft, { accounts: [{ ...account(MAIN, "main", "main"), ...patch }], defaults: { claude: MAIN, codex: null, pi: null } }),
     );
     const claude = { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), usage };
     const service = new Service(
-      { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter },
+      { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
       store,
       { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
       { locate: async () => "/usr/local/bin/paseo" } as unknown as Reopener,
     );
+    services.push(service);
     service.setPreferences(preferences.schema.parse({}));
     return { service, store };
   }
@@ -1518,7 +3991,7 @@ describe("the account button's reason row", () => {
     const { service, store } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "balance", at: new Date().toISOString(), selectionReason: "headroom" } },
         sessions: {},
       },
@@ -1550,7 +4023,7 @@ describe("pending placements", () => {
     const { service, store, paseo } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
       },
       () => {
         throw new Error("unused");

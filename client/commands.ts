@@ -1,7 +1,8 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
+import { describeReopen, limitedPick, moveProblem } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type StateView } from "../shared/model";
-import { setAgentAccount, setDefaultAccount } from "../shared/rpc";
-import type { ZeroSubStore } from "./store";
+import { setAgentAccount, setDefaultAccount, setNextAgentAccount, type ReopenSummary } from "../shared/rpc";
+import { stoppedWaiting, type ZeroSubStore } from "./store";
 
 /** Command Center entries and the `/account` slash command. */
 export function contributeCommands(client: PluginClientContext, store: ZeroSubStore): () => void {
@@ -12,7 +13,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
       id: "open-accounts",
       title: "Manage subscription accounts (ZeroSub)",
       icon: "Users",
-      keywords: ["zerosub", "claude", "chatgpt", "codex", "account", "subscription", "login", "switch"],
+      keywords: ["zerosub", "claude", "chatgpt", "codex", "pi", "account", "subscription", "login", "switch"],
       context: "global",
       onSelect({ openSurface }) {
         openSurface("accounts");
@@ -36,8 +37,13 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
           return;
         }
         const accounts = state.accounts.filter((account) => account.family === family);
+        // Paseo shows what a command throws: a refusal, or that the agent couldn't be reloaded.
+        const move = async (accountId: string | null, to: string) => {
+          const problem = moveProblem(await stillMoving(store.rpc(setAgentAccount, { agentId: agent.id, accountId })), to);
+          if (problem) throw new Error(problem);
+        };
         if (/^default$/i.test(query)) {
-          await store.rpc(setAgentAccount, { agentId: agent.id, accountId: null });
+          await move(null, accounts.find((account) => account.isDefault)?.label ?? "the default account");
           return;
         }
         const match = findAccount(accounts, query);
@@ -47,7 +53,8 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
         }
         if (match.status === "signed_out") throw new Error(`${match.label} is signed out. Sign it in from Accounts first.`);
         if (match.status === "disabled") throw new Error(`${match.label} is disabled. Enable it in Accounts first.`);
-        await store.rpc(setAgentAccount, { agentId: agent.id, accountId: match.id });
+        if (match.status === "limited" && state.autoSwitch) throw new Error(limitedPick(match.label));
+        await move(match.id, match.label);
       },
     }),
   );
@@ -57,13 +64,32 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
   let signature = "";
   const syncDynamic = () => {
     const state = store.current.state;
-    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status])) : "";
+    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status, a.nextAgentUntil])) : "";
     if (next === signature) return;
     signature = next;
     for (const remove of dynamic) remove();
     dynamic = [];
     if (!state) return;
     state.accounts.forEach((account, index) => {
+      const pending = Boolean(account.nextAgentUntil);
+      // A waiting pick can always be canceled, whatever has become of its account since.
+      if (pending || (account.status !== "signed_out" && account.status !== "disabled")) {
+        dynamic.push(
+          client.addCommandCenterItem({
+            id: `next-agent-${index}`,
+            title: pending
+              ? `Cancel: next new ${FAMILY_LABEL[account.family]} agent on ${account.label}`
+              : `Next new ${FAMILY_LABEL[account.family]} agent: use ${account.label}`,
+            icon: pending ? "CircleX" : "SquarePlus",
+            keywords: ["account", "next", "new agent", "workspace", account.email ?? "", account.family],
+            context: "global",
+            async onSelect() {
+              await store.rpc(setNextAgentAccount, { accountId: account.id, enabled: !pending });
+              await store.refresh();
+            },
+          }),
+        );
+      }
       if (account.isDefault || account.status === "signed_out" || account.status === "disabled") return;
       dynamic.push(
         client.addCommandCenterItem({
@@ -73,7 +99,9 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
           keywords: ["account", "default", "switch", account.email ?? "", account.family],
           context: "global",
           async onSelect() {
-            await store.rpc(setDefaultAccount, { accountId: account.id });
+            const summary = await stillMoving(store.rpc(setDefaultAccount, { accountId: account.id }));
+            // Only a reload that didn't work needs saying; Paseo shows what this throws.
+            if (summary.failed.length > 0) throw new Error(describeReopen(`${account.label} is now the default`, summary));
           },
         }),
       );
@@ -87,6 +115,14 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
     for (const remove of dynamic) remove();
     for (const remove of removers) remove();
   };
+}
+
+/** A move's outcome; nothing to report when Paseo stopped waiting for it, since it goes on regardless. */
+async function stillMoving(request: Promise<ReopenSummary>): Promise<ReopenSummary> {
+  return request.catch((error: unknown) => {
+    if (stoppedWaiting(error)) return { reopened: [], deferred: [], failed: [], pending: [], continuedIn: null };
+    throw error;
+  });
 }
 
 async function currentState(store: ZeroSubStore): Promise<StateView> {

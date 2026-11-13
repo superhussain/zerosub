@@ -2,7 +2,7 @@
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./adapter";
-import { buildTranscript, continuationPrompt, continueInNewAgent, keepEnds, shortenEarlierHandOff } from "./handoff";
+import { buildTranscript, continuationPrompt, continueInNewAgent, keepEnds, shortenEarlierHandOff, updatePrompt } from "./handoff";
 
 const OPEN = "<previous-session>";
 const CLOSE = "</previous-session>";
@@ -85,6 +85,116 @@ describe("quoting an earlier hand-off", () => {
     const quoted = continuationPrompt(buildTranscript([user("ORIGINAL"), user("z".repeat(50_000))]), "limit");
     const transcript = buildTranscript([user(quoted), user("y".repeat(50_000))], 10_000);
     expect(transcript).not.toMatch(/<\/?previous-session>/);
+  });
+});
+
+describe("clipping a transcript", () => {
+  it("keeps the latest stop instruction last, after the omitted progress", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      user("STOP, DO NOT MODIFY ANYTHING"),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+    ]);
+    expect(transcript).toContain("User (original request): Fix the build");
+    expect(transcript).toContain("User (latest instruction): STOP, DO NOT MODIFY ANYTHING");
+    expect(transcript).toContain("[… earlier conversation omitted …]");
+    expect(transcript.indexOf("STOP, DO NOT MODIFY ANYTHING")).toBeGreaterThan(
+      transcript.indexOf("[… earlier conversation omitted …]"),
+    );
+    // The summary reorders older progress around the latest instruction, so it can't claim a
+    // strictly oldest-first reading.
+    expect(continuationPrompt(transcript, "a limit")).not.toContain("oldest first");
+  });
+
+  it("keeps both ends of a long latest instruction", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+      user(`${"Check each step. ".repeat(600)}STOP, DO NOT MODIFY ANYTHING`),
+    ]);
+    const latest = transcript.slice(transcript.indexOf("User (latest instruction):"));
+    expect(latest).toContain("STOP, DO NOT MODIFY ANYTHING");
+    expect(latest).toContain("[… omitted …]");
+    expect(latest.length).toBeLessThan(6_200);
+  });
+
+  it("keeps the latest stop instruction after the older instructions and the todo snapshot", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+      user("CONTINUE EVERYTHING"),
+      { type: "todo", items: [{ text: "Ship it", completed: false }] },
+      user("STOP, DO NOT MODIFY ANYTHING"),
+    ]);
+    expect(transcript).toContain("User: CONTINUE EVERYTHING");
+    expect(transcript.indexOf("CONTINUE EVERYTHING")).toBeLessThan(transcript.indexOf("User (latest instruction): STOP"));
+    expect(transcript.indexOf("Task list at the time it stopped:")).toBeLessThan(
+      transcript.indexOf("User (latest instruction): STOP"),
+    );
+  });
+
+  it("keeps a terminal stop when the only user message is the latest one, after the todo snapshot", () => {
+    const transcript = buildTranscript([
+      user(`${"Please do the work. ".repeat(400)}STOP, DO NOT MODIFY ANYTHING`),
+      { type: "todo", items: [{ text: "Ship it", completed: false }] },
+      { type: "assistant_message", text: "a".repeat(50_000) },
+    ]);
+    expect(transcript).toMatch(/User \(original request and latest instruction\):[\s\S]*STOP, DO NOT MODIFY ANYTHING$/);
+    expect(transcript).toContain("[… omitted …]");
+    expect(transcript.indexOf("Task list at the time it stopped:")).toBeLessThan(transcript.indexOf("STOP, DO NOT MODIFY ANYTHING"));
+    expect(transcript.match(/Please do the work\./g)!.length).toBeLessThan(400);
+  });
+});
+
+describe("ordering and bounds", () => {
+  it("puts a short latest STOP after an older todo snapshot", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      { type: "todo", items: [{ text: "Ship it", completed: false }] },
+      user("STOP"),
+    ]);
+    expect(transcript.indexOf("Task list at the time it stopped:")).toBeLessThan(transcript.indexOf("STOP"));
+    expect(transcript).toMatch(/STOP$/);
+    expect(transcript).toContain("User: Fix the build");
+  });
+
+  it("leaves a short transcript without todos in conversation order", () => {
+    expect(buildTranscript([user("Fix the build"), { type: "assistant_message", text: "Done." }])).toBe("User: Fix the build\n\nAssistant: Done.");
+  });
+
+  it("tells the new agent to follow a stop or pause instruction instead of resuming", () => {
+    expect(continuationPrompt("User: STOP", "a limit")).toMatch(/stop or pause/);
+  });
+
+  it("keeps an oversized todo inside the transcript budget", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      { type: "todo", items: [{ text: "t".repeat(200_000), completed: false }] },
+      user("STOP, DO NOT MODIFY ANYTHING"),
+    ]);
+    expect(transcript.length).toBeLessThanOrEqual(40_000);
+    expect(transcript).toContain("[… omitted …]");
+    expect(transcript).toMatch(/STOP, DO NOT MODIFY ANYTHING$/);
+  });
+
+  it("keeps a long history with an oversized todo inside the budget", () => {
+    const transcript = buildTranscript([
+      user("Fix the build"),
+      { type: "assistant_message", text: "a".repeat(50_000) },
+      { type: "todo", items: [{ text: "t".repeat(200_000), completed: false }] },
+      user("STOP, DO NOT MODIFY ANYTHING"),
+    ]);
+    expect(transcript.length).toBeLessThanOrEqual(40_000);
+    expect(transcript).toMatch(/User \(latest instruction\): STOP, DO NOT MODIFY ANYTHING$/);
+  });
+});
+
+describe("an update for an existing fork", () => {
+  it("puts the user's instructions after the older progress", () => {
+    const prompt = updatePrompt("User: STOP", "Assistant: Continuing.\n\nTask list at the time it stopped:\n- [ ] Ship it", "Claude Code", "zerosub transfer m1");
+    expect(prompt.indexOf("<progress-updates>")).toBeLessThan(prompt.indexOf("<user-updates>"));
+    expect(prompt.indexOf("- [ ] Ship it")).toBeLessThan(prompt.indexOf("User: STOP"));
+    expect(prompt.endsWith("zerosub transfer m1")).toBe(true);
   });
 });
 

@@ -77,7 +77,24 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
       try {
         const fork = await store.rpc(forkAgent, { agentId, destination: "opencode" });
         close();
-        toast.show(`Continuing on OpenCode in “${fork.title}”`, { variant: "success", durationMs: 5_000 });
+        if (fork.delivery === "up-to-date") {
+          toast.show("No update was sent: the OpenCode continuation already has everything from this agent.", {
+            variant: "default",
+            durationMs: 5_000,
+          });
+        } else if (fork.delivery === "found") {
+          toast.show(`Found the existing OpenCode continuation “${fork.title}”. Nothing was sent; open that chat to inspect it.`, {
+            variant: "default",
+            durationMs: 5_000,
+          });
+        } else if (fork.delivery === "uncertain") {
+          toast.show(`The last handoff to “${fork.title}” couldn't be confirmed. Nothing more was sent; open that chat before retrying. To continue in a new chat instead, archive that one.`, {
+            variant: "default",
+            durationMs: 5_000,
+          });
+        } else {
+          toast.show(`Continuing on OpenCode in “${fork.title}”`, { variant: "success", durationMs: 5_000 });
+        }
       } catch (failure) {
         setError(describe(failure));
         setBusy(false);
@@ -89,7 +106,9 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
         <Text style={text.heading}>Continue on OpenCode?</Text>
         <Text style={text.body}>
           This starts a new OpenCode agent in this workspace with the conversation so far, using the OpenCode model and
-          thinking option picked in ZeroSub's settings, allowed no more than this agent is. This agent stays as it is.
+          thinking option picked in ZeroSub's settings. It gets Plan or Build under this host's OpenCode permission
+          policy. Build edits files and runs shell without asking, so it can allow more than Claude does. Claude's Auto classifier and
+          sandbox rules aren't copied. This agent stays as it is.
         </Text>
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>

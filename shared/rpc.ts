@@ -37,10 +37,52 @@ export const renameAccount = defineRpc({
   output: z.object({ ok: z.literal(true) }),
 });
 
-export const removeAccount = defineRpc({
-  name: "zerosub.accounts.remove",
-  input: z.object({ accountId: z.string() }),
-  output: z.object({ ok: z.literal(true), movedAgents: z.number() }),
+/** Adds a Pi account: an Anthropic API key, with an optional base URL and proxy. */
+export const addApiAccount = defineRpc({
+  name: "zerosub.accounts.api.add",
+  input: z.object({
+    label: z.string().trim().min(1).max(40),
+    key: z.string().trim().min(1).max(4096),
+    /** Empty for Anthropic's own API. */
+    baseUrl: z.string().trim().max(2048).optional(),
+    proxy: z.string().trim().max(2048).optional(),
+  }),
+  output: z.object({ accountId: z.string() }),
+});
+
+/** Changes a Pi account's key (empty or omitted keeps it) or base URL; Pi's own login's too. */
+export const updateApiAccount = defineRpc({
+  name: "zerosub.accounts.api.update",
+  input: z.object({
+    accountId: z.string(),
+    key: z.string().trim().max(4096).optional(),
+    baseUrl: z.string().trim().max(2048).optional(),
+  }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** Sets a Pi account's proxy (Pi's own login's included); an empty value clears it. */
+export const setAccountProxy = defineRpc({
+  name: "zerosub.accounts.proxy",
+  input: z.object({ accountId: z.string(), proxy: z.string().trim().max(2048) }),
+  output: z.object({ ok: z.literal(true), proxy: z.string().nullable() }),
+});
+
+/**
+ * Changes the folder added Pi accounts' homes are kept in (empty: the default, `~/.pi-config`); the
+ * accounts kept before move there. `moving`: how many are due to move.
+ */
+export const setPiHomesDir = defineRpc({
+  name: "zerosub.accounts.pi.homes",
+  input: z.object({ dir: z.string().trim().max(1024) }),
+  output: z.object({ ok: z.literal(true), dir: z.string(), moving: z.number() }),
+});
+
+/** Adds back a Pi account from the folder ZeroSub kept when it was removed. */
+export const importPiAccount = defineRpc({
+  name: "zerosub.accounts.pi.import",
+  input: z.object({ path: z.string().trim().min(1).max(1024) }),
+  output: z.object({ accountId: z.string() }),
 });
 
 export const ReopenSummarySchema = z.object({
@@ -48,10 +90,19 @@ export const ReopenSummarySchema = z.object({
   /** Busy agents move when their current turn ends. */
   deferred: z.array(z.string()),
   failed: z.array(z.object({ agentId: z.string(), error: z.string() })),
+  /** Still being moved when the answer was sent; the move goes on, and each agent's timeline says how it went. */
+  pending: z.array(z.string()).default([]),
   /** A conversation that could not move in place and continues in this account's agent instead. */
   continuedIn: z.object({ agentId: z.string(), title: z.string() }).nullable().default(null),
 });
 export type ReopenSummary = z.infer<typeof ReopenSummarySchema>;
+
+/** `movedAgents`: how many agents ran on the account. `moves`: how moving them went (older servers don't say). */
+export const removeAccount = defineRpc({
+  name: "zerosub.accounts.remove",
+  input: z.object({ accountId: z.string() }),
+  output: z.object({ ok: z.literal(true), movedAgents: z.number(), moves: ReopenSummarySchema.optional() }),
+});
 
 export const clearAccountLimit = defineRpc({
   name: "zerosub.accounts.available",
@@ -73,6 +124,8 @@ export const RedeemOutcomeSchema = z.enum([
   "unavailable",
   /** The request failed or its result is unknown. */
   "error",
+  /** Still going when the answer was sent (or one already was); the account's usage shows the result. */
+  "pending",
 ]);
 export type RedeemOutcome = z.infer<typeof RedeemOutcomeSchema>;
 
@@ -96,6 +149,12 @@ export const redeemReset = defineRpc({
   output: RedeemResultSchema,
 });
 
+export const setNextAgentAccount = defineRpc({
+  name: "zerosub.accounts.next_agent",
+  input: z.object({ accountId: z.string(), enabled: z.boolean() }),
+  output: z.object({ until: z.string().nullable() }),
+});
+
 export const setDefaultAccount = defineRpc({
   name: "zerosub.accounts.default",
   input: z.object({ accountId: z.string() }),
@@ -116,7 +175,16 @@ export const setAccountEnabled = defineRpc({
 export const forkAgent = defineRpc({
   name: "zerosub.agents.fork",
   input: z.object({ agentId: z.string(), destination: z.enum(["other", "opencode"]).default("other") }),
-  output: z.object({ agentId: z.string(), title: z.string() }),
+  output: z.object({
+    agentId: z.string(),
+    title: z.string(),
+    /**
+     * Whether the conversation was delivered: `sent` and confirmed, `up-to-date` (nothing new to
+     * send), `found` (an existing continuation without a provable checkpoint; nothing was sent),
+     * or `uncertain` (a previous handoff has no trustworthy receipt; nothing more was sent).
+     */
+    delivery: z.enum(["sent", "up-to-date", "found", "uncertain"]).default("sent"),
+  }),
 });
 
 export const setAgentAccount = defineRpc({
