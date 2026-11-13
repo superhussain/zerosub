@@ -125,6 +125,7 @@ export type AgentLookup = (agentId: string) => Promise<AgentStatus | "gone" | nu
 /**
  * Stops the leftover Claude session processes of Paseo's daemon, with their descendants: SIGTERM,
  * then SIGKILL for any that outlast `graceMs`. Stops nothing when `ps` fails.
+ * Codex app-server processes are left alone: Paseo starts one per session at a time and tree-kills it on close.
  */
 export async function reapLeftovers(
   agents: ReadonlyMap<string, AgentStatus>,
