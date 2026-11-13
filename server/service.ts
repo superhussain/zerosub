@@ -38,6 +38,7 @@ import { sameAccountIdentity } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { isAccountHome, removeHome } from "./homes";
+import { reapLeftovers } from "./leftovers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
@@ -86,6 +87,7 @@ const LIMIT_TRUST_MS = 15 * 60_000;
 const LOGIN_TTL_MS = 15 * 60_000;
 const LOGIN_GRACE_MS = 3_000;
 const PRUNE_MS = 10 * 60_000;
+const REAP_MS = 5 * 60_000;
 /** Cleanup passes a home's sign-out (or sign-in check) may fail in before it's given up on. */
 const CLEANUP_TRIES = 3;
 /** After a reset, limit notices from turns that were already running are stale. */
@@ -199,6 +201,7 @@ export class Service {
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
   private lastPrune = 0;
+  private lastReap = 0;
   private cleaning: Promise<void> | null = null;
   /** Failed cleanup attempts this run, by home. */
   private readonly cleanupFailures = new Map<string, number>();
@@ -309,7 +312,21 @@ export class Service {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
+    if (this.paseo && now - this.lastReap >= REAP_MS) {
+      this.lastReap = now;
+      void this.reapLeftovers(this.paseo).catch((error: unknown) => log("could not check for leftover Claude processes", error));
+    }
     if (this.paseo) await this.cleanUpHomes(this.paseo);
+  }
+
+  /** Stops Claude processes Paseo left running for closed, archived or gone agents, or replaced by a newer session. */
+  private async reapLeftovers(paseo: PaseoApi): Promise<void> {
+    const { agents, complete } = await listAgents(paseo, true);
+    if (!complete) return;
+    const known = new Map(agents.map((agent) => [agent.id, { archived: agent.archived, status: agent.status }]));
+    for (const { pid, agentId, reason } of await reapLeftovers(known)) {
+      console.log(`[ZeroSub] stopped leftover Claude process ${pid} of agent ${agentId} (${reason}); Paseo had left it running`);
+    }
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {

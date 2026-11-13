@@ -35,7 +35,7 @@ const PS_TIMEOUT_MS = 10_000;
 export function parseEtime(value: string): number | null {
   const match = /^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$/.exec(value.trim());
   if (!match) return null;
-  const [days, hours, minutes, seconds] = [match[1], match[2], match[3], match[4]].map((part) => Number(part ?? 0));
+  const [days = 0, hours = 0, minutes = 0, seconds = 0] = match.slice(1).map((part) => Number(part ?? 0));
   return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
 }
 
@@ -43,9 +43,9 @@ export function parseEtime(value: string): number | null {
 export function parsePs(output: string): ProcessRow[] {
   const rows: ProcessRow[] = [];
   for (const line of output.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
-    const ageMs = match ? parseEtime(match[3]) : null;
-    if (match && ageMs !== null) rows.push({ pid: Number(match[1]), ppid: Number(match[2]), ageMs, args: match[4] });
+    const [, pid, ppid, etime, args] = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line) ?? [];
+    const ageMs = etime === undefined ? null : parseEtime(etime);
+    if (pid && ppid && args !== undefined && ageMs !== null) rows.push({ pid: Number(pid), ppid: Number(ppid), ageMs, args });
   }
   return rows;
 }

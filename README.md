@@ -129,6 +129,8 @@ Sign-in runs the official CLIs:
 
 ZeroSub never implements OAuth itself and never copies credentials between accounts.
 
+**Leftover Claude processes.** Paseo 0.16 can leave a Claude process running after it closes or replaces an agent's session. Every 5 minutes ZeroSub stops any Claude process Paseo started for an agent that is closed, archived or gone, or that a newer session of the same agent replaced, together with its MCP servers, and logs each one. It never stops a process younger than a minute or one it can't tie to a Paseo agent. macOS and Linux only.
+
 ## Privacy and security
 
 - Credentials stay in the CLIs' own stores. ZeroSub's registry (`$PASEO_HOME/zerosub/state.json`) holds account names, emails, plans, which agent uses which account, and continuation links with timeline positions. Handoff text stays in the agents' conversation histories; it isn't copied into the registry.
