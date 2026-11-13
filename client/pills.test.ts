@@ -23,6 +23,18 @@ function account(id: string, isDefault: boolean, overrides: Partial<AccountView>
     usage: null,
     agentCount: 1,
     home: null,
+    auth: "subscription",
+    api: null,
+    apiEditable: false,
+    proxy: null,
+    proxyEditable: false,
+    inheritedProxy: null,
+    proxyFile: null,
+    proxyFollowers: [],
+    launcher: null,
+    egress: null,
+    externalHome: false,
+    moving: null,
     ...overrides,
   };
 }
@@ -31,13 +43,16 @@ function account(id: string, isDefault: boolean, overrides: Partial<AccountView>
 async function menu(route: Partial<AgentRoute>, family: "claude" | "codex" = "codex", accounts: AccountView[] = [account("work", true), account("home", false)], openCodeAvailable = true): Promise<readonly PluginButtonMenuEntry[]> {
   const state: StateView = {
     accounts,
-    agents: [{ agentId: "agent-1", family, accountId: accounts[0]!.id, pinned: true, pendingAccountId: null, movable: false, ...route }],
+    agents: [{ agentId: "agent-1", family, accountId: accounts[0]!.id, pinned: true, pendingAccountId: null, waiting: null, movable: false, ...route }],
     logins: [],
     providers: { [family]: family },
     canReopen: true,
     browserSignIn: true,
+    piLaunchers: null,
+    piHomes: null,
     showComposerPill: true,
     openCodeAvailable,
+    autoSwitch: true,
     warnings: [],
   };
   const buttons: PluginButton[] = [];
@@ -106,13 +121,16 @@ describe("the OpenCode entry", () => {
     const buttons: PluginButton[] = [];
     const state: StateView = {
       accounts: [account("solo", true, { family: "claude", status: "ready" })],
-      agents: [{ agentId: "agent-1", family: "claude", accountId: "solo", pinned: true, pendingAccountId: null, movable: true }],
+      agents: [{ agentId: "agent-1", family: "claude", accountId: "solo", pinned: true, pendingAccountId: null, waiting: null, movable: true }],
       logins: [],
       providers: { claude: "claude" },
       canReopen: true,
       browserSignIn: true,
+      piLaunchers: null,
+      piHomes: null,
       showComposerPill: true,
       openCodeAvailable: false,
+      autoSwitch: true,
       warnings: [],
     };
     const client = {
@@ -142,13 +160,16 @@ describe("the OpenCode entry", () => {
     const buttons: PluginButton[] = [];
     const state: StateView = {
       accounts: [account("solo", true)],
-      agents: [{ agentId: "agent-1", family: "codex", accountId: "solo", pinned: true, pendingAccountId: null, movable: true }],
+      agents: [{ agentId: "agent-1", family: "codex", accountId: "solo", pinned: true, pendingAccountId: null, waiting: null, movable: true }],
       logins: [],
       providers: { codex: "codex" },
       canReopen: true,
       browserSignIn: true,
+      piLaunchers: null,
+      piHomes: null,
       showComposerPill: true,
       openCodeAvailable: true,
+      autoSwitch: true,
       warnings: [],
     };
     const client = {
@@ -180,13 +201,16 @@ describe("the OpenCode entry", () => {
     const buttons: PluginButton[] = [];
     const state: StateView = {
       accounts: [account("solo", true, { family: "claude", status: "limited" })],
-      agents: [{ agentId: "agent-1", family: "claude", accountId: "solo", pinned: true, pendingAccountId: null, movable: true }],
+      agents: [{ agentId: "agent-1", family: "claude", accountId: "solo", pinned: true, pendingAccountId: null, waiting: null, movable: true }],
       logins: [],
       providers: { claude: "claude" },
       canReopen: true,
       browserSignIn: true,
+      piLaunchers: null,
+      piHomes: null,
       showComposerPill: true,
       openCodeAvailable: true,
+      autoSwitch: true,
       warnings: [],
     };
     const client = {

@@ -4,12 +4,12 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { accountPeak, formatCredits, formatPercent, shortLabel } from "../shared/format";
-import { FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
+import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from "../shared/format";
+import { FAMILY_LABEL, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover, openCodeForkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
-import type { ZeroSubStore } from "./store";
+import { stoppedWaiting, type ZeroSubStore } from "./store";
 
 /** The most agents Paseo returns per page. */
 const PAGE_SIZE = 200;
@@ -157,9 +157,10 @@ function buttonFor(
   // A banked reset is worth offering right where the agent stopped, even with a single account.
   const resets = current.usage?.resets ?? null;
   const offerReset = resets !== null && (current.status === "limited" || resets.usableNow);
-  // With every account of this provider out, the work can carry on with the other provider.
-  const other: Family = family === "claude" ? "codex" : "claude";
+  // With every account of this provider out, the work can carry on with the other provider (Pi has none).
+  const other = OTHER_FAMILY[family];
   const offerFork =
+    other !== null &&
     current.status === "limited" &&
     accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
@@ -169,8 +170,15 @@ function buttonFor(
   const offerOpenCode = family === "claude" && state.openCodeAvailable;
   if (accounts.length < 2 && !(offerOpenCode || (current.status === "limited" && (offerReset || offerFork)))) return null;
 
-  const choose = (accountId: string | null) => async () => {
-    await store.rpc(setAgentAccount, { agentId: agent.id, accountId });
+  const choose = (accountId: string | null, to: string) => async () => {
+    const summary = await store.rpc(setAgentAccount, { agentId: agent.id, accountId }).catch((error: unknown) => {
+      // The move goes on without Paseo waiting for it, and the pill shows it under way.
+      if (stoppedWaiting(error)) return null;
+      throw error;
+    });
+    // Paseo shows what an action throws: here, that the agent couldn't be reloaded.
+    const problem = summary && moveProblem(summary, to);
+    if (problem) throw new Error(problem);
   };
 
   // Codex threads can't change accounts in place; continue in this task's tab for that account.
@@ -180,8 +188,13 @@ function buttonFor(
     id: `account-${index}`,
     title: account.id === current.id || movable ? menuTitle(account) : `Continue on ${account.label}`,
     icon: account.id === current.id ? "CircleCheck" : movable ? "Circle" : "ArrowRightLeft",
-    disabled: account.status === "signed_out" || account.status === "disabled" || account.id === current.id,
-    behavior: { kind: "action", onPress: choose(account.id) },
+    // With automatic switching on, an account at its limit would only pass the agent on (the server refuses it too).
+    disabled:
+      account.status === "signed_out" ||
+      account.status === "disabled" ||
+      (state.autoSwitch && account.status === "limited") ||
+      account.id === current.id,
+    behavior: { kind: "action", onPress: choose(account.id, account.label) },
   }));
   // When the agent is stuck on a limit, a way out is the most useful thing in the menu.
   const wayOut: PluginButtonMenuEntry[] = [];
@@ -196,7 +209,7 @@ function buttonFor(
     if (current.status === "limited") wayOut.push(entry);
     else items.push(entry);
   }
-  if (offerFork) {
+  if (offerFork && other) {
     wayOut.push({
       kind: "item",
       id: "fork-other",
@@ -230,7 +243,7 @@ function buttonFor(
       id: "follow-default",
       title: fallback ? `Follow default (${fallback.label})` : "Follow default",
       icon: "Undo2",
-      behavior: { kind: "action", onPress: choose(null) },
+      behavior: { kind: "action", onPress: choose(null, fallback?.label ?? "the default account") },
     });
   }
   items.push({
@@ -246,11 +259,10 @@ function buttonFor(
     },
   });
 
-  const pending = route?.pendingAccountId ? " (after this turn)" : "";
+  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
   return {
-    title: `Account: ${current.label}${current.email && current.email !== current.label ? ` (${current.email})` : ""}`,
+    ...pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart")),
     icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound",
-    label: `${shortLabel(current)}${pending}`,
     behavior: { kind: "menu", items },
   };
 }

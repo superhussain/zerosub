@@ -1,9 +1,11 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
+import { PiAdapter } from "./server/pi";
 import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
 import {
+  addApiAccount,
   cancelLogin,
   clearAccountLimit,
   getState,
@@ -12,14 +14,19 @@ import {
   renameAccount,
   setAgentAccount,
   setDefaultAccount,
+  setNextAgentAccount,
   setAccountEnabled,
   forkAgent,
+  importPiAccount,
+  setAccountProxy,
+  setPiHomesDir,
   startLogin,
   submitLoginCode,
+  updateApiAccount,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
-  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter() });
+  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter() });
 
   const settings = server.registerSettings(preferences);
   const applySettings = (state: PluginSettingsState<typeof preferences.schema>) => {
@@ -31,17 +38,20 @@ export default function contribute(server: PluginServerContext) {
   void service.start().catch((error: unknown) => console.error("[ZeroSub] startup failed; trying again in 30 s", describe(error)));
 
   // Never let routing break or stall an agent: on any error, or if it takes too long (Paseo fails
-  // a hook after 30s), the session simply opens on its usual login.
+  // a hook after 30s), the session simply opens on its usual login. Routing is told it was given
+  // up on, so it doesn't record an account the session never opened on.
   server.before("agent.session_open", async ({ request }, context) => {
+    const late = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<undefined>((resolve) => {
       timer = setTimeout(() => {
         console.error(`[ZeroSub] routing ${request.agentId} took too long; using the default login`);
+        late.abort();
         resolve(undefined);
       }, 15_000);
     });
     try {
-      return await Promise.race([service.onSessionOpen(request, context), deadline]);
+      return await Promise.race([service.onSessionOpen(request, context, late.signal), deadline]);
     } catch (error) {
       console.error(`[ZeroSub] could not route ${request.agentId}; using the default login`, describe(error));
       return undefined;
@@ -63,6 +73,16 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.archived", (event) => {
     void service.onAgentArchived(event.agent.id).catch(() => undefined);
   });
+  // Paseo 0.11 and later say when an agent closes, though the plugin SDK's types don't list it yet.
+  // An older Paseo refuses the event; agents then keep their record until their session next opens.
+  try {
+    const lifecycle = server as unknown as { on(name: "agent.closed", handler: (event: { agent: { id: string } }) => void): unknown };
+    lifecycle.on("agent.closed", (event) => {
+      void service.onAgentClosed(event.agent.id).catch(() => undefined);
+    });
+  } catch (error) {
+    console.error("[ZeroSub] this Paseo doesn't report closed agents", describe(error));
+  }
 
   server.handle(getState, ({ refreshUsage }, { paseo }) => service.view(paseo, refreshUsage));
   server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));
@@ -72,10 +92,11 @@ export default function contribute(server: PluginServerContext) {
     await service.rename(accountId, label);
     return { ok: true as const };
   });
-  server.handle(removeAccount, async ({ accountId }, { paseo }) => ({
-    ok: true as const,
-    movedAgents: await service.remove(paseo, accountId),
-  }));
+  server.handle(removeAccount, async ({ accountId }, { paseo }) => {
+    const { affected, moves } = await service.remove(paseo, accountId);
+    return { ok: true as const, movedAgents: affected, moves };
+  });
+  server.handle(setNextAgentAccount, ({ accountId, enabled }) => service.setNextAgent(accountId, enabled));
   server.handle(setDefaultAccount, ({ accountId }, { paseo }) => service.setDefault(paseo, accountId));
   server.handle(clearAccountLimit, async ({ accountId }) => {
     await service.clearLimit(accountId);
@@ -85,6 +106,14 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setAgentAccount, ({ agentId, accountId }, { paseo }) => service.setAgentAccount(paseo, agentId, accountId));
   server.handle(forkAgent, ({ agentId, destination }, { paseo }) => service.forkAgent(paseo, agentId, destination));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
+  server.handle(addApiAccount, async (input) => ({ accountId: await service.addApiAccount(input) }));
+  server.handle(updateApiAccount, async ({ accountId, ...input }) => {
+    await service.updateApiAccount(accountId, input);
+    return { ok: true as const };
+  });
+  server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
+  server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
+  server.handle(importPiAccount, async ({ path }) => ({ accountId: await service.importPiAccount(path) }));
 
   return async () => {
     stopSettings();

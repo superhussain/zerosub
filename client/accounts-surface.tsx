@@ -3,8 +3,8 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, formatAge, formatCredits, formatPlan, staleNotice, usageSummary } from "../shared/format";
-import { FAMILY_LABEL, type AccountView, type Family } from "../shared/model";
+import { accountSubtitle, describeReopen, formatAge, formatCredits, formatPlan, staleNotice, usageSummary } from "../shared/format";
+import { FAMILIES, FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
   clearAccountLimit,
@@ -12,12 +12,13 @@ import {
   renameAccount,
   setAccountEnabled,
   setDefaultAccount,
-  type ReopenSummary,
+  setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
 import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
+import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
-import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
+import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
 
 type Theme = PluginSurfaceProps["theme"];
@@ -44,7 +45,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   // Keep usage moving while the screen is open.
   useEffect(() => store.watch(VISIBLE_POLL_MS), [store]);
 
-  const families: Family[] = ["claude", "codex"];
+  // Pi shows once its CLI login is registered (Pi is installed where the daemon runs) or an account of it was added.
+  const families = FAMILIES.filter((family) => family !== "pi" || state?.accounts.some((account) => account.family === "pi"));
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
       <ScrollView
@@ -75,8 +77,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ) : null}
           </View>
           <Text style={text.muted}>
-            Keep several Claude and ChatGPT accounts signed in. Each agent uses one; when an account
-            hits its limit, agents move to another and keep going.
+            Keep several Claude and ChatGPT accounts signed in, and run Pi on several Anthropic API keys. Each
+            agent uses one; when an account hits its limit, agents move to another and keep going.
           </Text>
         </View>
 
@@ -121,6 +123,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
                 key={family}
                 family={family}
                 accounts={state.accounts.filter((account) => account.family === family)}
+                state={state}
                 theme={theme}
                 compact={layout.compact}
                 store={store}
@@ -133,7 +136,9 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
         <AutomationSettings theme={theme} />
       </ScrollView>
 
-      {adding ? (
+      {adding?.family === "pi" ? (
+        <AddPiAccountModal theme={theme} store={store} onClose={() => setAdding(null)} />
+      ) : adding ? (
         <AddAccountModal
           theme={theme}
           layout={layout}
@@ -213,9 +218,12 @@ function HostScope({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
+const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi" };
+
 function FamilySection({
   family,
   accounts,
+  state,
   theme,
   compact,
   store,
@@ -224,6 +232,7 @@ function FamilySection({
 }: {
   family: Family;
   accounts: AccountView[];
+  state: StateView;
   theme: Theme;
   compact: boolean;
   store: ZeroSubStore;
@@ -235,14 +244,14 @@ function FamilySection({
     <View style={{ gap: 10 }}>
       <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
         <Text style={text.heading} accessibilityRole="header">
-          {family === "claude" ? "Claude" : "ChatGPT (Codex)"}
+          {SECTION_TITLE[family]}
         </Text>
         <Button
           theme={theme}
           icon="Plus"
           label={compact ? "Add" : "Add account"}
           accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
-          tooltip={`Sign in another ${FAMILY_LABEL[family]} account`}
+          tooltip={family === "pi" ? "Add a Pi account with an Anthropic API key and its own proxy" : `Sign in another ${FAMILY_LABEL[family]} account`}
           tooltipAlign="end"
           onPress={onAdd}
         />
@@ -250,6 +259,7 @@ function FamilySection({
       {accounts.length === 0 ? (
         <Text style={text.muted}>No {FAMILY_LABEL[family]} accounts yet.</Text>
       ) : null}
+      {family === "pi" ? <PiSectionNotes theme={theme} state={state} accounts={accounts} store={store} /> : null}
       {chunk(accounts, compact ? 1 : 2).map((row) => (
         <View key={row.map((account) => account.id).join()} style={{ flexDirection: "row", gap: 10 }}>
           {row.map((account) => (
@@ -281,8 +291,12 @@ function AccountCard({
 }) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | null>(null);
+  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "next" | null>(null);
   const [renaming, setRenaming] = useState(false);
+  const [editingApi, setEditingApi] = useState(false);
+  const [editingProxy, setEditingProxy] = useState(false);
+  const api = account.auth === "api";
+  const details = piCardDetails(account);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
@@ -308,9 +322,10 @@ function AccountCard({
         result.stayed > 0
           ? ` · ${result.stayed} ChatGPT conversation${result.stayed === 1 ? " stays" : "s stay"} on it (they can't change accounts)`
           : "";
-      toast.show(`${message}${stayed}`, { variant: "success", durationMs: 5_000 });
+      toast.show(`${message}${stayed}`, { variant: result.failed.length > 0 ? "warning" : "success", durationMs: 5_000 });
     } catch (error) {
-      toast.error(describe(error));
+      if (stoppedWaiting(error)) toast.show(stillMoving(account.label), { variant: "info", durationMs: 5_000 });
+      else toast.error(describe(error));
     } finally {
       setBusy(null);
     }
@@ -320,7 +335,22 @@ function AccountCard({
     setBusy("default");
     try {
       const summary = await store.rpc(setDefaultAccount, { accountId: account.id });
-      toast.show(describeReopen(`${account.label} is now the default`, summary), { variant: "success" });
+      toast.show(describeReopen(`${account.label} is now the default`, summary), { variant: summary.failed.length > 0 ? "warning" : "success" });
+      await store.refresh();
+    } catch (error) {
+      if (stoppedWaiting(error)) toast.show(stillMoving(account.label), { variant: "info", durationMs: 5_000 });
+      else toast.error(describe(error));
+    } finally {
+      setBusy(null);
+    }
+  }, [account, store, toast]);
+
+  const nextAgent = useCallback(async () => {
+    setBusy("next");
+    const enabled = !account.nextAgentUntil;
+    try {
+      await store.rpc(setNextAgentAccount, { accountId: account.id, enabled });
+      toast.show(enabled ? `Your next new agent starts on ${account.label} (for the next 10 minutes)` : "Next new agent: back to the default", { variant: "success" });
       await store.refresh();
     } catch (error) {
       toast.error(describe(error));
@@ -346,15 +376,25 @@ function AccountCard({
     setBusy("remove");
     try {
       const result = await store.rpc(removeAccount, { accountId: account.id });
-      toast.show(
-        result.movedAgents > 0
-          ? `Removed ${account.label}; ${result.movedAgents} agent(s) moved to the default account`
-          : `Removed ${account.label}`,
-        { variant: "success" },
-      );
+      const removed = `Removed ${account.label}`;
+      // An older server only says how many agents ran on it, not how moving them went.
+      const message = result.moves
+        ? describeReopen(removed, result.moves)
+        : result.movedAgents > 0
+          ? `${removed}; ${result.movedAgents} agent(s) move off it`
+          : removed;
+      toast.show(message, { variant: result.moves?.failed.length ? "warning" : "success" });
       await store.refresh();
     } catch (error) {
-      toast.error(describe(error));
+      if (stoppedWaiting(error)) {
+        toast.show(`Still removing ${account.label} and moving its agents off it. Their timelines say when each has switched.`, {
+          variant: "info",
+          durationMs: 5_000,
+        });
+        void store.refresh();
+      } else {
+        toast.error(describe(error));
+      }
     } finally {
       setBusy(null);
       setConfirmRemove(false);
@@ -388,6 +428,21 @@ function AccountCard({
               onPress={() => void markAvailable()}
             />
           ) : null}
+          {/* A pick waiting here can always be canceled, whatever has become of the account since. */}
+          {account.nextAgentUntil || (!signedOut && !disabled) ? (
+            <IconButton
+              theme={theme}
+              icon={account.nextAgentUntil ? "CircleX" : "SquarePlus"}
+              label={account.nextAgentUntil ? "Cancel: next new agent goes back to the default" : "Use for the next new agent"}
+              tooltip={
+                account.nextAgentUntil
+                  ? "Your next new agent starts here. Click to cancel"
+                  : "Next new agent: the next agent you start (new workspace or tab) uses this account, once"
+              }
+              busy={busy === "next"}
+              onPress={() => void nextAgent()}
+            />
+          ) : null}
           {!account.isDefault && !signedOut && !disabled ? (
             <IconButton
               theme={theme}
@@ -398,25 +453,40 @@ function AccountCard({
               onPress={() => void makeDefault()}
             />
           ) : null}
-          <IconButton
-            theme={theme}
-            icon={disabled ? "CirclePlay" : "CirclePause"}
-            label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
-            tooltip={
-              disabled
-                ? "Enable: agents can use this account again"
-                : "Disable for now: agents stop using it and move to your other accounts"
-            }
-            busy={busy === "toggle"}
-            onPress={() => void toggle()}
-          />
+          {/* No Pi account stands in for another, so one can't be disabled (see setAccountEnabled). */}
+          {account.family === "pi" && !disabled ? null : (
+            <IconButton
+              theme={theme}
+              icon={disabled ? "CirclePlay" : "CirclePause"}
+              label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
+              tooltip={
+                disabled
+                  ? "Enable: agents can use this account again"
+                  : "Disable for now: agents stop using it and move to your other accounts"
+              }
+              busy={busy === "toggle"}
+              onPress={() => void toggle()}
+            />
+          )}
+          {account.apiEditable ? (
+            <IconButton theme={theme} icon="KeyRound" label="API settings" tooltip="API settings: key and base URL" onPress={() => setEditingApi(true)} />
+          ) : null}
+          {account.proxyEditable ? (
+            <IconButton theme={theme} icon="Globe" label="Proxy" tooltip="Proxy: the network this account uses" onPress={() => setEditingProxy(true)} />
+          ) : null}
           <IconButton theme={theme} icon="Pencil" label="Rename" tooltip="Rename this account" onPress={() => setRenaming(true)} />
           {account.kind !== "main" ? (
             <IconButton
               theme={theme}
               icon="Trash2"
               label="Remove"
-              tooltip="Remove: sign it out and delete its saved login"
+              tooltip={
+                account.externalHome
+                  ? "Remove from ZeroSub only: its folder, key and script stay"
+                  : api
+                    ? "Remove: delete its saved key"
+                    : "Remove: sign it out and delete its saved login"
+              }
               tone="danger"
               busy={busy === "remove"}
               onPress={() => setConfirmRemove(true)}
@@ -429,15 +499,31 @@ function AccountCard({
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
+        {api ? <Badge theme={theme} label="API" /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
 
+      {details ? (
+        <Text selectable style={[text.small, faded]} numberOfLines={3}>
+          {details}
+        </Text>
+      ) : null}
+      {account.moving ? (
+        <Text style={[account.moving.error ? text.danger : text.small, faded]}>
+          {account.moving.error
+            ? `Couldn't move its folder to ${account.moving.to}: ${account.moving.error}`
+            : `Moving its folder to ${account.moving.to}${account.moving.waiting ? `: ${account.moving.waiting}` : "…"}`}
+        </Text>
+      ) : null}
+
       <View style={[{ gap: 10 }, faded]}>
         {signedOut ? (
-          <Text style={text.small}>Sign in again to use this account.</Text>
+          <Text style={text.small}>{api ? "The key was refused. Enter a working one to use this account." : "Sign in again to use this account."}</Text>
+        ) : api ? (
+          <Text style={text.small}>Billed per use · used only as the default or when picked for an agent</Text>
         ) : windows.length > 0 ? (
           windows.map((limit) => <UsageBar key={limit.id} theme={theme} limit={limit} />)
         ) : (
@@ -472,11 +558,11 @@ function AccountCard({
             theme={theme}
             size="small"
             tone="primary"
-            icon="LogIn"
-            label="Sign in"
-            tooltip="Sign this account in again"
+            icon={api ? "KeyRound" : "LogIn"}
+            label={api ? "Fix key" : "Sign in"}
+            tooltip={api ? "Enter a working key for this account" : "Sign this account in again"}
             tooltipAlign="end"
-            onPress={onSignIn}
+            onPress={api ? () => setEditingApi(true) : onSignIn}
           />
         ) : disabled ? (
           <Button
@@ -525,12 +611,18 @@ function AccountCard({
       {renaming ? (
         <RenameModal theme={theme} account={account} store={store} onClose={() => setRenaming(false)} />
       ) : null}
+      {editingApi ? <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} /> : null}
+      {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
           <Text style={text.body}>
-            {account.family === "claude"
-              ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
-              : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
+            {account.externalHome
+              ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""}, its key${account.launcher ? ` and its terminal script ${account.launcher}` : ""} stay as they are, and you can add it back from Add account. Agents using it move to the default account; their conversations are kept.`
+              : account.family === "pi"
+                ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
+                : account.family === "claude"
+                  ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
+                  : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
@@ -539,7 +631,13 @@ function AccountCard({
               tone="danger"
               icon="Trash2"
               label="Remove"
-              tooltip="Sign it out and delete its saved login; its agents move to the default"
+              tooltip={
+                account.externalHome
+                  ? "Remove it from ZeroSub only; its agents move to the default"
+                  : api
+                    ? "Delete its saved key; its agents move to the default"
+                    : "Sign it out and delete its saved login; its agents move to the default"
+              }
               tooltipAlign="end"
               busy={busy === "remove"}
               onPress={() => void remove()}
@@ -723,13 +821,9 @@ function AutomationSettings({ theme }: { theme: Theme }) {
   );
 }
 
-export function describeReopen(prefix: string, summary: ReopenSummary): string {
-  const parts = [prefix];
-  if (summary.continuedIn) parts.push(`continuing in “${summary.continuedIn.title}”`);
-  if (summary.reopened.length > 0) parts.push(`${summary.reopened.length} agent(s) switched`);
-  if (summary.deferred.length > 0) parts.push(`${summary.deferred.length} will switch after their current turn`);
-  if (summary.failed.length > 0) parts.push(`${summary.failed.length} will switch on their next restart`);
-  return parts.join(" · ");
+/** Paseo stopped waiting for a change that moves agents; the daemon carries on with it. */
+function stillMoving(label: string): string {
+  return `Still moving agents for ${label}. Their timelines say when each has switched.`;
 }
 
 function chunk<T>(items: T[], size: number): T[][] {

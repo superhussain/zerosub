@@ -1,4 +1,5 @@
-import type { AccountView, Credits, UsageWindow } from "./model";
+import type { AccountView, AgentRoute, Credits, Egress, UsageWindow } from "./model";
+import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
 export function formatResetIn(resetsAt: string | null, now: number = Date.now()): string | null {
@@ -90,6 +91,54 @@ export function shortLabel(account: Pick<AccountView, "label">, max = 18): strin
   return label.length <= max ? label : `${label.slice(0, max - 1)}…`;
 }
 
+const MOVES_WHEN: Record<NonNullable<AgentRoute["waiting"]>, string> = {
+  idle: "once it's idle",
+  turn: "when its current turn ends",
+  background: "once the background work it left running stops",
+  restart: "when its session next starts",
+};
+
+/**
+ * A composer pill's label and tooltip for an agent routed to `account`. While its session still
+ * runs on another account, both are named, so the pill never claims an account the agent isn't
+ * using yet, and the tooltip says when the move happens.
+ */
+export function pillText(
+  account: Pick<AccountView, "label" | "email">,
+  running: Pick<AccountView, "label"> | null,
+  waiting: AgentRoute["waiting"],
+): { label: string; title: string } {
+  const named = `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}`;
+  if (!running) return { label: shortLabel(account), title: `Account: ${named}` };
+  return {
+    label: `${shortLabel(running, 12)} → ${shortLabel(account, 12)}`,
+    title: `Account: ${running.label}, moving to ${named} ${MOVES_WHEN[waiting ?? "idle"]}`,
+  };
+}
+
+/** What moving agents came to, after `prefix`: "work is now the default · 2 agent(s) switched · …". */
+export function describeReopen(prefix: string, summary: ReopenSummary): string {
+  const parts = [prefix];
+  if (summary.continuedIn) parts.push(`continuing in “${summary.continuedIn.title}”`);
+  if (summary.reopened.length > 0) parts.push(`${summary.reopened.length} agent(s) switched`);
+  if (summary.pending.length > 0) parts.push(`${summary.pending.length} still switching (their timelines will say when)`);
+  if (summary.deferred.length > 0) parts.push(`${summary.deferred.length} will switch after their current turn`);
+  if (summary.failed.length > 0) parts.push(`${summary.failed.length} couldn't be reloaded and will switch when their session next starts`);
+  return parts.join(" · ");
+}
+
+/** Why moving one agent to `to` didn't happen now, for its account button and `/account`; null when it did or will by itself. */
+export function moveProblem(summary: ReopenSummary, to: string): string | null {
+  const failed = summary.failed[0];
+  if (!failed) return null;
+  return `Couldn't reload this agent onto ${to} (${failed.error.replace(/\.$/, "")}), so it moves when its session next starts.`;
+}
+
+/** Why an agent can't be moved onto an account at its limit while automatic switching is on. */
+export function limitedPick(label: string): string {
+  return `${label} is at its limit, and with automatic switching on the agent would move straight off it again. Pick another account, or mark ${label} as available again on its card in Accounts if it has room.`;
+}
+
 /** One line summarising an account's headroom, e.g. "42% of 5-hour used · resets in 2h". */
 /**
  * The line under an account's name: its email, plus its organization when that adds something.
@@ -111,6 +160,18 @@ export function formatAge(at: string, now: number = Date.now()): string {
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.round(minutes / 60);
   return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
+/** How old an address may get before it says so: checks run every half hour. */
+const EGRESS_FRESH_MS = 60 * 60_000;
+
+/** "IP: 203.0.113.7 (US)", with its age once that's an hour; null before the first check. */
+export function egressText(egress: Egress | null, now: number = Date.now()): string | null {
+  if (!egress) return null;
+  if (!egress.ip) return egress.error ? "IP: couldn't check" : null;
+  const old = egress.checkedAt && now - Date.parse(egress.checkedAt) >= EGRESS_FRESH_MS ? formatAge(egress.checkedAt, now) : null;
+  const notes = [egress.country, old].filter(Boolean).join(", ");
+  return `IP: ${egress.ip}${notes ? ` (${notes})` : ""}`;
 }
 
 export function usageSummary(account: AccountView, now: number = Date.now()): string | null {
