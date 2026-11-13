@@ -45,7 +45,7 @@ import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent
 import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
-import { reapLeftovers } from "./leftovers";
+import { reapLeftovers, type AgentLookup } from "./leftovers";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode, withinMode } from "./modes";
@@ -571,22 +571,26 @@ export class Service {
     const { agents, complete } = await listAgents(paseo, true);
     if (!complete) return;
     const known = new Map(agents.map((agent) => [agent.id, { archived: agent.archived, status: agent.status }]));
-    for (const { pid, agentId, reason } of await reapLeftovers(known, { resolve: (id) => this.lookUpAgent(paseo, id) })) {
+    for (const { pid, agentId, reason } of await reapLeftovers(known, { resolve: this.lookUpAgent(paseo) })) {
       console.log(`[ZeroSub] stopped leftover Claude process ${pid} of agent ${agentId} (${reason}); Paseo had left it running`);
     }
   }
 
   /** An agent Paseo's list left out (background workspaces): its status, `"gone"` if Paseo doesn't know it or it's an internal helper, `null` when there's no answer yet. */
-  private async lookUpAgent(paseo: PaseoApi, id: string): Promise<{ archived: boolean; status: string } | "gone" | null> {
-    const agent = await paseo.agents
-      .ref(id)
-      .refresh()
-      .then((result) => result?.agent ?? null)
-      .catch((error: unknown) => (/Agent not found/.test(describe(error)) ? null : undefined));
-    if (agent === undefined) return null;
-    if (agent === null || (agent as { internal?: boolean }).internal) return "gone";
-    const { archived, status } = toAgentInfo(agent);
-    return { archived, status };
+  private lookUpAgent(paseo: PaseoApi): AgentLookup {
+    return async (id) => {
+      const agent = await paseo.agents
+        .ref(id)
+        .refresh()
+        .then((result) => result?.agent ?? null)
+        // Paseo 0.9 and 0.10 answer an ID they don't know (their own helpers' included) with an error
+        // rather than no agent. Any other error means no answer yet.
+        .catch((error: unknown) => (/Agent not found/.test(describe(error)) ? null : undefined));
+      if (agent === undefined) return null;
+      if (agent === null || (agent as { internal?: boolean }).internal) return "gone";
+      const { archived, status } = toAgentInfo(agent);
+      return { archived, status };
+    };
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {
@@ -662,15 +666,9 @@ export class Service {
         .map(([id]) => id),
     );
     const gone = new Set<string>();
+    const lookUp = this.lookUpAgent(paseo);
     for (const id of unlisted) {
-      const agent = await paseo.agents
-        .ref(id)
-        .refresh()
-        .then((result) => result?.agent ?? null)
-        // Paseo 0.9 and 0.10 answer an ID they don't know (their own helpers' included) with an error
-        // rather than no agent. Any other error means no answer yet.
-        .catch((error: unknown) => (/Agent not found/.test(describe(error)) ? null : undefined));
-      if (agent === null || (agent && (agent as { internal?: boolean }).internal)) gone.add(id);
+      if ((await lookUp(id)) === "gone") gone.add(id);
     }
     const staleSessions = Object.entries(state.sessions).filter(([id, session]) => gone.has(id) && old(session.openedAt));
     const staleBindings = Object.entries(state.bindings).filter(([id, binding]) => gone.has(id) && old(binding.at));

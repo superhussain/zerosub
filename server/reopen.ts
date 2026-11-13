@@ -42,10 +42,13 @@ export function hostCanReload(paseo: ReopenHost | null | undefined): boolean {
 export class Reopener {
   private cli: { at: number; path: Promise<string | null> } | null = null;
 
+  /** `find` looks for the CLI; tests pass their own so a host's real CLI never runs. */
+  constructor(private readonly find: () => Promise<string | null> = () => findCli()) {}
+
   /** Path to the CLI, or null when none can be found (looked for again every few minutes). */
   async locate(): Promise<string | null> {
     if (this.cli && (Date.now() - this.cli.at < 5 * 60_000 || (await this.cli.path) !== null)) return this.cli.path;
-    this.cli = { at: Date.now(), path: findCli() };
+    this.cli = { at: Date.now(), path: this.find() };
     return this.cli.path;
   }
 

@@ -28,6 +28,7 @@ export interface AgentStatus {
 export const MIN_AGE_MS = 60_000;
 export const UNKNOWN_AGE_MS = 600_000;
 export const SUPERSEDED_GAP_MS = 30_000;
+export const START_TOLERANCE_MS = 2_000;
 
 const PS_TIMEOUT_MS = 10_000;
 
@@ -106,9 +107,14 @@ async function agentIdOf(pid: number): Promise<string | null> {
   return agentIdFrom(text);
 }
 
-async function listProcesses(): Promise<ProcessRow[] | null> {
+async function listProcesses(): Promise<{ rows: ProcessRow[]; at: number } | null> {
   const result = await run("ps", ["-A", "-ww", "-o", "pid=,ppid=,etime=,args="], { timeoutMs: PS_TIMEOUT_MS });
-  return result.code === 0 ? parsePs(result.stdout) : null;
+  return result.code === 0 ? { rows: parsePs(result.stdout), at: Date.now() } : null;
+}
+
+/** Whether two listings show the same process: same pid, started within `START_TOLERANCE_MS` (ps etime has 1 s steps). */
+export function sameProcess(before: ProcessRow, beforeAt: number, after: ProcessRow, afterAt: number): boolean {
+  return before.pid === after.pid && Math.abs(beforeAt - before.ageMs - (afterAt - after.ageMs)) <= START_TOLERANCE_MS;
 }
 
 function signal(pid: number, name: NodeJS.Signals): void {
@@ -124,7 +130,9 @@ export type AgentLookup = (agentId: string) => Promise<AgentStatus | "gone" | nu
 
 /**
  * Stops the leftover Claude session processes of Paseo's daemon, with their descendants: SIGTERM,
- * then SIGKILL for any that outlast `graceMs`. Stops nothing when `ps` fails.
+ * then SIGKILL for any that outlast `graceMs`, matched by pid and start time so a child moved under pid 1 is still caught.
+ * Stops nothing when `ps` fails.
+ * Codex app-server processes are left alone: Paseo starts one per session at a time and tree-kills it on close.
  */
 export async function reapLeftovers(
   agents: ReadonlyMap<string, AgentStatus>,
@@ -132,8 +140,9 @@ export async function reapLeftovers(
 ): Promise<Leftover[]> {
   if (process.platform !== "darwin" && process.platform !== "linux") return [];
   const daemonPids = (options.daemonPids ?? [process.ppid, process.pid]).filter((pid) => pid !== 1);
-  const rows = await listProcesses();
-  if (!rows) return [];
+  const listing = await listProcesses();
+  if (!listing) return [];
+  const { rows } = listing;
   const sessions: SessionProcess[] = [];
   for (const row of rows) {
     if (!daemonPids.includes(row.ppid) || !isClaudeSession(row.args)) continue;
@@ -160,7 +169,7 @@ export async function reapLeftovers(
   const after = await listProcesses();
   for (const pid of targets) {
     const before = rows.find((row) => row.pid === pid);
-    if (after?.some((row) => row.pid === pid && row.ppid === before?.ppid)) signal(pid, "SIGKILL");
+    if (before && after?.rows.some((row) => sameProcess(before, listing.at, row, after.at))) signal(pid, "SIGKILL");
   }
   return leftovers;
 }
