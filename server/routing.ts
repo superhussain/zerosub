@@ -74,7 +74,7 @@ export function headroomScore(usage: Usage | null | undefined, now = Date.now())
 }
 
 /** The 5-hour window: Codex says how long its windows are, Claude's is known by id. */
-function fiveHourWindow(usage: Usage): UsageWindow | undefined {
+export function fiveHourWindow(usage: Usage): UsageWindow | undefined {
   return usage.windows.find((window) => window.minutes === FIVE_HOUR_MINUTES) ??
     usage.windows.find((window) => window.minutes == null && (window.id === "five_hour" || window.id === "primary"));
 }
@@ -104,7 +104,7 @@ export interface PaceScore {
   gated: boolean;
 }
 
-function weeklyWindow(usage: Usage): UsageWindow | undefined {
+export function weeklyWindow(usage: Usage): UsageWindow | undefined {
   return usage.windows.find((window) => window.minutes === WEEK_MINUTES) ??
     usage.windows.find((window) => window.minutes == null && (window.id === "seven_day" || window.id === "secondary"));
 }

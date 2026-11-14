@@ -112,9 +112,16 @@ async function listProcesses(): Promise<{ rows: ProcessRow[]; at: number } | nul
   return result.code === 0 ? { rows: parsePs(result.stdout), at: Date.now() } : null;
 }
 
-/** Whether two listings show the same process: same pid, started within `START_TOLERANCE_MS` (ps etime has 1 s steps). */
+/**
+ * Whether two listings show the same process: same pid, started within `START_TOLERANCE_MS` (ps etime
+ * has 1 s steps), and the same parent, or init (1) once SIGTERM left it orphaned.
+ */
 export function sameProcess(before: ProcessRow, beforeAt: number, after: ProcessRow, afterAt: number): boolean {
-  return before.pid === after.pid && Math.abs(beforeAt - before.ageMs - (afterAt - after.ageMs)) <= START_TOLERANCE_MS;
+  return (
+    before.pid === after.pid &&
+    Math.abs(beforeAt - before.ageMs - (afterAt - after.ageMs)) <= START_TOLERANCE_MS &&
+    (after.ppid === before.ppid || after.ppid === 1)
+  );
 }
 
 function signal(pid: number, name: NodeJS.Signals): void {
