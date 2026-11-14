@@ -1783,7 +1783,8 @@ export class Service {
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
         let move: { account: StoredAccount; pin: boolean } | undefined;
         if (reason === "pacing") {
-          if (!this.paced(findAccount(latest, accountId), now)) return;
+          // Turning either preference off stops a pass that's already running.
+          if (!this.prefs.balanceNewAgents || !this.prefs.autoSwitch || !this.paced(findAccount(latest, accountId), now)) return;
           const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), this.pacing(now));
           if (!next || paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) return;
           move = { account: next, pin: true };
