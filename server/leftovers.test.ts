@@ -42,11 +42,12 @@ describe("parsing", () => {
     expect(isClaudeSession("node --output-format stream-json --input-format stream-json")).toBe(false);
   });
 
-  it("sameProcess matches pid and start time", () => {
+  it("sameProcess matches pid, start time and parent", () => {
     const before = { pid: 4102, ppid: 4101, ageMs: 10_000, args: "" };
     expect(sameProcess(before, 1_000_000, { ...before, ppid: 1, ageMs: 15_400 }, 1_005_000)).toBe(true);
     expect(sameProcess(before, 1_000_000, { ...before, ageMs: 1_000 }, 1_005_000)).toBe(false);
     expect(sameProcess(before, 1_000_000, { ...before, pid: 4103, ageMs: 15_400 }, 1_005_000)).toBe(false);
+    expect(sameProcess(before, 1_000_000, { ...before, ppid: 999, ageMs: 15_400 }, 1_005_000)).toBe(false);
   });
 });
 
