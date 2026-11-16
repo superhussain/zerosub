@@ -95,6 +95,21 @@ describe("OpenCodeForkRows and ForkDestinationRows", () => {
     expect(row.props.label).toBe("Fork a stopped Claude chat to");
   });
 
+  it("says OpenCode uses no account when the destination is OpenCode", () => {
+    const row = ForkDestinationRows({ values: values({ claudeForkDestination: "opencode" }), saving: false, onSave: () => undefined }) as unknown as Row;
+    expect(row.props.hint).toBe(
+      "Applies when every Claude account is out. OpenCode uses no ZeroSub account. OpenCode runs this host's permission policy, so Build can edit files and run shell without asking. That can allow more than Claude does.",
+    );
+  });
+
+  it("shows only the no-models row when the catalog is empty", async () => {
+    catalog = [];
+    await render();
+    const rows = rowsOf(OpenCodeForkRows({ values: values(), saving: false, onSave: () => undefined }));
+    expect(rows.find((row) => row.props.label === "OpenCode model")?.props.hint).toBe("This host's OpenCode reported no models.");
+    expect(rows.some((row) => row.props.label === "OpenCode thinking")).toBe(false);
+  });
+
   it("shows the read error, not an empty catalog, when listModels reports one", async () => {
     catalogError = "daemon unreachable";
     await render();
@@ -110,7 +125,9 @@ describe("OpenCodeForkRows and ForkDestinationRows", () => {
     const model = byLabel("OpenCode model");
     expect(destination.props.disabled).toBe(true);
     expect(model.props.disabled).toBe(false);
-    expect(model.props.hint).toBe("Used by Continue on OpenCode in the account menu, and by the automatic fork when its destination is OpenCode.");
+    expect(model.props.hint).toBe(
+      "Used by Continue on OpenCode in the account menu, and by the automatic fork when its destination is OpenCode. OpenCode uses no ZeroSub account.",
+    );
     expect(model.props.options).toContainEqual({ label: "Host default", value: "" });
     // The host marks a default, so its thinking options are listed and pickable.
     const thinking = byLabel("OpenCode thinking");

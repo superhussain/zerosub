@@ -37,7 +37,7 @@ export function ForkDestinationRows({
       label="Fork a stopped Claude chat to"
       hint={
         values.claudeForkDestination === "opencode"
-          ? "Applies when every Claude account is out. OpenCode runs this host's permission policy, so Build can edit files and run shell without asking. That can allow more than Claude does."
+          ? "Applies when every Claude account is out. OpenCode uses no ZeroSub account. OpenCode runs this host's permission policy, so Build can edit files and run shell without asking. That can allow more than Claude does."
           : "Applies when every Claude account is out. ChatGPT uses the account with the most room left."
       }
       value={values.claudeForkDestination}
@@ -110,7 +110,7 @@ export function OpenCodeForkRows({
           ? "That model is no longer in this host's catalog; pick another."
           : !hostDefault && !values.forkOpenCodeModel
             ? "This host marks no OpenCode default; pick a model."
-            : "Used by Continue on OpenCode in the account menu, and by the automatic fork when its destination is OpenCode."
+            : "Used by Continue on OpenCode in the account menu, and by the automatic fork when its destination is OpenCode. OpenCode uses no ZeroSub account."
       }
       value={values.forkOpenCodeModel}
       options={[
