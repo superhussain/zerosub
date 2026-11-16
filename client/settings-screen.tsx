@@ -133,7 +133,7 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             onValueChange={(useCredits) => save({ useCredits })}
           />
           <SettingsSwitch
-            label="When every account is out, fork the chat to the other provider"
+            label="When every account is out, continue the chat in a new agent"
             hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
             value={settings.values.forkOtherProvider}
             disabled={settings.saving || !settings.values.autoSwitch}
