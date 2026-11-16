@@ -54,7 +54,92 @@ export function shortenEarlierHandOff(text: string): string {
   return `${neutralise(text.slice(0, open))}${OPEN}\n${kept}\n${CLOSE}${neutralise(after)}`;
 }
 
-function describeTool(item: Extract<AgentTimelineItem, { type: "tool_call" }>): string {
+type ToolCallItem = Extract<AgentTimelineItem, { type: "tool_call" }>;
+
+interface ParsedAgentMessage {
+  event: string;
+  sender: string | null;
+  text: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatSender(sender: unknown): string | null {
+  if (!isRecord(sender) || typeof sender.id !== "string" || !sender.id.trim()) return null;
+  const id = sender.id.trim();
+  const title = typeof sender.title === "string" ? sender.title.trim() : "";
+  return title && title !== id ? `${title} (${id})` : id;
+}
+
+/**
+ * Since Paseo 0.11.1, a prompt or finish notification from another agent is projected as an
+ * `agent_message` tool call (`paseo-agent-message:…`) rather than a `user_message`.
+ */
+function readAgentMessage(item: ToolCallItem): ParsedAgentMessage | null {
+  if (isRecord(item.agentMessage) && typeof item.agentMessage.event === "string" && typeof item.agentMessage.text === "string") {
+    return {
+      event: item.agentMessage.event,
+      sender: formatSender(item.agentMessage.sender),
+      text: item.agentMessage.text,
+    };
+  }
+  if (
+    item.name === "agent_message" &&
+    item.callId.startsWith("paseo-agent-message:") &&
+    item.detail.type === "plain_text" &&
+    typeof item.detail.text === "string"
+  ) {
+    return { event: "message", sender: null, text: item.detail.text };
+  }
+  return null;
+}
+
+/** Paseo projects a schedule or heartbeat fire (`<paseo-system>…</paseo-system>`) as a `heartbeat` tool call. */
+function readHeartbeatPrompt(item: ToolCallItem): string | null {
+  if (
+    item.name === "heartbeat" &&
+    item.callId.startsWith("paseo-system:") &&
+    item.detail.type === "plain_text" &&
+    typeof item.detail.text === "string"
+  ) {
+    return item.detail.text;
+  }
+  return null;
+}
+
+/** Whether `item` is a prompt row that starts or steers a turn (human, another agent, or a schedule). */
+export function isTurnPrompt(item: AgentTimelineItem): boolean {
+  if (item.type === "user_message") return true;
+  if (item.type !== "tool_call") return false;
+  return readAgentMessage(item) !== null || readHeartbeatPrompt(item) !== null;
+}
+
+/**
+ * Task instructions sent into the conversation: a human message, a prompt from another agent
+ * (`create_agent` / `send_agent_prompt`), or a scheduled prompt. Child lifecycle notifications
+ * (`event !== "message"`) return `null` so they stay in progress updates rather than instructions.
+ */
+export function promptInstruction(item: AgentTimelineItem): string | null {
+  if (item.type === "user_message") return item.text;
+  if (item.type !== "tool_call") return null;
+  const agentMsg = readAgentMessage(item);
+  if (agentMsg) {
+    if (agentMsg.event !== "message") return null;
+    if (!agentMsg.text.trim()) return "";
+    return agentMsg.sender ? `From ${agentMsg.sender}:\n${agentMsg.text}` : agentMsg.text;
+  }
+  return readHeartbeatPrompt(item);
+}
+
+function describeTool(item: ToolCallItem): string {
+  const agentMsg = readAgentMessage(item);
+  if (agentMsg) {
+    const head = `[agent_message: ${agentMsg.event}${agentMsg.sender ? ` from ${agentMsg.sender}` : ""}]`;
+    const body = clip(neutralise(agentMsg.text), 2_000);
+    return body ? `${head}\n${body}` : head;
+  }
   const detail = item.detail;
   const failed = item.status === "failed" ? " (failed)" : "";
   switch (detail.type) {
@@ -77,38 +162,49 @@ function describeTool(item: Extract<AgentTimelineItem, { type: "tool_call" }>): 
   }
 }
 
+type Prompt = { speaker: string; text: string; index: number };
+
 /**
  * A readable account of what happened in a conversation, for a fresh agent to pick up from.
  * Keeps the opening request and the most recent history; drops reasoning and tool output.
  */
 export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MAX_TRANSCRIPT): string {
   const lines: string[] = [];
-  let firstUser: string | null = null;
-  let firstUserIndex: number | null = null;
-  let latestUser: string | null = null;
-  let latestUserIndex: number | null = null;
+  // Typed by assertion: recordPrompt assigns these, and TypeScript doesn't follow assignments in closures.
+  let first = null as Prompt | null;
+  let latest = null as Prompt | null;
   let todos: string | null = null;
   let todosIndex = 0;
+  // A user, agent or scheduled prompt is an instruction: the first stays at the top, the latest goes last.
+  const recordPrompt = (speaker: string, rawText: string) => {
+    // Clipping below can't then split a quoted pair: the prompt's own tags are the only ones.
+    const text = neutralise(shortenEarlierHandOff(rawText)).trim();
+    if (first === null && text) first = { speaker, text, index: lines.length };
+    latest = { speaker, text, index: lines.length };
+    lines.push(`${speaker}: ${text}`);
+  };
   for (const item of timeline) {
     switch (item.type) {
-      case "user_message": {
-        // Clipping below can't then split a quoted pair: the prompt's own tags are the only ones.
-        const text = neutralise(shortenEarlierHandOff(item.text));
-        if (firstUser === null) {
-          firstUser = text;
-          firstUserIndex = lines.length;
-        }
-        latestUser = text.trim();
-        latestUserIndex = lines.length;
-        lines.push(`User: ${latestUser}`);
+      case "user_message":
+        recordPrompt("User", item.text);
         break;
-      }
       case "assistant_message":
         if (item.text.trim()) lines.push(`Assistant: ${item.text.trim()}`);
         break;
-      case "tool_call":
+      case "tool_call": {
+        const agentMsg = readAgentMessage(item);
+        if (agentMsg?.event === "message") {
+          if (agentMsg.text.trim()) recordPrompt(agentMsg.sender ? `From ${agentMsg.sender}` : "Agent", agentMsg.text);
+          break;
+        }
+        const heartbeat = readHeartbeatPrompt(item);
+        if (heartbeat !== null) {
+          if (heartbeat.trim()) recordPrompt("Scheduled", heartbeat);
+          break;
+        }
         lines.push(describeTool(item));
         break;
+      }
       case "todo":
         todos = item.items.map((task) => `- [${task.completed ? "x" : " "}] ${task.text}`).join("\n");
         todosIndex = lines.length;
@@ -118,28 +214,28 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
     }
   }
   // The todo snapshot counts against `max`. Unclipped, it sits where the list last changed, so an
-  // instruction given after it stays after it. Clipped, the latest user instruction is lifted out
-  // and goes last, after the snapshot; when it is also the original request, it appears only there.
-  const onlyUser = latestUserIndex === firstUserIndex;
-  const label = onlyUser ? "User (original request and latest instruction)" : "User (latest instruction)";
+  // instruction given after it stays after it. Clipped, the latest instruction is lifted out and goes
+  // last, after the snapshot; when it is also the original request, it appears only there.
+  const onlyOne = latest?.index === first?.index;
   const todoSection = todos === null ? "" : `Task list at the time it stopped:\n${keepEnds(todos, Math.min(MAX_TODOS, Math.floor(max / 4)))}`;
-  const rest = latestUser !== null ? lines.filter((_, index) => index !== latestUserIndex) : lines;
+  const rest = latest !== null ? lines.filter((_, index) => index !== latest?.index) : lines;
   const body = lines.join("\n\n");
   if (body.length + todoSection.length <= max) {
     return [...lines.slice(0, todosIndex), todoSection, ...lines.slice(todosIndex)].filter(Boolean).join("\n\n");
   }
-  const head = firstUser && !onlyUser ? `User (original request): ${clip(firstUser, MAX_FIRST_MESSAGE)}` : "";
+  const head = first && !onlyOne ? `${first.speaker} (original request): ${clip(first.text, MAX_FIRST_MESSAGE)}` : "";
   const omitted = "[… earlier conversation omitted …]";
-  const latest = latestUser === null ? "" : `${label}: ${keepEnds(latestUser, MAX_FIRST_MESSAGE)}`;
+  const label = onlyOne ? "original request and latest instruction" : "latest instruction";
+  const last = latest === null ? "" : `${latest.speaker} (${label}): ${keepEnds(latest.text, MAX_FIRST_MESSAGE)}`;
   const progress = rest.join("\n\n");
-  const room = Math.max(0, max - [head, omitted, todoSection, latest].filter(Boolean).join("\n\n").length - 2);
+  const room = Math.max(0, max - [head, omitted, todoSection, last].filter(Boolean).join("\n\n").length - 2);
   let kept = progress;
   if (progress.length > room) {
     const tail = progress.slice(progress.length - room);
     const start = tail.indexOf("\n\n");
     kept = start >= 0 ? tail.slice(start + 2) : tail;
   }
-  return [head, omitted, kept, todoSection, latest].filter(Boolean).join("\n\n");
+  return [head, omitted, kept, todoSection, last].filter(Boolean).join("\n\n");
 }
 
 export function continuationPrompt(transcript: string, why: string, previous = "Codex"): string {

@@ -24,6 +24,7 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     apiEditable: false,
     proxy: null,
     proxyEditable: false,
+    proxyBlocked: null,
     inheritedProxy: null,
     proxyFile: null,
     proxyFollowers: [],
@@ -55,8 +56,10 @@ function commandCenter(accounts: AccountView[]) {
     openCodeAvailable: false,
     autoSwitch: true,
     warnings: [],
+    launchers: null,
     piLaunchers: null,
     piHomes: null,
+    claudeHomes: null,
   };
   const rpc = vi.fn(async () => ({ until: null }));
   const store = { current: { state, error: null, updatedAt: 0 }, subscribe: () => () => undefined, rpc, refresh: async () => undefined };

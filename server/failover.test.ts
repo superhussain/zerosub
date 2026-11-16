@@ -108,7 +108,7 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
 
 interface SetUpOptions {
   /** How `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
-  reload?: "works" | "fails" | "times out" | "fails after another";
+  reload?: "no session" | "works" | "fails" | "times out" | "fails after another";
   /** Runs when `paseo agent reload` starts, before Paseo asks where the new session opens. */
   reloading?: () => Promise<void>;
   /** Replaces parts of the Claude adapter. */
@@ -139,6 +139,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     locate: async () => "/usr/local/bin/paseo",
     reopen: async (id: string) => {
       reopened.push(id);
+      if (options.reload === "no session") return { ok: true as const };
       await options.reloading?.();
       await reopenedSession();
       if (options.reload === "fails after another") {
@@ -399,6 +400,23 @@ describe("when the CLI login changes hands", () => {
 });
 
 describe("failover", () => {
+  it("does not continue or claim a switch when a successful CLI never opens a session", async () => {
+    const { store, sent, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
+      { reload: "no session" },
+    );
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(sent).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "pending", continued: false });
+    expect(notes.at(-1)?.detail).toContain("did not open a new provider session");
+  });
+
   it("blames the CLI login for a session ZeroSub never routed, even when the agent is bound elsewhere", async () => {
     // Today's incident: the agent's session predates zerosub, and a switch to "hello" was waiting.
     const { store, reopened, sent, notes, limitTurn } = await setUp(
@@ -984,6 +1002,31 @@ describe("forking to the other provider", () => {
     expect(prompt.match(/User: Fix the build/g) ?? []).toHaveLength(1);
     expect(prompt).toContain("Step 45 done.");
     expect(prompt).toContain("User: Now run the linter");
+  });
+
+  it("carries an orchestrator's agent_message instructions when forking a sub-agent", async () => {
+    const lead = { id: "lead", provider: "claude", status: "idle", title: "Lead the release", workspaceId: "ws-1", archivedAt: null, labels: {} };
+    const agentPrompt = (id: string, text: string): AgentTimelineItem =>
+      ({
+        type: "tool_call",
+        callId: `paseo-agent-message:${id}`,
+        name: "agent_message",
+        status: "completed",
+        error: null,
+        agentMessage: { event: "message", sender: { id: "lead", title: "Lead the release" }, text },
+        detail: { type: "plain_text", text, icon: "bot" },
+      }) as AgentTimelineItem;
+    const conversation = [
+      ...inTurn("t0", agentPrompt("m1", "Implement the parser"), { type: "assistant_message", text: "Parser skeleton ready." }),
+      ...inTurn("t", agentPrompt("m2", "Now run the linter"), { type: "assistant_message", text: "You've hit your session limit · resets 3pm (UTC)" }),
+    ];
+    const { created, limitTurn } = await setUpFork("bypassPermissions", conversation, { "paseo.parent-agent-id": "lead" }, [lead]);
+    await limitTurn();
+    const prompt = created[0]?.prompt ?? "";
+    expect(prompt).toContain("From Lead the release (lead): Implement the parser");
+    expect(prompt).toContain("Assistant: Parser skeleton ready.");
+    expect(prompt).toContain("From Lead the release (lead): Now run the linter");
+    expect(prompt).not.toContain("[agent_message]");
   });
 
   describe("forking to OpenCode", () => {
@@ -2386,6 +2429,44 @@ describe("usage readings", () => {
     await service.refreshUsage(MAIN, true);
     expect(await limitedUntil(store)).toBeNull();
     expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  const fableFull = (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: 8, resetsAt: inFuture() },
+      { id: "seven_day", label: "Weekly", usedPercent: 73, resetsAt: inFuture() },
+      { id: "weekly_fable", label: "Weekly · Fable", usedPercent: 100, resetsAt: inFuture() },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+  });
+
+  it("clears a limit a reading took once the account's own windows have room, one model's window full or not", async () => {
+    // Saved by a version that took any full window for the account's: the account stayed blocked until Fable reset.
+    const { service, store, paseo } = await setUp(
+      state({ limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast(), limitSource: "reading" }),
+      unused,
+      { usage: fableFull },
+    );
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  it("leaves a limit a turn ran into while one model's window is full", async () => {
+    // The turn may have hit that model's limit: the account's room says nothing about it.
+    const { service, store, limitTurn } = await setUp(
+      state(),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
+      { usage: fableFull },
+    );
+    await limitTurn();
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
   });
 
   it("takes a full window without credits for a limit, whatever the setting", async () => {
@@ -4015,5 +4096,108 @@ describe("the account button's reason row", () => {
     });
     expect((await route())?.accountId).toBe(MAIN);
     expect((await route())?.selectionReason).toBeUndefined();
+  });
+});
+
+describe("an API account's refused key", () => {
+  const API = "claude-api";
+
+  it("marks the account and moves the agent to a subscription account", async () => {
+    const refused = () => "Invalid API key · Fix external API key";
+    const { store, reopened, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), { ...account(API, "gateway", "managed"), auth: "api" }] as never,
+        defaults: { claude: API, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: API, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: refused },
+    );
+    await limitTurn();
+    const state = await store.read();
+    // `claude auth status` would still say "logged in" for any key, so the refusal is what counts.
+    expect(state.accounts.find((a) => a.id === API)?.signedIn).toBe(false);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "gateway", to: "marketing", outcome: "switched" });
+  });
+
+  it("leaves a subscription account alone when its login still checks out", async () => {
+    const { store, reopened, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: () => "Not logged in · Please run /login" },
+    );
+    await limitTurn();
+    expect((await store.read()).accounts.find((a) => a.id === HELLO)?.signedIn).toBe(true);
+    expect(reopened).toEqual([]);
+  });
+});
+
+describe("forking to the other provider by hand", () => {
+  /** A ChatGPT agent out of room, and Claude accounts as given; the fork never gets as far as starting an agent. */
+  async function refusal(claude: Array<Record<string, unknown>>) {
+    const CODEX_MAIN = MAIN_ACCOUNT_ID.codex;
+    const store = new StateStore(join(root, "state.json"));
+    await store.update((draft) =>
+      Object.assign(draft, {
+        accounts: [{ ...account(CODEX_MAIN, "hello", "main"), family: "codex", limitedUntil: inFuture(), limitKind: "window" }, ...claude],
+        defaults: { claude: MAIN, codex: CODEX_MAIN, pi: null },
+      }),
+    );
+    const agent = { id: AGENT, provider: "codex", status: "idle", title: "Fix the build", archivedAt: null, labels: {} };
+    const paseo = {
+      config: { get: async () => ({ config: { providers: {} } }) },
+      providers: { listAvailable: async () => ({ providers: [{ provider: "claude", available: true }, { provider: "codex", available: true }] }) },
+      agents: {
+        list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
+        ref: () => ({ refresh: async () => ({ agent }) }),
+      },
+    };
+    const service = new Service(
+      {
+        claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "" })),
+        codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        pi: absentPi(),
+      },
+      store,
+      { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
+      { locate: async () => "/usr/local/bin/paseo", reopen: async () => ({ ok: true as const }) } as unknown as Reopener,
+    );
+    return service.forkAgent(paseo as never, AGENT);
+  }
+
+  it("says an API account won't take the work over, rather than that every account is at its limit", async () => {
+    const limited = { ...account(MAIN, "marketing", "main"), limitedUntil: inFuture(), limitKind: "window" };
+    const api = { ...account("claude-api", "gateway", "managed"), auth: "api" };
+    await expect(refusal([limited, api])).rejects.toThrow(/only Claude accounts with room use an API key/);
+    await expect(refusal([limited])).rejects.toThrow("Every Claude account is at its limit too.");
+  });
+});
+
+describe("an API account at a limit with every other account out", () => {
+  it("is never spent a banked reset on automatically, which it doesn't have", async () => {
+    const redeemed: Array<string | null> = [];
+    const api = { ...account("claude-api", "Gateway", "managed"), auth: "api" as const };
+    const main = { ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window" as const };
+    const { service, limitTurn } = await setUp(
+      {
+        accounts: [main as never, api as never],
+        defaults: { claude: "claude-api", codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: "claude-api", family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "429 from the gateway" }),
+      { claude: { redeemReset: async (home: string | null) => (redeemed.push(home), { outcome: "reset", message: "Limits reset.", left: 0 }) } },
+    );
+    service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
+    await limitTurn();
+    expect(redeemed).toEqual([]);
   });
 });
