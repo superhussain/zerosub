@@ -44,8 +44,8 @@ export function mergeUsage(previous: Usage | undefined, next: Usage): Usage {
   if (!previous || previous.windows.length === 0) return next;
   if (next.windows.length === 0) return { ...previous, error: next.error };
   if (next.cached && Date.parse(next.fetchedAt) <= Date.parse(previous.fetchedAt)) return previous;
-  // Only a live read reports extra usage; a reading without it (Claude Code's cached copy, say) keeps the last.
-  if (next.extraUsage == null && previous.extraUsage != null) return { ...next, extraUsage: previous.extraUsage };
+  // A spend read can clear extra usage with null; reads without spend keep the last value.
+  if (next.extraUsage === undefined && previous.extraUsage != null) return { ...next, extraUsage: previous.extraUsage };
   return next;
 }
 

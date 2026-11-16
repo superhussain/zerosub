@@ -4,7 +4,7 @@ import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { egressText } from "../shared/format";
 import { HIDDEN, type AccountView, type StateView } from "../shared/model";
-import { addApiAccount, importPiAccount, setAccountProxy, setPiHomesDir, updateApiAccount } from "../shared/rpc";
+import { addApiAccount, importPiAccount, setAccountProxy, setClaudeHomesDir, setPiHomesDir, updateApiAccount } from "../shared/rpc";
 import { describe, type ZeroSubStore } from "./store";
 import { Button, IconButton, useText } from "./ui";
 
@@ -15,7 +15,7 @@ type Theme = PluginSurfaceProps["theme"];
  * optional base URL and proxy in an agent directory of its own. Everything here is only shown for Pi.
  */
 
-function useInputStyle(theme: Theme) {
+export function useInputStyle(theme: Theme) {
   return useMemo(
     () => ({
       color: theme.colors.foreground,
@@ -65,8 +65,16 @@ export function PiSectionNotes({ theme, state, accounts, store }: { theme: Theme
         share Pi's settings, sessions and other API keys; subscription sign-ins (/login) stay on the CLI login, whose files ZeroSub changes only when you edit its key or proxy on its card.
       </Text>
       <PiProxyNote theme={theme} />
-      {state.piLaunchers ? <ShellHint theme={theme} directory={state.piLaunchers} accounts={accounts} /> : null}
-      {state.piHomes ? <HomesHint theme={theme} homes={state.piHomes} store={store} /> : null}
+      {state.piLaunchers ? (
+        <ShellHint
+          theme={theme}
+          directory={state.piLaunchers}
+          accounts={accounts}
+          example="pi-<account>.sh"
+          note="Each runs pi on its account with the proxy its agents use in Paseo, whatever your shell exports."
+        />
+      ) : null}
+      {state.piHomes ? <HomesHint theme={theme} family="pi" homes={state.piHomes} store={store} /> : null}
     </>
   );
 }
@@ -100,7 +108,21 @@ function PiProxyNote({ theme }: { theme: Theme }) {
 }
 
 /** The line to put the scripts' directory on `PATH`, and the scripts there. */
-function ShellHint({ theme, directory, accounts }: { theme: Theme; directory: string; accounts: AccountView[] }) {
+export function ShellHint({
+  theme,
+  directory,
+  accounts,
+  example,
+  note,
+}: {
+  theme: Theme;
+  directory: string;
+  accounts: AccountView[];
+  /** What a script is called, shown while there's none. */
+  example: string;
+  /** What else to know about the scripts. */
+  note: string;
+}) {
   const text = useText(theme);
   const toast = useToast();
   // Readable when the path needs no quoting, which is nearly always.
@@ -119,8 +141,8 @@ function ShellHint({ theme, directory, accounts }: { theme: Theme; directory: st
       <Icon name="SquareTerminal" size={16} color={theme.colors.foregroundMuted} />
       <View style={{ flex: 1, gap: 4 }}>
         <Text style={text.small}>
-          From a terminal on this host: add this line to your shell profile once, then run {commands.length > 0 ? commands.join(", ") : "pi-<account>.sh"}.
-          Accounts added later work without changing it. Each runs pi on its account with the proxy its agents use in Paseo, whatever your shell exports.
+          From a terminal on this host: add this line to your shell profile once, then run {commands.length > 0 ? commands.join(", ") : example}.
+          Accounts added later work without changing it. {note}
         </Text>
         <Text selectable style={[text.small, { color: theme.colors.foreground }]}>
           {line}
@@ -131,15 +153,40 @@ function ShellHint({ theme, directory, accounts }: { theme: Theme; directory: st
   );
 }
 
-/** Where added Pi accounts' folders are kept, and the way to keep them somewhere else. */
-function HomesHint({ theme, homes, store }: { theme: Theme; homes: NonNullable<StateView["piHomes"]>; store: ZeroSubStore }) {
+/** What the folder setting says for each family whose added accounts' folders ZeroSub keeps outside its own. */
+const HOMES_COPY = {
+  claude: {
+    name: "Claude",
+    holds: "sign-in, settings and proxy",
+    variable: "CLAUDE_CONFIG_DIR",
+    setUp: "signed in",
+    runner: "a Claude agent or a terminal",
+    leftBehind: "its folder, sign-in and script stay",
+    rpc: setClaudeHomesDir,
+  },
+  pi: {
+    name: "Pi",
+    holds: "key, proxy and settings",
+    variable: "PI_CODING_AGENT_DIR",
+    setUp: "set up",
+    runner: "a Pi agent or a terminal",
+    leftBehind: "its folder, key and script stay",
+    rpc: setPiHomesDir,
+  },
+} as const;
+
+type HomesFamily = keyof typeof HOMES_COPY;
+type HomesState = NonNullable<StateView["piHomes"]>;
+
+/** Where a family's added accounts' folders are kept, and the way to keep them somewhere else. */
+export function HomesHint({ theme, family, homes, store }: { theme: Theme; family: HomesFamily; homes: HomesState; store: ZeroSubStore }) {
   const text = useText(theme);
   const [editing, setEditing] = useState(false);
   return (
     <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10, paddingHorizontal: 2 }}>
       <Icon name="FolderOpen" size={16} color={theme.colors.foregroundMuted} />
       <View style={{ flex: 1, gap: 4 }}>
-        <Text style={text.small}>Each added account keeps its key, proxy and settings in a folder of its own in</Text>
+        <Text style={text.small}>Each added account keeps its {HOMES_COPY[family].holds} in a folder of its own in</Text>
         <Text selectable style={[text.small, { color: theme.colors.foreground }]}>
           {homes.dir}
         </Text>
@@ -152,12 +199,13 @@ function HomesHint({ theme, homes, store }: { theme: Theme; homes: NonNullable<S
         tooltipAlign="end"
         onPress={() => setEditing(true)}
       />
-      {editing ? <HomesModal theme={theme} homes={homes} store={store} onClose={() => setEditing(false)} /> : null}
+      {editing ? <HomesModal theme={theme} family={family} homes={homes} store={store} onClose={() => setEditing(false)} /> : null}
     </View>
   );
 }
 
-function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: NonNullable<StateView["piHomes"]>; store: ZeroSubStore; onClose(): void }) {
+function HomesModal({ theme, family, homes, store, onClose }: { theme: Theme; family: HomesFamily; homes: HomesState; store: ZeroSubStore; onClose(): void }) {
+  const copy = HOMES_COPY[family];
   const text = useText(theme);
   const toast = useToast();
   const inputStyle = useInputStyle(theme);
@@ -170,9 +218,9 @@ function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: Non
     setSaving(true);
     setError(null);
     try {
-      const result = await store.rpc(setPiHomesDir, { dir: typed });
+      const result = await store.rpc(copy.rpc, { dir: typed });
       const moving = result.moving > 0 ? ` · ${result.moving} account${result.moving === 1 ? "" : "s"} move there once nothing runs on ${result.moving === 1 ? "it" : "them"}` : "";
-      toast.show(`Pi accounts are kept in ${result.dir} now${moving}`, { variant: "success", durationMs: 5_000 });
+      toast.show(`${copy.name} accounts are kept in ${result.dir} now${moving}`, { variant: "success", durationMs: 5_000 });
       await store.refresh();
       onClose();
     } catch (failure) {
@@ -180,17 +228,15 @@ function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: Non
     } finally {
       setSaving(false);
     }
-  }, [typed, store, toast, onClose]);
+  }, [copy, typed, store, toast, onClose]);
   return (
-    <Modal title="Where Pi accounts are kept" open onOpenChange={(open) => (open ? undefined : onClose())}>
+    <Modal title={`Where ${copy.name} accounts are kept`} open onOpenChange={(open) => (open ? undefined : onClose())}>
       <Modal.Content>
         <Text style={text.muted}>
-          {`Now: ${homes.dir}${homes.isDefault ? ", beside the terminal scripts" : ""}. Each added account has a folder of its own there (its PI_CODING_AGENT_DIR), named after it like its script, with its key, proxy and settings; new ones are set up inside ZeroSub's own folder, then moved there.`}
+          {`Now: ${homes.dir}${homes.isDefault ? ", beside the terminal scripts" : ""}. Each added account has a folder of its own there (its ${copy.variable}), named after it like its script, with its ${copy.holds}; new ones are ${copy.setUp} inside ZeroSub's own folder, then moved there.`}
         </Text>
         <Text style={text.muted}>
-          Saving another folder moves every account kept here, and any still in ZeroSub's own folder, to it. Each moves once nothing runs on it: a Pi
-          agent or a terminal using it holds it back until it stops. Removing an account later only takes it out of ZeroSub; its folder, key and
-          script stay.
+          {`Saving another folder moves every account kept here, and any still in ZeroSub's own folder, to it. Each moves once nothing runs on it: ${copy.runner} using it holds it back until it stops. Removing an account later only takes it out of ZeroSub; ${copy.leftBehind}.`}
         </Text>
         <TextInput
           value={dir}
@@ -203,7 +249,7 @@ function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: Non
           autoCorrect={false}
           onSubmitEditing={() => (changed ? void save() : undefined)}
           style={inputStyle}
-          accessibilityLabel="Folder for Pi accounts"
+          accessibilityLabel={`Folder for ${copy.name} accounts`}
         />
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
@@ -436,9 +482,12 @@ export function ProxyModal({ theme, account, store, onClose }: { theme: Theme; a
   const [proxy, setProxy] = useState(current);
   const typed = proxy.trim();
   const hidden = typed.includes(HIDDEN);
-  const changed = typed !== "" && typed !== current && !hidden;
+  // Main's settings can outrank a proxy set here for Claude's CLI login: it's set there instead.
+  const blocked = account.proxyBlocked;
+  const changed = typed !== "" && typed !== current && !hidden && !blocked;
   const inherited = account.inheritedProxy;
   const followers = account.proxyFollowers.length > 0 ? `, and so do ${account.proxyFollowers.join(", ")}, which have no proxy of their own` : "";
+  const afterRemoval = inherited ? `they then go through ${inherited.proxy}, set in ${inherited.from}` : "they then use the network the daemon has";
   const [saving, setSaving] = useState<"save" | "clear" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const save = useCallback(
@@ -467,32 +516,54 @@ export function ProxyModal({ theme, account, store, onClose }: { theme: Theme; a
             : inherited
               ? `Now: no proxy of its own; it goes through ${inherited.proxy}, set in ${inherited.from}.`
               : "Now: no proxy of its own; it uses the network the daemon has."}
-          {account.kind === "main"
-            ? ` Saving writes it as httpProxy in ~/.pi/agent/settings.json, so plain pi uses it too unless its environment names a proxy${followers || ", and so do added accounts without a proxy of their own"}. Pi agents started afterwards use the new setting; running ones keep theirs until they reopen.`
-            : " Its Pi agents started after saving use the new setting, for every request they make; running ones keep theirs until they reopen. It's also httpProxy in the settings of its folder, and its script uses it."}
+          {blocked
+            ? null
+            : account.family === "claude"
+              ? account.proxyFile
+                ? ` Saving changes it there, so plain claude in a terminal uses it too${followers}. Removing it takes it out of there, and ${afterRemoval}. Agents started afterwards use the new setting; running ones keep theirs until they reopen.`
+                : account.kind === "main"
+                  ? " Agents started after saving use the new setting; running ones keep theirs until they reopen. Plain claude in a terminal doesn't: it goes the way ~/.claude/settings.json and your shell say."
+                  : " Its agents started after saving use the new setting; running ones keep theirs until they reopen. It's kept in the env of its folder's settings.json, so Claude Code started on that folder uses it too."
+              : account.kind === "main"
+                ? ` Saving writes it as httpProxy in ~/.pi/agent/settings.json, so plain pi uses it too unless its environment names a proxy${followers || ", and so do added accounts without a proxy of their own"}. Pi agents started afterwards use the new setting; running ones keep theirs until they reopen.`
+                : " Its Pi agents started after saving use the new setting, for every request they make; running ones keep theirs until they reopen. It's also httpProxy in the settings of its folder, and its script uses it."}
         </Text>
-        <TextInput
-          value={proxy}
-          onChangeText={setProxy}
-          autoFocus
-          maxLength={2048}
-          // Empty keeps the proxy it goes through without one of its own, so that's what it shows.
-          placeholder={inherited?.proxy ?? "http://host:port"}
-          placeholderTextColor={theme.colors.foregroundMuted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          onSubmitEditing={() => (changed ? void save(typed) : undefined)}
-          style={inputStyle}
-          accessibilityLabel="Proxy URL"
-        />
-        <Text style={text.small}>{hidden ? `${HIDDEN} hides the proxy's password: type it in full to save a change.` : "http:// or https://, with user:password@ if the proxy needs it."}</Text>
+        {blocked ? <Text style={text.danger}>{blocked}</Text> : null}
+        {blocked ? null : (
+          <>
+          <TextInput
+            value={proxy}
+            onChangeText={setProxy}
+            autoFocus
+            maxLength={2048}
+            // Empty keeps the proxy it goes through without one of its own, so that's what it shows.
+            placeholder={inherited?.proxy ?? "http://host:port"}
+            placeholderTextColor={theme.colors.foregroundMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            onSubmitEditing={() => (changed ? void save(typed) : undefined)}
+            style={inputStyle}
+            accessibilityLabel="Proxy URL"
+          />
+          <Text style={text.small}>{hidden ? `${HIDDEN} hides the proxy's password: type it in full to save a change.` : "http:// or https://, with user:password@ if the proxy needs it."}</Text>
+          </>
+        )}
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
-          <Button theme={theme} label="Cancel" tooltip="Keep the current proxy" tooltipAlign="end" onPress={onClose} />
-          {account.proxy ? (
-            <Button theme={theme} label="Remove proxy" tooltip="Stop using a proxy of its own" tooltipAlign="end" busy={saving === "clear"} onPress={() => void save("")} />
+          <Button theme={theme} label={blocked ? "Close" : "Cancel"} tooltip={blocked ? "Close" : "Keep the current proxy"} tooltipAlign="end" onPress={onClose} />
+          {account.proxy && !blocked ? (
+            <Button
+              theme={theme}
+              label="Remove proxy"
+              tooltip={account.proxyFile ? `Take the proxy out of ${account.proxyFile}` : "Stop using a proxy of its own"}
+              tooltipAlign="end"
+              busy={saving === "clear"}
+              onPress={() => void save("")}
+            />
           ) : null}
-          <Button theme={theme} tone="primary" label="Save" tooltip="Use this proxy for the account" tooltipAlign="end" busy={saving === "save"} disabled={!changed} onPress={() => void save(typed)} />
+          {blocked ? null : (
+            <Button theme={theme} tone="primary" label="Save" tooltip="Use this proxy for the account" tooltipAlign="end" busy={saving === "save"} disabled={!changed} onPress={() => void save(typed)} />
+          )}
         </View>
       </Modal.Content>
     </Modal>

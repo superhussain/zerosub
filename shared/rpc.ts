@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
+import { ApiKeyKindSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -15,6 +15,8 @@ export const startLogin = defineRpc({
     /** Sign an existing account back in instead of adding a new one. */
     accountId: z.string().optional(),
     method: LoginMethodSchema.default("browser"),
+    /** A new account's proxy, set before the CLI signs in so the sign-in goes through it too. */
+    proxy: z.string().trim().max(2048).optional(),
   }),
   output: LoginViewSchema,
 });
@@ -37,35 +39,60 @@ export const renameAccount = defineRpc({
   output: z.object({ ok: z.literal(true) }),
 });
 
-/** Adds a Pi account: an Anthropic API key, with an optional base URL and proxy. */
+const ApiFieldsSchema = TrafficSwitchesSchema.extend({
+  /** Left out for a Pi account, which only takes an API key. */
+  keyKind: ApiKeyKindSchema.optional(),
+  /** Empty or omitted when editing: keep the current key. */
+  key: z.string().trim().max(4096).optional(),
+  /** Empty for Anthropic's own API. */
+  baseUrl: z.string().trim().max(2048).optional(),
+});
+
+/**
+ * Adds an account that uses an API key or token instead of a subscription: a Claude one, or a Pi one
+ * (an Anthropic API key Pi agents on it use), with an optional base URL and proxy.
+ */
 export const addApiAccount = defineRpc({
   name: "zerosub.accounts.api.add",
-  input: z.object({
+  input: ApiFieldsSchema.extend({
+    /** Left out, it's a Claude one when `keyKind` is given and a Pi one otherwise. */
+    family: z.enum(["claude", "pi"]).optional(),
     label: z.string().trim().min(1).max(40),
     key: z.string().trim().min(1).max(4096),
-    /** Empty for Anthropic's own API. */
-    baseUrl: z.string().trim().max(2048).optional(),
     proxy: z.string().trim().max(2048).optional(),
   }),
   output: z.object({ accountId: z.string() }),
 });
 
-/** Changes a Pi account's key (empty or omitted keeps it) or base URL; Pi's own login's too. */
+/** Changes an API account's key (empty or omitted keeps it), base URL or traffic switches; Pi's own login's too. */
 export const updateApiAccount = defineRpc({
   name: "zerosub.accounts.api.update",
-  input: z.object({
-    accountId: z.string(),
-    key: z.string().trim().max(4096).optional(),
-    baseUrl: z.string().trim().max(2048).optional(),
-  }),
+  input: ApiFieldsSchema.extend({ accountId: z.string() }),
   output: z.object({ ok: z.literal(true) }),
 });
 
-/** Sets a Pi account's proxy (Pi's own login's included); an empty value clears it. */
+/** Sets a Claude or Pi account's proxy (their CLI logins' included); an empty value clears it. */
 export const setAccountProxy = defineRpc({
   name: "zerosub.accounts.proxy",
   input: z.object({ accountId: z.string(), proxy: z.string().trim().max(2048) }),
   output: z.object({ ok: z.literal(true), proxy: z.string().nullable() }),
+});
+
+/**
+ * Changes the folder added Claude accounts' homes are kept in (empty: the default, `~/.claude-config`);
+ * the accounts kept before move there. `moving`: how many are due to move.
+ */
+export const setClaudeHomesDir = defineRpc({
+  name: "zerosub.accounts.homes",
+  input: z.object({ dir: z.string().trim().max(1024) }),
+  output: z.object({ ok: z.literal(true), dir: z.string(), moving: z.number() }),
+});
+
+/** Adds a folder Claude Code is signed in with already as a Claude account, where it is. */
+export const importAccount = defineRpc({
+  name: "zerosub.accounts.import",
+  input: z.object({ path: z.string().trim().min(1).max(1024) }),
+  output: z.object({ accountId: z.string() }),
 });
 
 /**

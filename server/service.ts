@@ -9,17 +9,22 @@ import type {
 import {
   FAMILIES,
   FAMILY_LABEL,
+  HAND_OFF,
   OPENCODE_LABEL,
   OPENCODE_PROVIDER,
+  OPTIONAL,
   OTHER_FAMILY,
   type AccountView,
   type ApiSummary,
+  ApiSummarySchema,
   type AgentRoute,
+  type ApiKeyKind,
   type Egress,
   type Family,
   type LoginMethod,
   type LoginView,
   type StateView,
+  type TrafficSwitches,
   type Usage,
 } from "../shared/model";
 import { capsAccount, limitedPick } from "../shared/format";
@@ -28,6 +33,7 @@ import type { RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
 import {
   applyEnv,
+  missingAdapter,
   type AgentTimelineItem,
   type FamilyAdapter,
   type Identity,
@@ -40,17 +46,18 @@ import {
 } from "./adapter";
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
-import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
-import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, updatePrompt, type Continuation } from "./handoff";
-import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
-import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
+import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
+import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
+import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
+import { PI_ACCOUNT_FILE, codexSessionsShared, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
+import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { Mutex } from "./json-file";
 import { reapLeftovers, type AgentLookup } from "./leftovers";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode, withinMode } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
-import { chooseImportedPiHome, choosePiHomesDir, piHomesDir, placeFor } from "./placement";
+import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, PLACED, placeFor, type PlacedFamily } from "./placement";
 import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
@@ -79,7 +86,7 @@ import {
 type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
-const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi" };
+const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok", cursor: "Cursor" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
@@ -151,6 +158,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   claudeForkDestination: "codex",
   forkOpenCodeModel: "",
   forkOpenCodeThinking: "",
+  codexSameConversation: false,
 };
 
 interface LoginSession {
@@ -176,6 +184,9 @@ interface HomeMove {
 
 /** A move that gave way to something started on the home meanwhile (see `moveAccountHome`). */
 class MoveGaveWay extends Error {}
+
+/** Where the registry keeps the folder each family's added accounts' homes are kept in. */
+const HOMES_KEY = { claude: "claudeHomes", pi: "piHomes" } as const satisfies Record<PlacedFamily, keyof StoredState>;
 
 interface AgentInfo {
   id: string;
@@ -246,11 +257,17 @@ function meaningful<T extends { item: AgentTimelineItem }>(entries: readonly T[]
 const forkRef = (fork: { id: string; title?: string | null }): string =>
   fork.title?.trim() ? fork.title : `${OPENCODE_LABEL} agent ${fork.id}`;
 
+/** Whether two OpenCode creates send Paseo the same request: everything but the prompt's reason. */
+function sameCreate(reserved: OpenCodeCreateConfig | undefined, next: OpenCodeCreateConfig): boolean {
+  const keys = ["provider", "modeId", "thinkingOptionId", "workspaceId", "cwd", "parentId", "title"] as const;
+  return reserved !== undefined && keys.every((key) => (reserved[key] ?? null) === (next[key] ?? null));
+}
+
 /**
  * The same place for a fork on another provider: the same workspace, or the same directory when
  * neither sits in one. (`samePlace` also demands the same provider, which a fork never shares.)
  */
-function sameWorkspace(left: Agent, right: Agent): boolean {
+function sameForkPlace(left: Agent, right: Agent): boolean {
   if (left.workspaceId !== right.workspaceId) return false;
   return Boolean(left.workspaceId) || left.cwd === right.cwd;
 }
@@ -278,8 +295,30 @@ interface Opening {
   session?: LiveSession;
   /** A Codex thread's pin it wrote, and the one that pin replaced. */
   pin?: { wrote: Binding; replaced: Binding | undefined };
+  /** Routing left the session alone: its family isn't available here (see `route`). */
+  unavailable?: boolean;
 }
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
+
+/** Why a conversation of a provider without hand-off (Grok's, Cursor's) can't be given another account. */
+function stays(family: Family, on: string | null): string {
+  return `${FAMILY_LABEL[family]} conversations stay on the account they started on${on ? ` (${on})` : ""}. Start a new agent to use another account; new agents follow your pick and the default.`;
+}
+
+/** What a same-conversation reload has to put back if the other account cannot read the thread. */
+interface ConversationMemberPin {
+  chainId: string;
+  accountId: string;
+  identity: string | null;
+  email: string | null;
+}
+
+interface SameConversationProbe {
+  fromAccountId: string;
+  toAccountId: string;
+  previousBinding: Binding | undefined;
+  members: ConversationMemberPin[];
+}
 
 /**
  * Whether the agent has a session open. One whose last turn failed ("error": an API key out of
@@ -355,7 +394,7 @@ export class Service {
   private readonly identityCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
-  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex() };
+  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex(), grok: new Mutex(), cursor: new Mutex() };
   /** Homes of API accounts being set up, which cleanup must leave alone. */
   private readonly creatingHomes = new Set<string>();
   /**
@@ -381,6 +420,13 @@ export class Service {
   private readonly unrouted = new Set<string>();
   /** When each agent's last turn started or ended; see `noteTurn`. */
   private readonly turnAt = new Map<string, number>();
+  /**
+   * The account a Codex agent reloaded off, until the first turn after that reload ends. A decrypt
+   * or resume failure pins it back and opens today's new tab. Any other ending drops the record.
+   */
+  private readonly sameConversationProbe = new Map<string, SameConversationProbe>();
+  /** This agent already failed to resume on the other account, so the next limit uses a new tab. */
+  private readonly sameConversationBlocked = new Set<string>();
   private aligning = false;
   /**
    * Default changes pinning open agents right now. Until they're pinned, an agent that follows the
@@ -394,6 +440,8 @@ export class Service {
   private placing: Promise<void> | null = null;
   /** The move of each account's home under way now (see `moveAccountHome`). */
   private readonly moving = new Map<string, HomeMove>();
+  /** Recorded moves being finished, by account (see `finishOne`). */
+  private readonly finishing = new Map<string, Promise<void>>();
   /** Each account's last finished move, for a session routed from a registry read before it. */
   private readonly moved = new Map<string, { from: string; to: string }>();
   /** ZeroSub's own calls running on each home (see `onAccount`), which a move of it gives way to. */
@@ -443,12 +491,16 @@ export class Service {
   /** Whether records of sessions that ended while ZeroSub was off are forgotten yet (once a run). */
   private endedForgotten = false;
 
+  private readonly adapters: Record<Family, FamilyAdapter>;
+
+  /** A family left out of `adapters` is never available here (see `missingAdapter`). */
   constructor(
-    private readonly adapters: Record<Family, FamilyAdapter>,
+    adapters: Partial<Record<Family, FamilyAdapter>> & Record<"claude" | "codex", FamilyAdapter>,
     private readonly store = new StateStore(),
     private readonly families = new FamilyResolver(),
     private readonly reopener = new Reopener(),
   ) {
+    this.adapters = Object.fromEntries(FAMILIES.map((family) => [family, adapters[family] ?? missingAdapter(family)])) as Record<Family, FamilyAdapter>;
     this.continuations = new CodexContinuations(store);
   }
 
@@ -534,8 +586,13 @@ export class Service {
         void this.ensureFamily(family).catch(() => undefined);
       }
     }
+    // Moves a stop cut short are finished first: the checks below read an account's folder, and the
+    // sync further down would make the old one again.
+    if (this.hasRecordedMoves(await this.store.read())) await this.finishRecordedMoves();
     const state = await this.store.read();
     for (const account of state.accounts) {
+      // One still on record (both folders there, say) waits: its folder isn't settled.
+      if (state.moves[account.id]) continue;
       const attempted = this.usageAttemptAt.get(account.id) ?? 0;
       const busy = now - (this.activeAt.get(account.id) ?? 0) < ACTIVE_WINDOW_MS;
       const isDefault = defaultAccount(state, account.family)?.id === account.id;
@@ -546,7 +603,7 @@ export class Service {
       if (now - (this.identityCheckedAt.get(account.id) ?? 0) > IDENTITY_MS) {
         void this.refreshIdentity(account.id).catch(() => undefined);
       }
-      if (now - (this.egressCheckedAt.get(account.id) ?? 0) >= EGRESS_MS) void this.checkEgress(account);
+      if (account.signedIn && now - (this.egressCheckedAt.get(account.id) ?? 0) >= EGRESS_MS) void this.checkEgress(account);
     }
     for (const [id, login] of this.logins) {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
@@ -556,17 +613,17 @@ export class Service {
       this.lastReap = now;
       void this.reapLeftovers(this.paseo).catch((error: unknown) => log("could not check for leftover Claude processes", error));
     }
-    // Keep added Pi homes in step with Pi's own directory (shared entries, sign-ins, settings) even
-    // when they're only used from a terminal, which ZeroSub never sees start.
-    for (const account of state.accounts) {
-      if (account.family === "pi" && account.kind === "managed" && account.home && !this.moving.has(account.id)) {
-        await this.adapters.pi
+    // Keep added Claude and Pi homes in step with main (shared entries, generated settings; a Pi home's
+    // sign-ins too) even when they're only used from a terminal, which ZeroSub never sees start.
+    for (const account of (await this.store.read()).accounts) {
+      if ((account.family === "claude" || account.family === "pi") && account.kind === "managed" && account.home && !this.moving.has(account.id)) {
+        await this.adapters[account.family]
           .prepareHome(account.home, this.stillHas(account))
           .catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
       }
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     if (this.paseo) {
       await this.forgetEndedSessions(this.paseo).catch((error: unknown) => log("could not check which agents closed while ZeroSub was off", error));
       void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
@@ -747,12 +804,16 @@ export class Service {
       const info = await agentInfo(paseo, agentId);
       if (info && !info.archived && info.status !== "closed") return; // Still in use: a later pass.
     }
+    // The registry this pass read may be out of date by now (Paseo took a while to answer, say).
+    if (!(await this.stillToCleanUp(home))) return;
     // A sign-in this run saw end without an account is its own to undo. One left by an earlier run
     // only goes if it isn't signed in: a registry restored from an older copy can still list a
     // sign-in that has since become an account the registry no longer knows.
-    // A Pi account is saved, and its entry dropped, in one write (see `addApiAccount`): an entry left
-    // means it never became an account, so its home goes, key and all.
-    const earlier = entry.why === "unfinished" && entry.family !== "pi" && !this.endedHere(home);
+    // An API account (every Pi one) is saved, and its entry dropped, in one write (see `addApiAccount`):
+    // an entry left means it never became an account, so its home goes, key and all, though Claude
+    // Code calls a home with a key signed in.
+    const apiHome = entry.family === "pi" || (await this.adapters[entry.family].api?.(home).catch(() => null)) != null;
+    const earlier = entry.why === "unfinished" && !apiHome && !this.endedHere(home);
     let deleteFolder = true;
     let outcome: string;
     try {
@@ -764,7 +825,7 @@ export class Service {
           : `deleted ${home}, left by a sign-in that never finished`;
       } else {
         await this.adapters[entry.family].logout(home);
-        outcome = entry.why === "unfinished" && entry.family === "pi" ? `deleted ${home}, left by a Pi account that was never saved` : `signed out and deleted ${home}`;
+        outcome = entry.why === "unfinished" && apiHome ? `deleted ${home}, left by an API account that was never saved` : `signed out and deleted ${home}`;
       }
     } catch (error) {
       const failures = (this.cleanupFailures.get(home) ?? 0) + 1;
@@ -778,12 +839,28 @@ export class Service {
         : `gave up signing out ${home}, so its sign-in may still be valid; deleted it anyway`;
     }
     this.cleanupFailures.delete(home);
+    // Checked again just before the folder goes: signing out can take a while too.
+    if (deleteFolder && !(await this.stillToCleanUp(home))) return;
     if (deleteFolder) await removeHome(home);
     await this.store.update((draft) => {
       delete draft.cleanup[home];
       for (const agentId of users) if (draft.sessions[agentId]?.accountId === entry.accountId) delete draft.sessions[agentId];
     });
     console.log(`[ZeroSub] ${outcome}`);
+  }
+
+  /**
+   * Whether `home` is still listed for cleanup with no account using it, read from the registry as it
+   * is now. One an account uses again comes off the list, as in `cleanUpPass`.
+   */
+  private async stillToCleanUp(home: string): Promise<boolean> {
+    const state = await this.store.read();
+    if (!state.cleanup[home]) return false;
+    if (!state.accounts.some((account) => account.home === home)) return true;
+    await this.store.update((draft) => {
+      if (draft.accounts.some((account) => account.home === home)) delete draft.cleanup[home];
+    });
+    return false;
   }
 
   /** Whether a sign-in into `home` ran in this process and has ended. */
@@ -842,6 +919,10 @@ export class Service {
     abandoned?.addEventListener("abort", giveUp, { once: true });
     try {
       const result = await routed;
+      if (opening.unavailable) {
+        await this.openedUnavailable(request, opening);
+        return result;
+      }
       if (!abandoned?.aborted) {
         if (result) {
           // A fresh session already runs on the routed account, so any pending switch is done.
@@ -929,6 +1010,22 @@ export class Service {
     console.log(`[ZeroSub] placed ${agentId} on ${chosen.label} (${why}): ${parts.join("; ")}`);
   }
 
+  /**
+   * A session of a family that isn't available here runs on the CLI login, like any session ZeroSub
+   * didn't route: so the account recorded for the session before goes, unless a session opened since
+   * replaced it, and a reload of ours counts as not landed. Bindings stay, so the agent goes back to
+   * its account once the family is available again.
+   */
+  private async openedUnavailable(request: PluginSessionOpenRequest, opening: Opening): Promise<void> {
+    const { agentId } = request;
+    this.unrouted.add(agentId);
+    const ended = (session: LiveSession | undefined) => session !== undefined && Date.parse(session.openedAt) < opening.startedAt;
+    if (!ended((await this.store.read()).sessions[agentId])) return;
+    await this.store.update((draft) => {
+      if (ended(draft.sessions[agentId])) delete draft.sessions[agentId];
+    });
+  }
+
   private async route(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
@@ -938,7 +1035,17 @@ export class Service {
     this.attach(context.paseo);
     const family = (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
+    // A family known not to work here (Cursor off Linux, with a registry made on Linux, say) gives an
+    // added account no env of its own: the session runs on the CLI login, so it isn't routed or
+    // recorded. Until availability is first checked, sessions are routed as usual.
+    if (this.availability.get(family)?.ok === false) {
+      if (opening) opening.unavailable = true;
+      console.log(`[ZeroSub] ${request.provider} agent ${request.agentId} not routed: ${PROVIDER_NAME[family]} isn't available here (${request.reason})`);
+      return undefined;
+    }
     const adapter = this.adapters[family];
+    // A move a stop cut short is finished first, so no session opens on a folder that has moved.
+    if (this.hasRecordedMoves(await this.store.read())) await this.finishRecordedMoves();
     const now = Date.now();
     const interactive = request.purpose === "interactive";
     // The first session a reload of ours opens is the one it rolls back if the reload fails.
@@ -1050,8 +1157,18 @@ export class Service {
     // meanwhile, and the limit is still this account's.
     const accountId = this.runningOn(await this.store.read(), agentId, family) ?? null;
     if (accountId) this.activeAt.set(accountId, Date.now());
+    if (event.outcome.kind === "completed") this.sameConversationBlocked.delete(agentId);
+    const probe = this.sameConversationProbe.get(agentId);
     if (event.outcome.kind !== "canceled") {
       const turn = await this.turnWithTimeline(context.paseo, event);
+      if (probe && encryptedResumeFailure(turnFailedText(turn))) {
+        this.sameConversationProbe.delete(agentId);
+        this.sameConversationBlocked.add(agentId);
+        await this.revertSameConversation(context.paseo, agentId, family, probe, turn.timeline);
+        if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+        return;
+      }
+      if (probe) this.sameConversationProbe.delete(agentId);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
       const hit = adapter.detectLimit(turn);
@@ -1068,6 +1185,7 @@ export class Service {
         return;
       }
     }
+    if (probe && event.outcome.kind === "canceled") this.sameConversationProbe.delete(agentId);
     if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
     // The turn just used the account: read its usage again as soon as the provider allows.
     if (accountId) void this.refreshUsage(accountId).catch(() => undefined);
@@ -1115,6 +1233,8 @@ export class Service {
     this.alignedAt.delete(agentId);
     this.failedMoves.delete(agentId);
     this.unrouted.delete(agentId);
+    this.sameConversationProbe.delete(agentId);
+    this.sameConversationBlocked.delete(agentId);
     const ended = (session: LiveSession | undefined) => session !== undefined && Date.parse(session.openedAt) < closedAt;
     if (!ended((await this.store.read()).sessions[agentId])) return;
     await this.store.update((draft) => {
@@ -1128,6 +1248,8 @@ export class Service {
     this.failedMoves.delete(agentId);
     this.unrouted.delete(agentId);
     this.turnAt.delete(agentId);
+    this.sameConversationProbe.delete(agentId);
+    this.sameConversationBlocked.delete(agentId);
     this.switchGuard.forget(agentId);
     this.guardNoticeAt.delete(agentId);
     this.guardNoticeAt.delete(`${agentId}:elsewhere`);
@@ -1343,7 +1465,7 @@ export class Service {
     const next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), this.pacing(now));
     if (next) this.notePlacement(next.id, now);
     if (!next) {
-      if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
+      if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
         const reply = await this.redeemOn(account, true);
         if (reply.outcome === "reset") {
@@ -1409,6 +1531,8 @@ export class Service {
       return;
     }
 
+    if (!adapter.portable && (await this.keptSameConversation(paseo, agentId, account, next, problem, base, reason, endedAt))) return;
+
     if (adapter.portable) {
       if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
       this.switchGuard.note(agentId, now);
@@ -1431,13 +1555,13 @@ export class Service {
     }
 
     // A ChatGPT thread can't move to another account; carry the work on in a new agent there.
-    if (!this.prefs.autoContinue) {
+    if (!this.prefs.autoContinue || !HAND_OFF[family]) {
       await this.appendRow(paseo, agentId, {
         ...base,
         to: next.label,
         reason,
         outcome: "stayed",
-        detail: `New ChatGPT agents will use ${next.label}.`,
+        detail: `New ${FAMILY_LABEL[family]} agents will use ${next.label}.`,
       });
       return;
     }
@@ -1596,6 +1720,7 @@ export class Service {
     this.attach(paseo);
     const account = findAccount(await this.store.read(), accountId);
     if (!account) throw new Error("That account no longer exists.");
+    if (account.auth === "api") throw new Error(`${account.label} uses an API key, which has no banked resets.`);
     if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
     const pending = (message: string): RedeemResult => ({ outcome: "pending", message, left: null, continued: false });
     if (this.redeeming.has(account.id)) {
@@ -1852,7 +1977,7 @@ export class Service {
     // or whose fork was archived, is dropped here: nothing more is ever sent to it without its record.
     const reservation = state.opencodeForks[agentId]?.pending;
     if (reservation) {
-      const target = (await paseo.agents.ref(reservation.targetId).refresh())?.agent;
+      const target = await snapshot(paseo, reservation.targetId);
       if (target && !target.archivedAt) return { skipped: alreadyContinued(forkRef(target)) };
     }
 
@@ -1864,7 +1989,15 @@ export class Service {
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
     const now = Date.now();
     const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.pacing(now));
-    if (!account) return { skipped: `Every ${name} account is at its limit too.` };
+    if (!account) {
+      // API accounts are billed per use, so they never take work over by themselves; say so rather than "at its limit".
+      const apiOnly = accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
+      return {
+        skipped: apiOnly
+          ? `The only ${name} accounts with room use an API key, which ZeroSub never moves work onto by itself. To use one, start a ${name} agent and pick it from the agent's account button.`
+          : `Every ${name} account is at its limit too.`,
+      };
+    }
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
     if (!original) throw new Error("That agent is no longer available.");
@@ -1931,7 +2064,7 @@ export class Service {
     );
     if (!available) return { skipped: `${OPENCODE_LABEL} isn't available in Paseo on this host.` };
 
-    const first = (await paseo.agents.ref(agentId).refresh())?.agent;
+    const first = await snapshot(paseo, agentId);
     if (!first) throw new Error("That agent is no longer available.");
     // turn_ended can arrive just before the source reports idle: an automatic fork waits a moment,
     // refusing if a newer message arrives meanwhile.
@@ -1953,7 +2086,7 @@ export class Service {
       (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER)?.id;
     if (!forkId) return this.createOpenCodeFork(paseo, agentId, original, source);
 
-    let fork = (await paseo.agents.ref(forkId).refresh())?.agent;
+    let fork = await snapshot(paseo, forkId);
     // Reconcile a reservation an earlier call left behind, before anything else happens.
     if (record?.pending) {
       const pending = record.pending;
@@ -1963,9 +2096,8 @@ export class Service {
           return this.deliverReservedOpenCode(paseo, agentId, fork);
         }
         if (!fork) {
-          // The create never landed, so nothing was sent. Build it again from today's settings and
-          // source, under the same target ID: it stays the create's idempotency key, so a first
-          // create that lands late can't make a second fork.
+          // The create never landed, so nothing was sent. A create seen to fail is built again from
+          // today's settings and source; one whose outcome is unknown is sent again unchanged.
           return this.createOpenCodeFork(paseo, agentId, original, source, pending);
         }
         if (fork.archivedAt) {
@@ -1987,7 +2119,7 @@ export class Service {
       }
       if (pending.sentDigest !== undefined && (await this.hasReceipt(paseo, forkId, pending.messageId, pending.sentDigest))) {
         await this.settleOpenCode(agentId, pending.messageId);
-        fork = (await paseo.agents.ref(forkId).refresh())?.agent;
+        fork = await snapshot(paseo, forkId);
         record = (await this.store.read()).opencodeForks[agentId];
       } else {
         return this.openCodeUncertain(forkId, fork.title, pending.messageId);
@@ -2055,7 +2187,7 @@ export class Service {
     agentId: string,
     config?: OpenCodeCreateConfig,
   ): Promise<{ original: Agent; parentId: string | undefined } | undefined> {
-    const original = (await paseo.agents.ref(agentId).refresh())?.agent;
+    const original = await snapshot(paseo, agentId);
     if (!original || !ready(original)) return undefined;
     const parentId = await this.continuations.parentFor(paseo, agentId);
     if (config) {
@@ -2099,8 +2231,8 @@ export class Service {
     // The parent is resolved again after the catalog reads, then the snapshots come last.
     const parentId = await this.continuations.parentFor(paseo, agentId);
     const [original, fork] = await Promise.all([
-      paseo.agents.ref(agentId).refresh().then((result) => result?.agent),
-      paseo.agents.ref(forkId).refresh().then((result) => result?.agent),
+      snapshot(paseo, agentId),
+      snapshot(paseo, forkId),
     ]);
     if (!original || !ready(original)) return { refused: MOVED_REFUSAL };
     if (original.lastUserMessageAt !== source.original.lastUserMessageAt) return { refused: NEWER_REFUSAL };
@@ -2109,7 +2241,7 @@ export class Service {
     // A reserved creation's source must still be where it was reserved; the fork moving with it isn't enough.
     if (config && ((original.workspaceId ?? null) !== config.workspaceId || (original.cwd ?? null) !== config.cwd)) return { refused: MOVED_REFUSAL };
     if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || fork.labels?.[CONTINUED_FROM_LABEL] !== agentId ||
-      !sameWorkspace(original, fork) || fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
+      !sameForkPlace(original, fork) || fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
     if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return { refused: MOVED_REFUSAL };
     if (!withinMode(sourceModes, original.currentModeId, targetModes, fork.currentModeId)) return { refused: MODE_REFUSAL };
     return { original, fork };
@@ -2206,7 +2338,7 @@ export class Service {
       const since = await this.sourceSince(paseo, agentId, delta.mark);
       if (since === "newer") return { skipped: NEWER_REFUSAL };
       if (since !== "same") return this.openCodeFound(fork, since === "epoch" ? FOUND_DETAIL : HISTORY_GAP_DETAIL);
-      const now = (await paseo.agents.ref(agentId).refresh())?.agent;
+      const now = await snapshot(paseo, agentId);
       if (!now || !ready(now)) return { skipped: SOURCE_BUSY_REFUSAL };
       // A message that landed after the history read shows only in the source's own timestamp.
       if (now.lastUserMessageAt !== sourceAt) return { skipped: NEWER_REFUSAL };
@@ -2219,8 +2351,12 @@ export class Service {
         detail: UP_TO_DATE_DETAIL,
       };
     }
-    const instructions = fitInstructions(items.filter((item) => item.type === "user_message").map((item) => item.text));
-    const progress = buildTranscript(items.filter((item) => item.type !== "user_message"));
+    // Instructions are prompts from a human, another agent or a schedule, as in a Codex continuation.
+    const instructions = fitInstructions(items.flatMap((item) => {
+      const text = promptInstruction(item);
+      return text?.trim() ? [text] : [];
+    }));
+    const progress = buildTranscript(items.filter((item) => promptInstruction(item) === null));
     const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
     const prompt = updatePrompt(instructions, progress, PROVIDER_NAME.claude, transferMarker(messageId));
     const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark);
@@ -2258,6 +2394,16 @@ export class Service {
   ): Promise<ForkOutcome> {
     const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
     if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? `${PROVIDER_NAME["codex"]} agent ${chatGptCopy.id}`) };
+    // A create whose outcome was never seen may be in Paseo under its key, which stays tied to its
+    // first request: only that exact request may be sent again.
+    if (retry && !retry.createFailed) {
+      const reserved = retry.config;
+      // A reservation saved before the request was frozen whole can't be repeated exactly.
+      if (!reserved?.title || reserved.workspaceId === undefined || reserved.cwd === undefined || reserved.parentId === undefined) {
+        return this.openCodeUncertain(retry.targetId, null, retry.messageId);
+      }
+      return this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title }, true);
+    }
     const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
     const savedModel = this.prefs.forkOpenCodeModel;
@@ -2266,7 +2412,8 @@ export class Service {
       return { skipped: "The saved OpenCode model is no longer in this host's catalog. Pick one in ZeroSub's settings." };
     }
     if (!model) return { skipped: `No OpenCode model is marked default on this host. Pick one in ZeroSub's settings.` };
-    const thinking = this.prefs.forkOpenCodeThinking;
+    // A "default" saved from Paseo 0.16's own Default option sends no variant, as the model default does.
+    const thinking = this.prefs.forkOpenCodeThinking === "default" ? "" : this.prefs.forkOpenCodeThinking;
     if (thinking && !model.thinkingOptions?.some((option) => option.id === thinking)) {
       return { skipped: `“${model.label}” no longer offers the saved thinking option. Pick one in ZeroSub's settings.` };
     }
@@ -2290,54 +2437,80 @@ export class Service {
       return { skipped: HISTORY_GAP_DETAIL };
     }
 
-    const targetId = retry?.targetId ?? randomUUID();
-    const messageId = retry?.messageId ?? `${MESSAGE_PREFIX}${randomUUID()}`;
     const parentId = await this.continuations.parentFor(paseo, agentId);
-    const title = `${original.title?.trim() || "Task"} (continued on ${OPENCODE_LABEL})`;
-    const why = retry?.config?.why ?? (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
+    const config = {
+      provider: `${OPENCODE_PROVIDER}/${model.id}`,
+      modeId,
+      ...(thinking ? { thinkingOptionId: thinking } : {}),
+      workspaceId: original.workspaceId ?? null,
+      cwd: original.cwd ?? null,
+      parentId: parentId ?? null,
+      title: `${original.title?.trim() || "Task"} (continued on ${OPENCODE_LABEL})`,
+    };
+    // Paseo keeps a failed create's request under its key: the same request may use that key again,
+    // and any other request needs new IDs. The failed one can't land later, so this can't double.
+    const reuse = retry !== undefined && sameCreate(retry.config, config);
+    const targetId = reuse ? retry.targetId : randomUUID();
+    const messageId = reuse ? retry.messageId : `${MESSAGE_PREFIX}${randomUUID()}`;
+    const why = (reuse ? retry.config?.why : undefined) ?? (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
     const prompt = [continuationPrompt(buildTranscript(delta.entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(messageId)].join("\n");
     await this.store.update((draft) => {
       // A new reservation is this source's journal again; a hold it was told about is spent.
       delete draft.opencodeHolds[agentId];
       draft.opencodeForks[agentId] = {
         forkAgentId: targetId,
-        pending: {
-          stage: "creating",
-          targetId,
-          messageId,
-          seen: delta.mark,
-          config: {
-            provider: `${OPENCODE_PROVIDER}/${model.id}`,
-            modeId,
-            ...(thinking ? { thinkingOptionId: thinking } : {}),
-            workspaceId: original.workspaceId ?? null,
-            cwd: original.cwd ?? null,
-            parentId: parentId ?? null,
-            title,
-            why,
-          },
-          sentDigest: sentDigestOf(prompt),
-        },
+        pending: { stage: "creating", targetId, messageId, seen: delta.mark, config: { ...config, why }, sentDigest: sentDigestOf(prompt) },
       };
     });
-    await continueInNewAgent({
-      paseo,
-      sourceAgentId: agentId,
-      why: source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode",
-      previous: PROVIDER_NAME.claude,
-      agentId: targetId, // also the create's idempotency key, so a retried create can't double it
-      deferPrompt: true,
-      target: {
-        provider: OPENCODE_PROVIDER,
-        label: OPENCODE_LABEL,
-        modeId,
-        model: model.id,
-        ...(thinking ? { thinkingOptionId: thinking } : {}),
-      },
-      parentId,
-      reserved: { title, workspaceId: original.workspaceId ?? null, cwd: original.cwd ?? null },
-      bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
-    });
+    return this.sendReservedCreate(paseo, agentId, targetId, messageId, config, false);
+  }
+
+  /**
+   * Sends a reserved promptless create, then its reserved handoff once the fork exists.
+   * `outcomeUnknown`: Paseo may hold this key's request with no answer seen, so a refusal keeps it.
+   */
+  private async sendReservedCreate(
+    paseo: PaseoApi,
+    agentId: string,
+    targetId: string,
+    messageId: string,
+    config: OpenCodeCreateConfig & { title: string },
+    outcomeUnknown: boolean,
+  ): Promise<ForkOutcome> {
+    const markFailed = () =>
+      this.store.update((draft) => {
+        const pending = draft.opencodeForks[agentId]?.pending;
+        if (pending?.messageId === messageId) pending.createFailed = true;
+      });
+    let sending = false;
+    try {
+      await continueInNewAgent({
+        paseo,
+        sourceAgentId: agentId,
+        previous: PROVIDER_NAME.claude,
+        agentId: targetId, // also the create's idempotency key, so a retried create can't double it
+        deferPrompt: true,
+        target: {
+          provider: OPENCODE_PROVIDER,
+          label: OPENCODE_LABEL,
+          modeId: config.modeId,
+          model: config.provider.slice(`${OPENCODE_PROVIDER}/`.length),
+          ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
+        },
+        parentId: config.parentId ?? undefined,
+        reserved: { title: config.title, workspaceId: config.workspaceId ?? null, cwd: config.cwd ?? null },
+        // OpenCode is a harness, not an account provider: no binding to record. Binding is the
+        // helper's last step before it sends the create.
+        bind: async () => {
+          sending = true;
+        },
+        onCreateRejected: markFailed,
+      });
+    } catch (error) {
+      // Refused before the create was sent: Paseo has no record under this key, or only a failed one.
+      if (!sending && !outcomeUnknown) await markFailed();
+      throw error;
+    }
     const fork = await waitForCreated(paseo, targetId);
     if (!fork) return this.openCodeUncertain(targetId, null, messageId);
     return this.deliverReservedOpenCode(paseo, agentId, fork);
@@ -2464,7 +2637,7 @@ export class Service {
     const info = await lookUpAgent(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok or Cursor subscription accounts.`);
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
@@ -2493,6 +2666,177 @@ export class Service {
       at: new Date().toISOString(),
     });
     return { ...result.fork, delivery: result.delivery };
+  }
+
+  /**
+   * Reloads this Codex agent on `next` when both accounts are members of one workspace and `next`
+   * really links `sessions/`. One write updates the binding and this agent's continuation record,
+   * so a later handoff still sees one tab. A failed reload puts that write back and returns false,
+   * and the caller opens today's new tab.
+   */
+  private async keptSameConversation(
+    paseo: PaseoApi,
+    agentId: string,
+    account: StoredAccount,
+    next: StoredAccount,
+    problem: Problem,
+    base: Omit<SwitchRow, "to" | "reason" | "outcome">,
+    reason: SwitchRow["reason"],
+    endedAt: number,
+  ): Promise<boolean> {
+    if (problem.kind !== "limit" || account.family !== "codex" || next.family !== "codex") return false;
+    const eligible = codexHandoffMode({
+      enabled: this.prefs.codexSameConversation && !this.sameConversationBlocked.has(agentId),
+      sameWorkspace: sameWorkspace(account.identity, next.identity),
+      // The link is checked below, after the other gates, so a disabled option does not touch homes.
+      sessionsShared: true,
+      limitMessage: problem.hit.message,
+    });
+    if (eligible === "new-tab") return false;
+    await this.prepareSharedSessions(account);
+    await this.prepareSharedSessions(next);
+    if (!(await codexSessionsShared(next.home, account.home))) return false;
+
+    const seen = await this.store.read();
+    const previousBinding = seen.bindings[agentId];
+    const members = this.conversationPins(seen, agentId);
+    await this.store.update((draft) => {
+      draft.bindings[agentId] = { accountId: next.id, source: "auto", at: new Date().toISOString() };
+      for (const chain of Object.values(draft.continuations)) {
+        const member = chain.members[agentId];
+        if (!member) continue;
+        member.accountId = next.id;
+        member.identity = next.identity;
+        member.email = next.email;
+      }
+    });
+    const result = await this.reopenAgent(paseo, agentId, { settle: true, sameConversation: true });
+    const landed = (await this.store.read()).sessions[agentId]?.accountId === next.id;
+    if (result.outcome !== "reopened" || !landed) {
+      this.deferred.delete(agentId);
+      await this.restoreConversationPin(agentId, previousBinding, members);
+      return false;
+    }
+    this.switchGuard.note(agentId, Date.now());
+    this.sameConversationProbe.set(agentId, { fromAccountId: account.id, toAccountId: next.id, previousBinding, members });
+    const continued = this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
+    await this.appendRow(paseo, agentId, {
+      ...base,
+      to: next.label,
+      reason,
+      continued,
+      outcome: "switched",
+      sameConversation: true,
+    });
+    if (continued) await this.carryOn(paseo, agentId, endedAt);
+    return true;
+  }
+
+  /**
+   * Puts the agent back on the account that can read the thread, then hands off to the other as
+   * today: a new tab there, or only a note while Keep going after a switch is off.
+   */
+  private async revertSameConversation(
+    paseo: PaseoApi,
+    agentId: string,
+    family: Family,
+    probe: SameConversationProbe,
+    timeline: readonly AgentTimelineItem[] | undefined,
+  ): Promise<void> {
+    const release = await this.claim(agentId);
+    try {
+      await this.restoreConversationPin(agentId, probe.previousBinding, probe.members);
+      await this.reopenAgent(paseo, agentId, { settle: true, sameConversation: true });
+      const state = await this.store.read();
+      const from = findAccount(state, probe.fromAccountId);
+      const to = findAccount(state, probe.toAccountId);
+      if (!from || !to || family !== "codex") return;
+      if (!this.prefs.autoContinue) {
+        await this.appendRow(paseo, agentId, {
+          family,
+          from: from.label,
+          to: to.label,
+          reason: "limit",
+          resetsAt: from.limitedUntil,
+          continued: false,
+          continuedIn: null,
+          toFamily: null,
+          toProvider: null,
+          outcome: "stayed",
+          detail: `New ${FAMILY_LABEL[family]} agents will use ${to.label}.`,
+          at: new Date().toISOString(),
+        });
+        return;
+      }
+      const why = `its ChatGPT account (${from.label}) reached its usage limit, and ${to.label} could not resume the thread`;
+      try {
+        const continuation = await this.continueElsewhere(paseo, agentId, to, why, timeline, "auto");
+        await this.appendRow(paseo, agentId, {
+          family,
+          from: from.label,
+          to: to.label,
+          reason: "limit",
+          resetsAt: from.limitedUntil,
+          continued: true,
+          continuedIn: continuation,
+          toFamily: null,
+          toProvider: null,
+          outcome: "continued",
+          detail: `${to.label} could not resume this thread.`,
+          at: new Date().toISOString(),
+        });
+      } catch (error) {
+        log(`could not continue ${agentId} on ${to.label}`, error);
+        await this.appendRow(paseo, agentId, {
+          family,
+          from: from.label,
+          to: to.label,
+          reason: "limit",
+          resetsAt: from.limitedUntil,
+          continued: false,
+          continuedIn: null,
+          toFamily: null,
+          toProvider: null,
+          outcome: "stayed",
+          detail: `Couldn't continue on ${to.label}: ${describe(error)}`,
+          at: new Date().toISOString(),
+        });
+      }
+    } finally {
+      release();
+    }
+  }
+
+  private conversationPins(state: StoredState, agentId: string): ConversationMemberPin[] {
+    const pins: ConversationMemberPin[] = [];
+    for (const [chainId, chain] of Object.entries(state.continuations)) {
+      const member = chain.members[agentId];
+      if (!member) continue;
+      pins.push({ chainId, accountId: member.accountId, identity: member.identity, email: member.email });
+    }
+    return pins;
+  }
+
+  private async restoreConversationPin(agentId: string, binding: Binding | undefined, members: readonly ConversationMemberPin[]): Promise<void> {
+    await this.store.update((draft) => {
+      if (binding) draft.bindings[agentId] = binding;
+      else delete draft.bindings[agentId];
+      for (const pin of members) {
+        const member = draft.continuations[pin.chainId]?.members[agentId];
+        if (!member) continue;
+        member.accountId = pin.accountId;
+        member.identity = pin.identity;
+        member.email = pin.email;
+      }
+    });
+  }
+
+  /** Makes the shared session link before a same-conversation reload. A failed link only warns. */
+  private async prepareSharedSessions(account: StoredAccount): Promise<void> {
+    if (account.kind !== "managed" || !account.home || account.family !== "codex") return;
+    await this.adapters.codex.prepareHome(account.home, this.stillHas(account)).catch((error: unknown) =>
+      log(`could not refresh the home of ${account.label}`, error),
+    );
   }
 
   private async continueElsewhere(
@@ -2607,7 +2951,7 @@ export class Service {
   private async reopenAgent(
     paseo: PaseoApi,
     agentId: string,
-    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean } = {},
+    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean } = {},
   ): Promise<ReopenResult> {
     const { row = null, settle = false, background = false, unattended = background } = options;
     let info: AgentInfo | null;
@@ -2628,7 +2972,9 @@ export class Service {
     const state = await this.store.read();
     // A thread whose session opened without ZeroSub (on the CLI login) belongs to the account it's
     // pinned to, which holds its history, so it reopens there.
-    if (family && !this.adapters[family].portable && info.hasHistory && (state.sessions[agentId] || !state.bindings[agentId])) {
+    // A same-conversation reload already pinned this thread to the other account. This guard would
+    // pin it back to the session it is leaving, so that one reload skips it.
+    if (!options.sameConversation && family && !this.adapters[family].portable && info.hasHistory && (state.sessions[agentId] || !state.bindings[agentId])) {
       // The thread gained history while waiting, so it can no longer change accounts: keep it put.
       const current = this.runningOn(state, agentId, family);
       if (current && findAccount(state, current)) {
@@ -2656,6 +3002,9 @@ export class Service {
       result = await this.reopener.reopen(agentId, paseo);
     } finally {
       this.reloads.delete(agentId);
+    }
+    if (result.ok && reload.opens === 0) {
+      result = { ok: false, error: "Paseo reported a reload but did not open a new provider session", timedOut: false };
     }
     if (result.ok && this.unrouted.has(agentId)) {
       // Paseo stopped waiting for routing and reopened the session as it was (see `onSessionOpen`).
@@ -2822,7 +3171,9 @@ export class Service {
       for (const agent of await this.liveAgents(paseo)) {
         const agentId = agent.id;
         const family = families[agent.provider];
-        if (!family || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
+        // A reload can't move an agent of a family that isn't available here: its session opens on
+        // the CLI login again (see `route`).
+        if (!family || this.availability.get(family)?.ok === false || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
         if (this.deferred.has(agentId)) {
           // Its switch waited for a turn that never came (it was only starting), or ended without it.
           if (settled(agent.status)) waiting.push({ agentId, family });
@@ -2865,7 +3216,7 @@ export class Service {
     canReopen: boolean,
     now: number,
   ): NonNullable<AgentRoute["waiting"]> {
-    if (!canReopen || this.failedMoves.get(agent.id) === target) return "restart";
+    if (!canReopen || this.failedMoves.get(agent.id) === target || this.availability.get(family)?.ok === false) return "restart";
     const deferred = this.deferred.get(agent.id);
     // Only a move left for its turn, or one alignment tries, happens before the session next starts.
     // One left for its turn goes ahead as `finishDeferred` checks: always when asked for, and when
@@ -2976,9 +3327,15 @@ export class Service {
       // A window limit clears once usage shows room again, or once credits cover it if a reading set
       // it: a limit a turn ran into stands, credits or not. Budget limits never appear in usage
       // windows, and a fresh limit is trusted for a while (it may be on a window we can't see).
+      // A reading only takes a limit from the account's own windows, so its limit clears on those:
+      // one model's full window (Claude's "Weekly · Fable") doesn't hold it, nor one set by a
+      // version that still took any full window for the account's.
       const settled = account.limitedAt ? now - Date.parse(account.limitedAt) > LIMIT_TRUST_MS : true;
-      const roomy = (creditsCover && account.limitSource === "reading") || Math.max(...usage.windows.map((window) => window.usedPercent)) < 90;
-      if (!full && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
+      const fromReading = account.limitSource === "reading";
+      const watched = fromReading ? usage.windows.filter(capsAccount) : usage.windows;
+      const stillFull = fromReading ? cutOff : full;
+      const roomy = (creditsCover && fromReading) || Math.max(...watched.map((window) => window.usedPercent)) < 90;
+      if (!stillFull && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
         await this.store.update((draft) => {
           const target = findAccount(draft, accountId);
           if (!target) return;
@@ -3060,8 +3417,9 @@ export class Service {
       });
     }
 
-    const piScripts = this.launcherAccounts(state);
-    const launcherOf = this.launcherFiles ?? launcherNames(piScripts);
+    const claudeScripts = this.launcherAccounts(state);
+    const piScripts = this.launcherAccounts(state, "pi");
+    const launcherOf = this.launcherFiles ?? new Map([...launcherNames(claudeScripts), ...launcherNames(piScripts, new Map(), "pi")]);
     const proxies = new Map<string, ProxyState>();
     const apis = new Map<string, ApiSummary | null>();
     const external = new Set<string>();
@@ -3070,7 +3428,8 @@ export class Service {
         const adapter = this.adapters[account.family];
         // A home of null is the CLI's own login; its files are only read here.
         if (adapter.proxyState && (account.kind === "main" || account.home)) {
-          proxies.set(account.id, await adapter.proxyState(account.home).catch((): ProxyState => ({ own: null, file: null, inherited: null })));
+          const unknown = (error: unknown): ProxyState => ({ own: null, file: null, inherited: null, blocked: describe(error) });
+          proxies.set(account.id, await adapter.proxyState(account.home).catch(unknown));
         }
         if (account.kind === "main" && adapter.mainApi && adapter.api) apis.set(account.id, await adapter.api(null).catch(() => null));
         if (account.kind !== "managed" || !account.home) return;
@@ -3082,13 +3441,13 @@ export class Service {
     // account without its own goes through.
     const followers = (family: Family) =>
       state.accounts.filter((other) => other.family === family && other.kind === "managed" && proxies.get(other.id)?.own === null).map((other) => other.label);
-    const piHomesNow = piHomesDir(state.piHomes);
+    const homesNow = (family: PlacedFamily) => homesDirFor(family, state[HOMES_KEY[family]]);
     const due = new Set((await this.dueMoves(state)).map((account) => account.id));
     const moving = (account: StoredAccount): AccountView["moving"] => {
       const move = state.moves[account.id];
       if (!move && !due.has(account.id)) return null;
       const note = this.moveNotes.get(account.id);
-      return { to: shownPath(move?.to ?? piHomesNow), waiting: note?.waiting ?? null, error: note?.error ?? null };
+      return { to: shownPath(move?.to ?? homesNow(account.family === "pi" ? "pi" : "claude")), waiting: note?.waiting ?? null, error: note?.error ?? null };
     };
     const accounts: AccountView[] = state.accounts.map((account) => {
       const limited = isLimited(account, now);
@@ -3109,10 +3468,11 @@ export class Service {
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
         auth: account.auth,
-        api: apis.get(account.id) ?? null,
+        api: apiView(apis.get(account.id)),
         apiEditable: account.auth === "api" || (account.kind === "main" && this.adapters[account.family].mainApi === true),
         proxy: proxy?.own ? maskProxy(proxy.own) : null,
         proxyEditable: proxy !== undefined,
+        proxyBlocked: proxy?.blocked ?? null,
         inheritedProxy: proxy?.inherited ? { ...proxy.inherited, proxy: maskProxy(proxy.inherited.proxy) } : null,
         proxyFile: proxy?.file ?? null,
         proxyFollowers: proxy?.file ? followers(account.family) : [],
@@ -3134,8 +3494,10 @@ export class Service {
       openCodeAvailable: await this.openCodeAvailable(paseo),
       autoSwitch: this.prefs.autoSwitch,
       warnings: await this.warnings(),
+      launchers: claudeScripts.length > 0 ? launcherDir() : null,
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
-      piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
+      claudeHomes: this.adapters.claude.homesInUse ? { dir: shownPath(homesNow("claude")), isDefault: state.claudeHomes.dir === null } : null,
+      piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(homesNow("pi")), isDefault: state.piHomes.dir === null } : null,
     };
   }
 
@@ -3176,8 +3538,8 @@ export class Service {
     const state = await this.store.read();
     for (const family of FAMILIES) {
       const availability = this.availability.get(family);
-      // Pi is optional: it's only missed once an account of it was added.
-      if (family === "pi" && !state.accounts.some((account) => account.family === "pi" && account.kind === "managed")) continue;
+      // An optional provider (Pi, Grok, Cursor) is only missed once an account of it was added.
+      if (OPTIONAL[family] && !state.accounts.some((account) => account.family === family && account.kind === "managed")) continue;
       if (availability && !availability.ok) {
         warnings.push(
           `${PROVIDER_NAME[family]} isn't installed where the daemon can run it${availability.detail ? ` (${availability.detail})` : ""}. Install it to add ${FAMILY_LABEL[family]} accounts.`,
@@ -3191,6 +3553,21 @@ export class Service {
     }
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
+    }
+    // Only once Grok is on the Accounts screen (its CLI login registered or an account of it added), like `shownFamilies`.
+    const grokSignIn = process.env.GROK_AUTH_PROVIDER_COMMAND || (process.env.GROK_OIDC_ISSUER && process.env.GROK_OIDC_CLIENT_ID);
+    if (grokSignIn && state.accounts.some((account) => account.family === "grok")) {
+      warnings.push(
+        "The daemon's environment sets a Grok sign-in (GROK_AUTH_PROVIDER_COMMAND, or GROK_OIDC_ISSUER and GROK_OIDC_CLIENT_ID). Grok agents on your CLI login use it; added Grok accounts don't, so one that can only sign in that way may fail to sign in or stay signed in.",
+      );
+    }
+    // Only once Cursor is on the Accounts screen (its CLI login registered or an account of it added), like `shownFamilies`.
+    const cursorLogin = ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].filter((key) => process.env[key]);
+    if (cursorLogin.length > 0 && state.accounts.some((account) => account.family === "cursor")) {
+      const it = cursorLogin.length > 1 ? "them" : "it";
+      warnings.push(
+        `The daemon's environment sets ${cursorLogin.join(" and ")}. Cursor agents on your CLI login use ${it}, and cursor-agent saves ${it} as that login; added Cursor accounts don't.`,
+      );
     }
     if (!(await this.canReopen(this.paseo))) {
       warnings.push(
@@ -3234,7 +3611,7 @@ export class Service {
     this.pinning += 1;
     try {
       await this.store.update((draft) => {
-        previous = draft.defaults[account.family];
+        previous = draft.defaults[account.family] ?? null;
         draft.defaults[account.family] = account.id;
       });
       if (portable && !this.prefs.moveAgentsOnDefaultChange) {
@@ -3404,7 +3781,7 @@ export class Service {
     const info = await lookUpAgent(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok or Cursor subscription accounts.`);
     const adapter = this.adapters[family];
     const state = await this.store.read();
     const target = accountId ? findAccount(state, accountId) : defaultAccount(state, family);
@@ -3421,6 +3798,7 @@ export class Service {
         const binding = state.bindings[agentId];
         const current = binding?.source === "thread" ? binding.accountId : this.runningOn(state, agentId, family);
         if (current === target.id) return emptySummary();
+        if (!HAND_OFF[family]) throw new Error(stays(family, findAccount(state, current)?.label ?? null));
         const from = findAccount(state, current)?.label ?? null;
         const handoff = (async (): Promise<ReopenSummary> => {
           const continuation = await this.withSwitch(agentId, () => this.continueElsewhere(
@@ -3487,7 +3865,7 @@ export class Service {
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
     // A Pi account's script is named after it.
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
   }
 
   /** Removes an account. Moving its agents can outlast the RPC: see `answerBy`. */
@@ -3498,7 +3876,7 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.kind === "main") {
-      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout` or Pi's /logout instead.");
+      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout`, `grok logout`, `cursor-agent logout` or Pi's /logout instead.");
     }
     if (!this.adapters[account.family].portable) {
       // These conversations can't move to another ChatGPT account, so removing theirs would strand them.
@@ -3511,19 +3889,21 @@ export class Service {
       );
       if (stranded.length > 0) {
         const one = stranded.length === 1;
+        const elsewhere = !HAND_OFF[account.family] ? "" : ` or continue ${one ? "it" : "them"} on another account from the account button`;
         throw new Error(
-          `${stranded.length} ChatGPT conversation${one ? "" : "s"} still ${one ? "runs" : "run"} on ${account.label} and can't move to another account. Archive ${
+          `${stranded.length} ${FAMILY_LABEL[account.family]} conversation${one ? "" : "s"} still ${one ? "runs" : "run"} on ${account.label} and can't move to another account. Archive ${
             one ? "it" : "them"
-          } (the work stays in your files) or continue ${one ? "it" : "them"} on another account from the account button, then remove ${account.label}.`,
+          } (the work stays in your files)${elsewhere}, then remove ${account.label}.`,
         );
       }
     }
     const affected = Object.entries(state.sessions)
       .filter(([, session]) => session.accountId === accountId)
       .map(([agentId]) => agentId);
-    // A home kept outside ZeroSub's own `homes/` (where added Pi accounts are kept) is the user's:
-    // removing its account only takes it out of ZeroSub, and its folder, key and script stay.
-    const kept = account.home !== null && account.family === "pi" && !(await isOwnHome(account.home));
+    // A home kept outside ZeroSub's own `homes/` (where added Claude and Pi accounts are kept) is the
+    // user's: removing its account only takes it out of ZeroSub, and its folder, sign-in or key and
+    // script stay.
+    const kept = account.home !== null && !(await isOwnHome(account.home));
     await this.store.update((draft) => {
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
       if (account.home && !kept) draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString() };
@@ -3535,9 +3915,9 @@ export class Service {
     });
     this.setUsage(accountId, null);
     this.egress.delete(accountId);
-    if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't in ${homesDir()}, so its files and script stay`);
+    if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't a folder ZeroSub made in ${homesDir()}, so its files and script stay`);
     // Its script is released rather than deleted when its home stays (see writeLaunchers).
-    await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the shell launchers", error));
     // Idle agents move now and busy ones after their turn. The home is signed out and deleted by the
     // cleanup pass only once nothing runs on it any more.
     const summary = emptySummary();
@@ -3549,12 +3929,15 @@ export class Service {
   // ------------------------------------------------------------------ Pi accounts
 
   /**
-   * Whether `account` is still registered, asked with its home's lock held before anything is
-   * written to it: a home whose account was removed meanwhile is never written to (or made again).
+   * Whether `account` still has the home it had, asked with its home's lock held before anything is
+   * written to it: a home whose account was removed or moved meanwhile, or that a move on record is
+   * taking it away from, is never written to (or made again, empty, beside the folder that moved).
    */
   private stillHas(account: StoredAccount): () => Promise<boolean> {
     return async () => {
-      const current = findAccount(await this.store.read(), account.id);
+      const state = await this.store.read();
+      if (state.moves[account.id]?.from === account.home) return false;
+      const current = findAccount(state, account.id);
       return current !== undefined && current.home === account.home;
     };
   }
@@ -3591,44 +3974,87 @@ export class Service {
     }
   }
 
-  /** Added Pi accounts, which each get a `pi-<account>.sh` script. */
-  private launcherAccounts(state: StoredState): LauncherAccount[] {
+  /** Added accounts of `kind`, which each get a `<kind>-<account>.sh` script. */
+  private launcherAccounts(state: StoredState, kind: LauncherKind = "claude"): LauncherAccount[] {
     return state.accounts.flatMap((account) =>
-      account.family === "pi" && account.kind === "managed" && account.home ? [{ id: account.id, label: account.label, home: account.home }] : [],
+      account.family === kind && account.kind === "managed" && account.home ? [{ id: account.id, label: account.label, home: account.home }] : [],
     );
   }
 
   /**
    * Rewrites the account scripts when the accounts or their names changed. A removed account's
    * script goes when its home does (`leaving`, or gone); one whose home stays is released to the user.
-   * Nothing is written while no Pi account is added.
+   * Each kind only touches its own scripts; Pi's are written only where Pi accounts are kept
+   * outside `homes/` (the real adapter, not test doubles).
    */
   private async refreshLaunchers(leaving: readonly string[] = []): Promise<void> {
-    // Only where Pi accounts are kept outside `homes/` (the real adapter; not test doubles).
-    if (!this.adapters.pi.homesInUse) return;
     const state = await this.store.read();
     // A home that's moving keeps its account's script, rewritten for where it's gone.
     const moved = new Map(Object.values(state.moves).map((move) => [resolve(move.from), move.to]));
-    this.launcherFiles = await writeLaunchers(this.launcherAccounts(state), piLauncherDir(), leaving, moved);
+    const files = new Map<string, string>();
+    const kinds: [LauncherKind, string][] = [["claude", launcherDir()]];
+    if (this.adapters.pi.homesInUse) kinds.push(["pi", piLauncherDir()]);
+    for (const [kind, directory] of kinds) {
+      const accounts = this.launcherAccounts(state, kind);
+      try {
+        const written = await writeLaunchers(accounts, directory, leaving, moved, kind);
+        for (const [accountId, name] of written) files.set(accountId, name);
+      } catch (error) {
+        // One kind's folder failing (say, ~/.claude-config can't be made) never stops the other's
+        // scripts; its accounts keep the names they had until it works again.
+        log(`could not write the ${kind === "claude" ? "Claude" : "Pi"} account scripts in ${directory}`, error);
+        for (const account of accounts) {
+          const name = this.launcherFiles?.get(account.id);
+          if (name !== undefined) files.set(account.id, name);
+        }
+      }
+    }
+    this.launcherFiles = files;
   }
 
   /**
-   * Sets an account's proxy; an empty value clears it. Processes started afterwards use it. Pi's own
-   * login's is kept in Pi's own settings, changed there only when asked to here.
+   * Sets an account's proxy; an empty value clears it. Processes started afterwards use it. The CLI
+   * login's is kept in the user's own settings when they set one (Pi's in Pi's settings, Claude's
+   * in `~/.claude/settings.json`), changed there only when asked to here.
    */
   async setProxy(accountId: string, input: string): Promise<string | null> {
-    const { account, proxy } = await this.onAccount(accountId, async (account) => {
+    const { account, proxy, kept } = await this.onAccount(accountId, async (account) => {
       if (!account) throw new Error("That account no longer exists.");
       const adapter = this.adapters[account.family];
-      const main = account.kind === "main" && adapter.mainApi === true;
-      if (!adapter.setProxy || !(main || (account.kind === "managed" && account.home))) throw new Error("A proxy can only be set for Pi accounts.");
+      const main = account.kind === "main";
+      if (!adapter.setProxy || !(main || (account.kind === "managed" && account.home))) throw new Error("A proxy can only be set for Claude and Pi accounts.");
       const proxy = input.trim() ? normalizeProxy(input) : null;
-      if (main && proxy && proxy !== (await adapter.proxyState?.(null))?.own) await this.refuseClearTextFollowers(account.family);
+      const kept = main ? await adapter.proxyState?.(null).catch(() => null) : null;
+      if (main && account.family === "pi" && proxy && proxy !== kept?.own) await this.refuseClearTextFollowers(account.family);
+      if (main && adapter.clearTextProxy && proxy && proxy !== kept?.own) await this.refuseClaudeFollowers(account.family, proxy);
+      const keyed = !main && account.auth === "api" && adapter.clearTextProxy ? await adapter.api?.(account.home).catch(() => null) : null;
+      const before = keyed ? (await adapter.proxyState?.(account.home))?.own ?? null : null;
+      // As with a new base URL, a key is never sent somewhere new: over plain http:// a proxy reads it.
+      if (keyed && proxy && proxy !== before && sentInTheClear(keyed.baseUrl)) {
+        throw new Error(
+          "This account sends its key over plain http://, which a proxy can read. To use a new proxy, remove the account and add it again with its key and the proxy, or switch to an https:// base URL.",
+        );
+      }
       await adapter.setProxy(main ? null : account.home, proxy, this.stillHas(account));
-      return { account, proxy };
+      // Without its own, it goes through the one it inherits: put its own back if that would read the key.
+      if (keyed && !proxy && before && account.home) {
+        const through = await adapter.clearTextProxy!(account.home, keyed.baseUrl);
+        if (through) {
+          await adapter.setProxy(account.home, before, this.stillHas(account));
+          throw new Error(
+            `This account sends its key over plain http://, and without its own proxy it would go through ${maskProxy(through)}, which could read it. Switch to an https:// base URL first, or keep this proxy.`,
+          );
+        }
+      }
+      return { account, proxy, kept };
     });
-    if (account.kind === "main") await this.followMainSettings(account.family);
-    else void this.checkEgress(account);
+    if (account.kind === "main" && account.family === "pi") {
+      await this.followMainSettings(account.family);
+    } else {
+      void this.checkEgress(account);
+      // The CLI login's proxy kept in main's settings is every added account's without one of its own.
+      if (account.kind === "main" && kept?.file) void this.followMainSettings(account.family);
+    }
     return proxy ? maskProxy(proxy) : null;
   }
 
@@ -3658,6 +4084,38 @@ export class Service {
   }
 
   /**
+   * Refuses an API account whose key would cross a proxy it only inherits (the daemon's, or the CLI
+   * login's) as plain http:// (see `FamilyAdapter.clearTextProxy`).
+   */
+  private async refuseClearText(adapter: FamilyAdapter, home: string, baseUrl: string | null): Promise<void> {
+    const through = await adapter.clearTextProxy?.(home, baseUrl);
+    if (!through) return;
+    throw new Error(
+      `${baseUrl} is plain http://, and the account would go through ${maskProxy(through)}, which could read its key. Use an https:// base URL, keep the gateway direct with NO_PROXY, or add it with a proxy of its own you trust.`,
+    );
+  }
+
+  /**
+   * As `refuseClearTextFollowers`, for Claude: a new proxy on the CLI login is every added account's
+   * without one of its own, so it's refused while one of those API accounts would send its key
+   * through it over plain http://, unless its no-proxy list keeps the gateway direct.
+   */
+  private async refuseClaudeFollowers(family: Family, proxy: string): Promise<void> {
+    const adapter = this.adapters[family];
+    for (const account of accountsOf(await this.store.read(), family)) {
+      const home = this.homeNow(account);
+      if (account.kind !== "managed" || account.auth !== "api" || !home) continue;
+      if ((await adapter.proxyState?.(home).catch(() => null))?.own) continue;
+      const api = await adapter.api?.(home).catch(() => null);
+      if (api && (await adapter.clearTextProxy!(home, api.baseUrl, proxy))) {
+        throw new Error(
+          `${account.label} has no proxy of its own and sends its key over plain http:// to ${api.baseUrl}, so this proxy could read it. Give ${account.label} an https:// base URL, or a proxy of its own, first.`,
+        );
+      }
+    }
+  }
+
+  /**
    * Remakes the added homes' files from the CLI login's, which just changed (its proxy goes to every
    * added account without one of its own), and checks where those accounts' requests come from now.
    */
@@ -3672,16 +4130,18 @@ export class Service {
   }
 
   /**
-   * Checks where an added account's requests come from; a failed check keeps the last address it
-   * saw. The CLI login is never checked, so nothing is sent while no account is added.
+   * Checks where an account's requests come from; a failed check keeps the last address it saw.
+   * Pi's own login is never checked: only an added Pi account's requests are ZeroSub's to place, so
+   * nothing is sent while none is added. Claude's CLI login is, as its proxy can be set here too.
    */
   private async checkEgress(account: StoredAccount): Promise<void> {
     const adapter = this.adapters[account.family];
-    if (!adapter.egress || account.kind !== "managed" || !account.home || !account.signedIn) return;
+    if (!adapter.egress || !account.signedIn) return;
+    if (account.kind === "main" ? account.family !== "claude" : !account.home) return;
     this.egressCheckedAt.set(account.id, Date.now());
     const checkedAt = new Date().toISOString();
     try {
-      const seen = await this.onAccount(account.id, async (current) => (current?.home ? adapter.egress!(current.home) : null));
+      const seen = await this.onAccount(account.id, async (current) => (current?.home || current?.kind === "main" ? adapter.egress!(current.home) : null));
       if (seen) this.egress.set(account.id, { ...seen, checkedAt, error: null });
       else this.egress.delete(account.id);
     } catch (error) {
@@ -3699,35 +4159,41 @@ export class Service {
    * Adds a Pi account: an Anthropic API key, optionally sent to another base URL, with an optional
    * proxy. Set up in `homes/`, then moved to where Pi accounts are kept (see `placeHomes`).
    */
-  async addApiAccount(input: { label: string; key: string; baseUrl?: string; proxy?: string }): Promise<string> {
-    const adapter = this.adapters.pi;
+  async addApiAccount(input: ApiAccountInput & { label: string; key: string; proxy?: string; family?: "claude" | "pi" }): Promise<string> {
+    // Pi's are an Anthropic API key and nothing else, so its form sends no kind; Claude's always says which.
+    const family = input.family ?? (input.keyKind ? "claude" : "pi");
+    const keyKind = input.keyKind ?? "api_key";
+    const adapter = this.adapters[family];
     if (!adapter.setApi) throw new Error("API accounts aren't supported here.");
+    if (family === "pi" && keyKind !== "api_key") throw new Error("Pi accounts use an API key (x-api-key), not an auth token.");
     const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
     const proxy = input.proxy?.trim() ? normalizeProxy(input.proxy) : null;
     const key = input.key.trim();
-    if (!key) throw new Error("Enter the API key.");
+    if (!key) throw new Error(family === "pi" ? "Enter the API key." : "Enter the API key or token.");
     const identity = apiIdentity(baseUrl, keyDigest(key));
-    const duplicate = accountsOf(await this.store.read(), "pi").find((account) => account.identity === identity);
+    const duplicate = accountsOf(await this.store.read(), family).find((account) => sameApiIdentity(account.identity, identity));
     if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
 
     // A managed account's ID matches its home's folder name, as its cleanup entry does.
-    const id = `pi-${randomBytes(6).toString("hex")}`;
+    const id = `${family}-${randomBytes(6).toString("hex")}`;
     const home = join(homesDir(), id);
     this.creatingHomes.add(home);
     try {
       // On the cleanup list until the account is saved, so a home left half made is cleaned up even
       // after a restart. While it's being made, cleanup leaves it alone.
       await this.store.update((draft) => {
-        draft.cleanup[home] = { family: "pi", accountId: id, why: "unfinished", at: new Date().toISOString() };
+        draft.cleanup[home] = { family, accountId: id, why: "unfinished", at: new Date().toISOString() };
       });
       if (proxy) await adapter.setProxy?.(home, proxy);
-      await adapter.setApi(home, { key, baseUrl });
+      await adapter.setApi(home, { ...trafficSwitches(input), keyKind, key, baseUrl });
       await adapter.prepareHome(home);
+      // A proxy typed in along with the key is the user's to trust; one the account would only inherit isn't.
+      if (!proxy) await this.refuseClearText(adapter, home, baseUrl);
       await this.store.update((draft) => {
         // Checked again here too: another add of the same key may have finished meanwhile.
-        const twin = accountsOf(draft, "pi").find((entry) => entry.identity === identity);
+        const twin = accountsOf(draft, family).find((entry) => sameApiIdentity(entry.identity, identity));
         if (twin) throw new Error(`That key is already added as "${twin.label}".`);
-        const account = newAccount({ id, family: "pi", kind: "managed", home, auth: "api" });
+        const account = newAccount({ id, family, kind: "managed", home, auth: "api" });
         account.label = input.label.trim();
         account.autoLabel = false;
         account.identity = identity;
@@ -3738,7 +4204,7 @@ export class Service {
       // Gone now, or left on the cleanup list for a later pass.
       const removed = await removeHome(home).then(
         () => true,
-        () => false,
+        (failure: unknown) => (log(`could not delete the half-made home ${home}; the cleanup pass tries again`, failure), false),
       );
       if (removed) await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
       throw error;
@@ -3746,14 +4212,14 @@ export class Service {
       this.creatingHomes.delete(home);
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     const added = findAccount(await this.store.read(), id);
     if (added) void this.checkEgress(added);
     return id;
   }
 
-  /** Changes a Pi account's key (empty keeps it) or base URL; Pi's own login's too, when asked to here. */
-  async updateApiAccount(accountId: string, input: { key?: string; baseUrl?: string }): Promise<void> {
+  /** Changes an API account's key (empty keeps it), base URL or traffic switches; Pi's own login's too, when asked to here. */
+  async updateApiAccount(accountId: string, input: ApiAccountInput & { key?: string }): Promise<void> {
     await this.onAccount(accountId, async (account) => {
       if (!account) throw new Error("That account no longer exists.");
       const adapter = this.adapters[account.family];
@@ -3761,7 +4227,7 @@ export class Service {
       const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
       // Pi's own login keeps its key in Pi's own files, which the adapter changes in place.
       if (account.kind === "main" && adapter.mainApi && adapter.setApi) {
-        await adapter.setApi(null, { key, baseUrl });
+        await adapter.setApi(null, { ...trafficSwitches(input), keyKind: "api_key", key, baseUrl });
         await this.followMainSettings(account.family);
         return;
       }
@@ -3769,21 +4235,69 @@ export class Service {
       // A kept key stays on its base URL (the adapter refuses to move it), so its identity holds.
       const identity = key ? apiIdentity(baseUrl, keyDigest(key)) : null;
       if (identity) {
-        const duplicate = accountsOf(await this.store.read(), account.family).find((entry) => entry.id !== account.id && entry.identity === identity);
+        const duplicate = accountsOf(await this.store.read(), account.family).find((entry) => entry.id !== account.id && sameApiIdentity(entry.identity, identity));
         if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
       }
-      await adapter.setApi(account.home, { key, baseUrl }, this.stillHas(account));
+      if (!(await adapter.proxyState?.(account.home).catch(() => null))?.own) await this.refuseClearText(adapter, account.home, baseUrl);
+      await adapter.setApi(account.home, { ...trafficSwitches(input), keyKind: input.keyKind ?? "api_key", key, baseUrl }, this.stillHas(account));
       await this.store.update((draft) => {
         const target = findAccount(draft, accountId);
         if (!target) return;
-        if (!identity) return;
-        target.identity = identity;
-        // A new key is worth trying again even if the old one had been refused.
-        target.signedIn = true;
+        if (identity) target.identity = identity;
+        // A new key is worth trying again even if the old one had been refused. A Pi account's key is
+        // only marked refused by Anthropic, so a new base URL alone doesn't clear that; a Claude one's
+        // refusal may be the endpoint's, so saving its settings again tries it again.
+        if (key || account.family !== "pi") target.signedIn = true;
       });
     });
     const account = findAccount(await this.store.read(), accountId);
     if (account) void this.checkEgress(account);
+  }
+
+  /**
+   * Adds a folder Claude Code is signed in with already (with a subscription) as an account: one the
+   * user set up, or one ZeroSub kept when its account was removed. The folder stays where it is,
+   * unless it's in ZeroSub's `homes/` or a folder picked before, which it moves out of like any
+   * account's (see `placeHomes`); removing the account later only takes it out of ZeroSub, as for
+   * any folder outside `homes/`. Refused, saying why, for a folder `chooseImportedHome` turns down,
+   * one not signed in with a Claude subscription, or one signed in as an account here already.
+   * Returns the new account's ID.
+   */
+  async importAccount(input: string): Promise<string> {
+    const home = await chooseImportedHome(input, (await this.store.read()).accounts);
+    const shown = shownPath(home);
+    if ([...this.logins.values()].some((login) => login.home === home && !login.finishedAt)) throw new Error(`${shown} is being signed in right now.`);
+    const identity = await this.adapters.claude.identity(home).catch((error: unknown) => {
+      throw new Error(`ZeroSub couldn't tell whether ${shown} is signed in: ${describe(error)}`);
+    });
+    if (!identity.signedIn) {
+      throw new Error(
+        `Claude Code isn't signed in with ${shown}. Sign in there first (CLAUDE_CONFIG_DIR=${shown} claude, then /login), using the same path, or add the account with a Claude subscription sign-in instead.`,
+      );
+    }
+    if (!identity.identity) throw new Error(`${shown} uses an API key or token, not a Claude subscription. Add it with "API key or token" instead.`);
+    let account: StoredAccount | undefined;
+    await this.store.update((draft) => {
+      if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
+      // The CLI's own login counts too: an added account must be one of its own.
+      const duplicate = accountsOf(draft, "claude").find((entry) => entry.identity === identity.identity);
+      if (duplicate) throw new Error(`${identity.email ?? shown} is already added as "${duplicate.label}".`);
+      // A folder of ZeroSub's own gets its ID back: a managed account's ID matches its folder's name there.
+      const name = basename(home);
+      const id = inHomesDir(home) && /^claude-[0-9a-f]{12}$/.test(name) && !findAccount(draft, name) ? name : `claude-${randomBytes(6).toString("hex")}`;
+      account = newAccount({ id, family: "claude", kind: "managed", home });
+      draft.accounts.push(account);
+      applyIdentity(account, identity, draft);
+      // A removed account's folder that's back isn't cleaned up after all.
+      for (const folder of Object.keys(draft.cleanup)) if (resolve(folder) === home) delete draft.cleanup[folder];
+    });
+    const added = account!;
+    this.identityCheckedAt.set(added.id, Date.now());
+    console.log(`[ZeroSub] added ${home}, signed in already, as ${added.label}`);
+    await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
+    void this.refreshUsage(added.id, true).catch(() => undefined);
+    return added.id;
   }
 
   /**
@@ -3812,7 +4326,7 @@ export class Service {
     let account: StoredAccount | undefined;
     await this.store.update((draft) => {
       if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
-      const duplicate = accountsOf(draft, "pi").find((entry) => entry.identity === identity);
+      const duplicate = accountsOf(draft, "pi").find((entry) => sameApiIdentity(entry.identity, identity));
       if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
       const name = basename(home);
       const id = inHomesDir(home) && /^pi-[0-9a-f]{12}$/.test(name) && !findAccount(draft, name) ? name : `pi-${randomBytes(6).toString("hex")}`;
@@ -3828,48 +4342,50 @@ export class Service {
     await this.adapters.pi.prepareHome(home, this.stillHas(added)).catch((error: unknown) => log(`could not refresh the home of ${added.label}`, error));
     console.log(`[ZeroSub] added the Pi account in ${home} back as ${added.label}`);
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     void this.checkEgress(added);
     return added.id;
   }
 
   /**
-   * Changes the folder added Pi accounts' homes are kept in (empty: the default, `~/.pi-config`).
-   * New accounts go there, and the accounts in the folder it replaces, or still in ZeroSub's
-   * `homes/`, move there one at a time as nothing runs on them (see `placeHomes`). Returns the
-   * folder as shown, and how many accounts are due to move.
+   * Changes the folder `family`'s added accounts' homes are kept in (empty: the default,
+   * `~/.claude-config` or `~/.pi-config`). New accounts go there, and the accounts in the folder it
+   * replaces, or still in ZeroSub's `homes/`, move there one at a time as nothing runs on them (see
+   * `placeHomes`). Returns the folder as shown, and how many accounts are due to move.
    */
-  async setPiHomesDir(input: string): Promise<{ dir: string; moving: number }> {
+  async setHomesDir(input: string, family: PlacedFamily): Promise<{ dir: string; moving: number }> {
     const state = await this.store.read();
-    const chosen = await choosePiHomesDir(input, state.accounts);
-    const previous = resolve(piHomesDir(state.piHomes));
+    const key = HOMES_KEY[family];
+    const chosen = await chooseHomesDir(input, state.accounts, family);
+    const previous = resolve(homesDirFor(family, state[key]));
     const updated = await this.store.update((draft) => {
-      const from = new Set(draft.piHomes.from.map((folder) => resolve(folder)));
+      const from = new Set(draft[key].from.map((folder) => resolve(folder)));
       from.add(previous);
-      from.delete(resolve(piHomesDir({ dir: chosen, from: [] })));
-      draft.piHomes = { dir: chosen, from: [...from] };
+      from.delete(resolve(homesDirFor(family, { dir: chosen, from: [] })));
+      draft[key] = { dir: chosen, from: [...from] };
     });
     this.moveNotes.clear();
-    const dir = piHomesDir(updated.piHomes);
-    console.log(`[ZeroSub] added Pi accounts' homes are kept in ${dir} now`);
+    const dir = homesDirFor(family, updated[key]);
+    console.log(`[ZeroSub] added ${FAMILY_LABEL[family]} accounts' homes are kept in ${dir} now`);
     void this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    return { dir: shownPath(dir), moving: (await this.dueMoves(updated)).length };
+    return { dir: shownPath(dir), moving: (await this.dueMoves(updated)).filter((account) => account.family === family).length };
+  }
+
+  setClaudeHomesDir(input: string): Promise<{ dir: string; moving: number }> {
+    return this.setHomesDir(input, "claude");
+  }
+
+  setPiHomesDir(input: string): Promise<{ dir: string; moving: number }> {
+    return this.setHomesDir(input, "pi");
   }
 
   /**
-   * Moves added Pi accounts' homes to the folder they're kept in (see `piHomesDir`): a new account's
-   * from ZeroSub's own `homes/`, where it was set up, and every account's from a folder picked
-   * before. Moves cut short (the plugin stopped halfway) are finished first. Each home moves only
-   * while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass, and the app
-   * says why. One pass at a time; a call during one gets that one.
-   */
-
-  /**
-   * Moves added Pi accounts' homes to the folder they're kept in (see `piHomesDir`): a new account's
-   * from ZeroSub's own `homes/`, where it was set up, and every account's from a folder picked
-   * before. Moves cut short (the plugin stopped halfway) are finished first. Each home moves only
-   * while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass, and the app
-   * says why. One pass at a time; a call during one gets that one.
+   * Moves added Claude and Pi accounts' homes to the folder they're kept in (see `homesDirFor`): a
+   * new account's from ZeroSub's own `homes/`, where it was set up, and every account's from a
+   * folder picked before. Moves cut short (the plugin stopped halfway) are finished first. Each home
+   * moves only while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass,
+   * and the app says why. Only families whose adapter can tell what runs on a home take part. One
+   * pass at a time; a call during one gets that one.
    */
   placeHomes(): Promise<void> {
     this.placing ??= this.placePass().finally(() => {
@@ -3878,38 +4394,69 @@ export class Service {
     return this.placing;
   }
 
-  private async placePass(): Promise<void> {
-    const adapter = this.adapters.pi;
-    if (!adapter.homesInUse) return;
+  /**
+   * Finishes the moves on record that aren't under way in this process (ones a stop cut short).
+   * Runs before homes are synced or a session is routed: either would otherwise make the old folder
+   * again for a home whose registry entry still names it, or open an agent there without its sign-in.
+   */
+  private async finishRecordedMoves(): Promise<void> {
     for (const [accountId, move] of Object.entries((await this.store.read()).moves)) {
-      await this.finishMove(accountId, move).catch((error: unknown) => {
+      if (this.moving.has(accountId)) continue;
+      await this.finishOne(accountId, move).catch((error: unknown) => {
         this.moveNotes.set(accountId, { waiting: null, error: describe(error) });
         log(`could not finish moving ${move.from} to ${move.to}`, error);
       });
     }
+  }
+
+  /** Whether a move of an account's home is on record and not under way here: one a stop cut short. */
+  private hasRecordedMoves(state: StoredState): boolean {
+    return Object.keys(state.moves).some((accountId) => !this.moving.has(accountId));
+  }
+
+  /** `finishMove`, once at a time per account: the pass, routing and the move itself may all ask. */
+  private finishOne(accountId: string, move: Move): Promise<void> {
+    let finishing = this.finishing.get(accountId);
+    if (!finishing) {
+      finishing = this.finishMove(accountId, move).finally(() => this.finishing.delete(accountId));
+      this.finishing.set(accountId, finishing);
+    }
+    return finishing;
+  }
+
+  private async placePass(): Promise<void> {
+    await this.finishRecordedMoves();
     const state = await this.store.read();
     const due = await this.dueMoves(state);
     for (const accountId of this.moveNotes.keys()) {
       if (!due.some((account) => account.id === accountId) && !state.moves[accountId]) this.moveNotes.delete(accountId);
     }
     if (due.length === 0) return this.forgetEmptiedFolders(state);
-    let inUse: Set<string>;
-    try {
-      inUse = await adapter.homesInUse(due.map((account) => account.home));
-    } catch (error) {
-      for (const account of due) this.moveNotes.set(account.id, { waiting: null, error: `ZeroSub couldn't tell whether anything runs on it: ${describe(error)}` });
-      return;
+    const inUse = new Set<string>();
+    const unknown = new Set<string>();
+    for (const family of PLACED) {
+      const homes = due.filter((account) => account.family === family).map((account) => account.home);
+      if (homes.length === 0) continue;
+      try {
+        for (const home of await this.adapters[family].homesInUse!(homes)) inUse.add(home);
+      } catch (error) {
+        for (const account of due.filter((entry) => entry.family === family)) {
+          unknown.add(account.id);
+          this.moveNotes.set(account.id, { waiting: null, error: `ZeroSub couldn't tell whether anything runs on it: ${describe(error)}` });
+        }
+      }
     }
-    const dir = piHomesDir(state.piHomes);
     const taken = new Set(state.accounts.flatMap((account) => (account.home ? [resolve(account.home)] : [])));
     let moved = false;
     for (const account of due) {
+      if (unknown.has(account.id)) continue;
+      const family = account.family as PlacedFamily;
       const waiting = this.moveBlocker(account, inUse);
       if (waiting) {
         this.moveNotes.set(account.id, { waiting, error: null });
         continue;
       }
-      const to = await placeFor(account, dir, taken);
+      const to = await placeFor(account, homesDirFor(family, state[HOMES_KEY[family]]), taken);
       taken.add(resolve(to));
       try {
         if (await this.moveAccountHome(account, to)) moved = true;
@@ -3918,24 +4465,28 @@ export class Service {
         log(`could not move the home of ${account.label} to ${to}`, error);
       }
     }
-    if (moved) await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    if (moved) await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
   }
 
   /**
-   * Added Pi accounts whose homes are due to move: a folder of their own (a link stays where it
-   * points) in ZeroSub's `homes/` or a folder picked before, and no move of theirs under way.
+   * Added Claude and Pi accounts whose homes are due to move: a folder of their own (a link stays
+   * where it points) in ZeroSub's `homes/` or a folder picked before, and no move of theirs under way.
+   * Only families whose adapter can tell what runs on a home (the real ones; not test doubles).
    */
   private async dueMoves(state: StoredState): Promise<Array<StoredAccount & { home: string }>> {
-    if (!this.adapters.pi.homesInUse) return [];
-    const dir = resolve(piHomesDir(state.piHomes));
-    const sources = new Set([homesDir(), ...state.piHomes.from].map((folder) => resolve(folder)));
     const due: Array<StoredAccount & { home: string }> = [];
-    for (const account of accountsOf(state, "pi")) {
-      const home = account.home;
-      if (account.kind !== "managed" || !home || state.moves[account.id]) continue;
-      const folder = dirname(resolve(home));
-      if (folder === dir || !sources.has(folder)) continue;
-      if ((await lstat(home).catch(() => null))?.isDirectory()) due.push({ ...account, home });
+    for (const family of PLACED) {
+      if (!this.adapters[family].homesInUse) continue;
+      const homes = state[HOMES_KEY[family]];
+      const dir = resolve(homesDirFor(family, homes));
+      const sources = new Set([homesDir(), ...homes.from].map((folder) => resolve(folder)));
+      for (const account of accountsOf(state, family)) {
+        const home = account.home;
+        if (account.kind !== "managed" || !home || state.moves[account.id]) continue;
+        const folder = dirname(resolve(home));
+        if (folder === dir || !sources.has(folder)) continue;
+        if ((await lstat(home).catch(() => null))?.isDirectory()) due.push({ ...account, home });
+      }
     }
     return due;
   }
@@ -3943,8 +4494,9 @@ export class Service {
   /** Why an account's home can't move just now, or null when it can. */
   private moveBlocker(account: StoredAccount & { home: string }, inUse: ReadonlySet<string>): string | null {
     const { home } = account;
+    if ([...this.logins.values()].some((login) => login.home === home && (!login.finishedAt || login.saving))) return "it's being signed in";
     if (this.creatingHomes.has(home)) return "it's being set up";
-    if (inUse.has(home)) return "Pi runs on it (an agent or a terminal); it moves once that stops";
+    if (inUse.has(home)) return `${PROVIDER_NAME[account.family]} runs on it (an agent or a terminal); it moves once that stops`;
     if ((this.homeCalls.get(home) ?? 0) > 0) return "ZeroSub is working on it";
     if (Date.now() - (this.routedAt.get(account.id) ?? 0) < ROUTED_SETTLE_MS) return "an agent has just started on it";
     return null;
@@ -3955,29 +4507,36 @@ export class Service {
    * routed to the home, or a call of ZeroSub's on it, while the folder is being moved makes the move
    * give way (the folder goes back, and it's tried at a later pass), and once the move is saved
    * they're given the new folder (see `homeNow`). The move is written down first (`moves`), so one
-   * cut short is finished or undone at the next pass (see `finishMove`). Everything a Pi account has
-   * is in its folder, so the folder is all that moves. False when it had to wait after all.
+   * cut short is finished or undone at the next pass (see `finishMove`). What the CLI keeps for the
+   * home outside its folder (Claude's Keychain entry) is copied before the folder moves, and the
+   * copy goes again when the move gives way. False when it had to wait after all.
    */
   private async moveAccountHome(account: StoredAccount & { home: string }, to: string): Promise<boolean> {
+    const adapter = this.adapters[account.family];
     const from = account.home;
-    const homesInUse = (homes: readonly string[]) => this.adapters.pi.homesInUse!(homes);
+    const homesInUse = (homes: readonly string[]) => adapter.homesInUse!(homes);
     const waiting = this.moveBlocker(account, await homesInUse([from]));
     if (waiting) {
       this.moveNotes.set(account.id, { waiting, error: null });
       return false;
     }
     const startedAt = Date.now();
-    const move: Move = { from, to, at: new Date(startedAt).toISOString() };
+    const move: Move = { from, to, at: new Date(startedAt).toISOString(), family: account.family };
     const run: HomeMove = { from, to, committed: false };
     this.moving.set(account.id, run);
     try {
       await this.store.update((draft) => void (draft.moves[account.id] = move));
+      let copied = false;
       try {
+        await adapter.copyCredentials?.(from, to);
+        copied = true;
         await moveHome(from, to, async () => {
           // Checked again once the folder is there: anything that started on it meanwhile keeps it.
           const started = (await homesInUse([from])).has(from)
-            ? "Pi started on it (an agent or a terminal); it moves once that stops"
-            : (this.homeCalls.get(from) ?? 0) > 0
+            ? `${PROVIDER_NAME[account.family]} started on it (an agent or a terminal); it moves once that stops`
+            : [...this.logins.values()].some((login) => login.home === from && !login.finishedAt)
+              ? "it's being signed in"
+              : (this.homeCalls.get(from) ?? 0) > 0
               ? "ZeroSub is working on it"
               : (this.routedAt.get(account.id) ?? 0) >= startedAt
                 ? "an agent has just started on it"
@@ -3996,9 +4555,13 @@ export class Service {
           }
         });
       } catch (error) {
-        // Still where it was: the record goes. Otherwise it stays, for `finishMove` to sort out.
+        // Still where it was: the copy of its sign-in goes, and so does the record. Otherwise the
+        // record stays, for `finishMove` to sort out.
         const back = (await lstat(from).catch(() => null))?.isDirectory() && !(await lstat(to).catch(() => null));
-        if (back) await this.store.update((draft) => void delete draft.moves[account.id]).catch(() => undefined);
+        if (back) {
+          if (copied) await adapter.dropCopiedCredentials?.(from, to).catch((failure: unknown) => log(`could not remove the copy of ${account.label}'s sign-in for ${to}`, failure));
+          await this.store.update((draft) => void delete draft.moves[account.id]).catch(() => undefined);
+        }
         if (!(error instanceof MoveGaveWay)) throw error;
         this.moveNotes.set(account.id, { waiting: error.message, error: null });
         return false;
@@ -4007,49 +4570,59 @@ export class Service {
     } finally {
       this.moving.delete(account.id);
     }
-    await this.finishMove(account.id, move);
+    await this.finishOne(account.id, move);
     return true;
   }
 
   /**
-   * Finishes a recorded move of an account's home. Cut short before the folder moved: the move is
-   * tried again. After the folder moved but before the account's new home was saved: it's saved now.
-   * Both folders there before it's saved: the account goes with the one that has its key
-   * (`zerosub.json`). Only the new one has it when Pi made the old folder again while the move was
-   * checking for Pi (a terminal with the old script, say), so the folder couldn't go back: the move is
-   * finished, and the old folder left alone. Otherwise, and when neither folder is there, it's left as
-   * it is for the user, and the app says so, never asking to delete the folder with the key. The old
-   * folder still there after (a copy onto another disk not cleaned up) is left alone, and logged. The
-   * account's script is rewritten for the new home before the record goes.
+   * Finishes a recorded move of an account's home. Cut short before the folder moved: the copy of
+   * its sign-in goes, and the move is tried again. After the folder moved but before the account's
+   * new home was saved: the sign-in is copied (again) and the new home saved. Both folders there
+   * before it's saved: the account goes with the one that holds its sign-in or key (see
+   * `FamilyAdapter.holdsAccount`). Only the new one does when the old folder was made again after
+   * the folder moved (by the CLI on the old script, say): the move is finished, and the old folder
+   * left alone. Otherwise, and when neither folder is there, it's left as it is for the user, and
+   * the app says so, never asking to delete the folder that holds the account. Once it's saved, the
+   * old Keychain entry goes, provided the new one holds the sign-in. The old folder still there
+   * after (a copy onto another disk not cleaned up) is left alone, and logged. The account's script
+   * is rewritten for the new home before the record goes.
    */
   private async finishMove(accountId: string, move: Move): Promise<void> {
     const forget = () => this.store.update((draft) => void delete draft.moves[accountId]);
     let account = findAccount(await this.store.read(), accountId);
+    // Records of earlier versions have no family: the account says whose home it is.
+    const family = move.family ?? account?.family;
+    const adapter = family ? this.adapters[family] : undefined;
     const folder = async (path: string) => (await lstat(path).catch(() => null))?.isDirectory() === true;
     const [atFrom, atTo] = [await folder(move.from), await folder(move.to)];
     if (account?.home === move.from) {
       if (atFrom && !atTo) {
+        await adapter?.dropCopiedCredentials?.(move.from, move.to);
         await forget();
         return;
       }
-      const keyed = async (path: string) => (await lstat(join(path, PI_ACCOUNT_FILE)).catch(() => null))?.isFile() === true;
-      const [keyFrom, keyTo] = atFrom && atTo ? [await keyed(move.from), await keyed(move.to)] : [false, false];
-      if (atFrom && atTo && keyTo && !keyFrom) {
-        console.log(`[ZeroSub] ${move.from} was made again while ${account.label} moved to ${move.to}, which has its key; finishing the move and leaving ${move.from} alone (delete it yourself)`);
+      const holds = async (path: string) => (adapter?.holdsAccount ? adapter.holdsAccount(path) : false);
+      const [holdsFrom, holdsTo] = atFrom && atTo ? [await holds(move.from), await holds(move.to)] : [false, false];
+      if (atFrom && atTo && holdsTo && !holdsFrom) {
+        console.log(`[ZeroSub] ${move.from} was made again while ${account.label} moved to ${move.to}, which holds its sign-in or key; finishing the move and leaving ${move.from} alone (delete it yourself)`);
       } else if (atFrom || !atTo) {
         throw new Error(
           !atFrom
             ? `ZeroSub stopped while moving ${shownPath(move.from)} to ${shownPath(move.to)}, and neither is there now.`
-            : keyFrom
+            : holdsFrom
               ? `ZeroSub stopped while copying ${shownPath(move.from)} to ${shownPath(move.to)} on another disk, and both are there now. The account still uses ${shownPath(move.from)}: delete ${shownPath(move.to)}, and the move starts again at ZeroSub's next check.`
-              : `Both ${shownPath(move.from)} and ${shownPath(move.to)} are there, and neither has the account's key (${PI_ACCOUNT_FILE}). Enter its key again from its card.`,
+              : `Both ${shownPath(move.from)} and ${shownPath(move.to)} are there, and neither holds ${account.label}'s sign-in or key. Sign it in again, or give it its key again, from its card.`,
         );
       }
+      await adapter?.copyCredentials?.(move.from, move.to);
       await this.store.update((draft) => {
         const target = findAccount(draft, accountId);
         if (target?.home === move.from) target.home = move.to;
       });
       account = findAccount(await this.store.read(), accountId);
+    }
+    if (account?.home === move.to && adapter?.dropOldCredentials && !(await adapter.dropOldCredentials(move.from, move.to))) {
+      console.log(`[ZeroSub] kept the sign-in saved for ${move.from}: ${move.to} has none of its own`);
     }
     // While the move is still on record, so the account's script is rewritten, not released.
     if (account?.home === move.to) await this.refreshLaunchers();
@@ -4066,19 +4639,19 @@ export class Service {
     const used = (folder: string) =>
       state.accounts.some((account) => account.home && dirname(resolve(account.home)) === resolve(folder)) ||
       Object.values(state.moves).some((move) => dirname(resolve(move.from)) === resolve(folder));
-    if (state.piHomes.from.every(used)) return;
+    if (PLACED.every((family) => state[HOMES_KEY[family]].from.every(used))) return;
     await this.store.update((draft) => {
-      draft.piHomes.from = draft.piHomes.from.filter(used);
+      for (const family of PLACED) draft[HOMES_KEY[family]].from = draft[HOMES_KEY[family]].from.filter(used);
     });
   }
 
   // ------------------------------------------------------------------ RPC: sign-in
 
-  startLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
-    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId));
+  startLogin(family: Family, method: LoginMethod, accountId?: string, proxy?: string): Promise<LoginView> {
+    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId, proxy));
   }
 
-  private async beginLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
+  private async beginLogin(family: Family, method: LoginMethod, accountId?: string, proxyInput?: string): Promise<LoginView> {
     // Pi's added accounts are API keys, and its own login signs in inside Pi.
     if (family === "pi") throw new Error("Pi accounts use an Anthropic API key: add one with Add account, or change its key from its card. Sign Pi's own login in with /login inside Pi.");
     let availability = this.availability.get(family);
@@ -4094,6 +4667,14 @@ export class Service {
     const state = await this.store.read();
     const existing = accountId ? findAccount(state, accountId) : undefined;
     if (accountId && (!existing || existing.family !== family)) throw new Error("That account no longer exists.");
+    if (existing?.auth === "api") throw new Error(`${existing.label} uses an API key. Change the key from its card instead.`);
+    // The CLI would sign in into the folder the account is leaving, and the sign-in go with it.
+    if (existing && (this.moving.has(existing.id) || state.moves[existing.id])) {
+      throw new Error(`${existing.label}'s folder is being moved. Sign it in again once that's done (its card says when).`);
+    }
+    // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
+    const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
+    if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
 
     const id = randomBytes(6).toString("hex");
     const home = existing ? existing.home : join(homesDir(), `${family}-${id}`);
@@ -4127,7 +4708,8 @@ export class Service {
           draft.cleanup[home] = { family, accountId: `${family}-${id}`, why: "unfinished", at: new Date().toISOString() };
         });
       }
-      if (home) await this.adapters[family].prepareHome(home);
+      if (home && proxy) await this.adapters[family].setProxy?.(home, proxy);
+      if (home) await this.adapters[family].prepareHome(home, existing ? this.stillHas(existing) : undefined);
       const handle = await this.adapters[family].login(home, method);
       if (session.finishedAt) {
         handle.cancel();
@@ -4237,7 +4819,11 @@ export class Service {
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
     if (accountId && handedOver) this.forgetReading(accountId);
     session.accountId = accountId;
+    // A new account's script is there by the time the app says it's added; its home then moves out
+    // of `homes/` to where accounts are kept.
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     session.view = { ...session.view, step: "done", accountId, message: null };
+    void this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
@@ -4252,9 +4838,34 @@ export class Service {
 
 // -------------------------------------------------------------------- helpers
 
+/** An adapter's API summary as the app shows it, the key kind and switches filled in. */
+function apiView(api: ApiSummary | null | undefined): AccountView["api"] {
+  return api ? ApiSummarySchema.parse(api) : null;
+}
+
+/** An API account's fields as the app sends them. */
+type ApiAccountInput = Partial<TrafficSwitches> & { keyKind?: ApiKeyKind; baseUrl?: string };
+
+/** The traffic switches in `input`, each off unless it's on. */
+function trafficSwitches(input: Partial<TrafficSwitches>): TrafficSwitches {
+  return {
+    disableTelemetry: input.disableTelemetry === true,
+    disableErrorReporting: input.disableErrorReporting === true,
+    disableNonessentialTraffic: input.disableNonessentialTraffic === true,
+  };
+}
+
 /** What tells an API key's account from another: where the key goes, and a short hash of the key. */
+/** Anthropic's API, which a blank base URL means too. */
+const ANTHROPIC_API = "https://api.anthropic.com";
+
 function apiIdentity(baseUrl: string | null, digest: string): string {
-  return `api|${baseUrl ?? "anthropic"}|${digest}`;
+  return `api|${baseUrl === null || baseUrl === ANTHROPIC_API ? "anthropic" : baseUrl}|${digest}`;
+}
+
+/** Whether `identity`, as an account was saved with, is `wanted`: one saved with Anthropic's API typed out is the same as one without. */
+function sameApiIdentity(identity: string | null, wanted: string): boolean {
+  return identity !== null && identity.replace(`api|${ANTHROPIC_API}|`, "api|anthropic|") === wanted;
 }
 
 function keyDigest(key: string): string {

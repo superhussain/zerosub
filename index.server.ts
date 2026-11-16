@@ -1,6 +1,8 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
+import { CursorAdapter } from "./server/cursor";
+import { GrokAdapter } from "./server/grok";
 import { PiAdapter } from "./server/pi";
 import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
@@ -17,8 +19,10 @@ import {
   setNextAgentAccount,
   setAccountEnabled,
   forkAgent,
+  importAccount,
   importPiAccount,
   setAccountProxy,
+  setClaudeHomesDir,
   setPiHomesDir,
   startLogin,
   submitLoginCode,
@@ -26,7 +30,7 @@ import {
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
-  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter() });
+  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter(), grok: new GrokAdapter(), cursor: new CursorAdapter() });
 
   const settings = server.registerSettings(preferences);
   const applySettings = (state: PluginSettingsState<typeof preferences.schema>) => {
@@ -85,7 +89,7 @@ export default function contribute(server: PluginServerContext) {
   }
 
   server.handle(getState, ({ refreshUsage }, { paseo }) => service.view(paseo, refreshUsage));
-  server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));
+  server.handle(startLogin, ({ family, method, accountId, proxy }) => service.startLogin(family, method, accountId, proxy));
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
   server.handle(renameAccount, async ({ accountId, label }) => {
@@ -112,6 +116,8 @@ export default function contribute(server: PluginServerContext) {
     return { ok: true as const };
   });
   server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
+  server.handle(setClaudeHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setClaudeHomesDir(dir)) }));
+  server.handle(importAccount, async ({ path }) => ({ accountId: await service.importAccount(path) }));
   server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
   server.handle(importPiAccount, async ({ path }) => ({ accountId: await service.importPiAccount(path) }));
 

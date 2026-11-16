@@ -102,6 +102,12 @@ export const OpenCodeForkSchema = z.object({
         .optional(),
       /** SHA-256 of the exact sent text, so a receipt survives a provider reload. */
       sentDigest: z.string().optional(),
+      /**
+       * The create was seen to fail. Paseo keeps a failed request under its idempotency key, so a
+       * retry with another request needs new IDs. Without it, the outcome is unknown and only the
+       * reserved request may be sent again.
+       */
+      createFailed: z.boolean().optional(),
     })
     .optional(),
 });
@@ -159,14 +165,21 @@ export const CleanupSchema = z.object({
 });
 export type Cleanup = z.infer<typeof CleanupSchema>;
 
-export const PiHomesSchema = z.object({
+/**
+ * Where a family's added accounts' homes are kept: `dir` (null for the default, beside their
+ * scripts), and folders picked before whose accounts still move to it.
+ */
+export const HomesSchema = z.object({
   dir: z.string().nullable().default(null),
   from: z.array(z.string()).default([]),
 });
-export type PiHomes = z.infer<typeof PiHomesSchema>;
+export type Homes = z.infer<typeof HomesSchema>;
 
-/** A home being moved, written before anything moves, so a move cut short is finished from here. */
-export const MoveSchema = z.object({ from: z.string(), to: z.string(), at: z.string() });
+/**
+ * A home being moved, written before anything moves, so a move cut short is finished from here.
+ * `family`: whose home it is (missing in records of earlier versions; the account says whose).
+ */
+export const MoveSchema = z.object({ from: z.string(), to: z.string(), at: z.string(), family: FamilySchema.optional() });
 export type Move = z.infer<typeof MoveSchema>;
 
 export const StoredStateSchema = z.object({
@@ -177,6 +190,9 @@ export const StoredStateSchema = z.object({
       claude: z.string().nullable().default(null),
       codex: z.string().nullable().default(null),
       pi: z.string().nullable().default(null),
+      // Families added later than Pi may be absent (none chosen), so registries and fixtures written before them load as they are.
+      grok: z.string().nullable().optional(),
+      cursor: z.string().nullable().optional(),
     })
     .default({ claude: null, codex: null, pi: null }),
   /** Per-agent overrides of the default account. */
@@ -197,16 +213,20 @@ export const StoredStateSchema = z.object({
       claude: NextAgentPickSchema.nullable().default(null),
       codex: NextAgentPickSchema.nullable().default(null),
       pi: NextAgentPickSchema.nullable().default(null),
+      grok: NextAgentPickSchema.nullable().optional(),
+      cursor: NextAgentPickSchema.nullable().optional(),
     })
     .default({ claude: null, codex: null, pi: null }),
   /** Where added Pi accounts' homes are kept: `dir` (null: `~/.pi-config`), and folders picked before whose accounts still move to it. */
-  piHomes: PiHomesSchema.default({ dir: null, from: [] }),
+  piHomes: HomesSchema.default({ dir: null, from: [] }),
+  /** Where added Claude accounts' homes are kept, as for Pi's (`dir` null: `~/.claude-config`). */
+  claudeHomes: HomesSchema.default({ dir: null, from: [] }),
   /** Homes being moved, by account (see `Service.placeHomes`). */
   moves: z.record(z.string(), MoveSchema).default({}),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
-export const MAIN_ACCOUNT_ID: Record<Family, string> = { claude: "claude-main", codex: "codex-main", pi: "pi-main" };
+export const MAIN_ACCOUNT_ID: Record<Family, string> = { claude: "claude-main", codex: "codex-main", pi: "pi-main", grok: "grok-main", cursor: "cursor-main" };
 
 export function emptyState(): StoredState {
   return StoredStateSchema.parse({});
@@ -251,7 +271,8 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       opencodeHolds: records(OpenCodeHoldSchema, source.opencodeHolds),
       cleanup: records(CleanupSchema, source.cleanup),
       nextAgent: { claude: null, codex: null, pi: null },
-      piHomes: keep(PiHomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
+      piHomes: keep(HomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
+      claudeHomes: keep(HomesSchema, source.claudeHomes ?? {}) ?? { dir: null, from: [] },
       moves: records(MoveSchema, source.moves),
     },
     dropped: true,

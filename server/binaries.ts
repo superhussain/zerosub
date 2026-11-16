@@ -1,6 +1,7 @@
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { FAMILIES, type Family } from "../shared/model";
+import { acpCommand, familiesFromConfig } from "./families";
 import { readJson } from "./json-file";
 import { dataDir, paseoHome } from "./paths";
 
@@ -35,6 +36,40 @@ export async function providerCommand(provider: Family): Promise<Command> {
   // Paseo's Pi provider also takes its binary from PI_COMMAND (or the older PI_ACP_PI_COMMAND).
   const fallback = provider === "pi" ? process.env.PI_COMMAND?.trim() || process.env.PI_ACP_PI_COMMAND?.trim() || "pi" : provider;
   return cache.value[provider] ?? { command: fallback, prefix: [] };
+}
+
+/**
+ * The binary of the Paseo provider that runs Grok Build (see `ACP_COMMANDS` in families.ts), preferring
+ * one with the id `grok`, as Paseo's catalog names it; null when no provider runs Grok, or the config
+ * can't be read.
+ */
+export function grokBinary(): Promise<string | null> {
+  return acpBinary("grok");
+}
+
+/** The same for Cursor's agent (`cursor-agent acp`), preferring the provider with the id `cursor`. */
+export function cursorBinary(): Promise<string | null> {
+  return acpBinary("cursor");
+}
+
+/** The binary of a custom ACP provider of `family`, preferring the one whose id is the family's. */
+async function acpBinary(family: Family): Promise<string | null> {
+  try {
+    const config = (await readJson(join(paseoHome(), "config.json"))) as { agents?: { providers?: Record<string, unknown> } } | undefined;
+    const providers = config?.agents?.providers;
+    const ids = Object.entries(familiesFromConfig(providers))
+      .filter(([, found]) => found === family)
+      .map(([id]) => id)
+      .sort((a, b) => (a === family ? -1 : b === family ? 1 : 0));
+    for (const id of ids) {
+      const entry = providers?.[id];
+      const binary = acpCommand(family, entry && typeof entry === "object" && !Array.isArray(entry) ? (entry as Record<string, unknown>) : undefined);
+      if (binary) return binary;
+    }
+  } catch {
+    // Unreadable config: no provider to go by.
+  }
+  return null;
 }
 
 let browserShim: Promise<string | null> | null = null;
