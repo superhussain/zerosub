@@ -108,7 +108,7 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
 
 interface SetUpOptions {
   /** How `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
-  reload?: "works" | "fails" | "times out" | "fails after another";
+  reload?: "no session" | "works" | "fails" | "times out" | "fails after another";
   /** Runs when `paseo agent reload` starts, before Paseo asks where the new session opens. */
   reloading?: () => Promise<void>;
   /** Replaces parts of the Claude adapter. */
@@ -139,6 +139,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     locate: async () => "/usr/local/bin/paseo",
     reopen: async (id: string) => {
       reopened.push(id);
+      if (options.reload === "no session") return { ok: true as const };
       await options.reloading?.();
       await reopenedSession();
       if (options.reload === "fails after another") {
@@ -399,6 +400,23 @@ describe("when the CLI login changes hands", () => {
 });
 
 describe("failover", () => {
+  it("does not continue or claim a switch when a successful CLI never opens a session", async () => {
+    const { store, sent, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
+      { reload: "no session" },
+    );
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(sent).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "pending", continued: false });
+    expect(notes.at(-1)?.detail).toContain("did not open a new provider session");
+  });
+
   it("blames the CLI login for a session ZeroSub never routed, even when the agent is bound elsewhere", async () => {
     // Today's incident: the agent's session predates zerosub, and a switch to "hello" was waiting.
     const { store, reopened, sent, notes, limitTurn } = await setUp(
@@ -772,7 +790,19 @@ describe("forking to the other provider", () => {
       onModes?: (provider: string) => void;
       send?: (id: string, text: string, messageId: string | undefined) => void;
       createdStatus?: string;
+      /** Paseo 0.9.1 to 0.10.3: refreshing an agent it doesn't know throws instead of answering null. */
+      unknownThrows?: boolean;
+      /** Makes every create fail with this message, after Paseo has recorded its request. */
+      createError?: string;
+      /** Makes every create throw this client-side error, with no answer from Paseo. */
+      clientError?: string;
     } = {};
+    /** Paseo's creation receipts: each idempotency key's first request fingerprint. */
+    const receipts = new Map<string, string>();
+    const fingerprintOf = (value: unknown) =>
+      JSON.stringify(value, (_key, entry) =>
+        entry && typeof entry === "object" && !Array.isArray(entry) ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b))) : entry,
+      );
     await store.update((draft) =>
       Object.assign(draft, {
         accounts: options.noChatGPT
@@ -848,7 +878,24 @@ describe("forking to the other provider", () => {
       workspaces: {
         ref: (workspaceId: string) => ({
           agents: {
-            create: async (request: (typeof created)[number]) => {
+            create: async ({ onEvent, ...request }: (typeof created)[number] & { onEvent?: (snapshot: { phase: string; error: string | null }) => void }) => {
+              // The client fails on its own, as on "Daemon client closed": Paseo's answer is never seen.
+              if (hooks.clientError) throw new Error(hooks.clientError);
+              // Paseo ties an idempotency key to its first request, failed or not: the same key with
+              // another request is refused, and the same request again doesn't make a second agent.
+              if (request.idempotencyKey) {
+                const { idempotencyKey: _key, ...intent } = request;
+                const fingerprint = fingerprintOf({ ...intent, workspaceId });
+                const first = receipts.get(request.idempotencyKey);
+                if (first !== undefined && first !== fingerprint) throw new Error("agent_request_key_conflict");
+                receipts.set(request.idempotencyKey, fingerprint);
+                if (byId.has(request.agentId)) return;
+              }
+              if (hooks.createError) {
+                // Paseo answers with its failed creation result, which the client throws as its error.
+                onEvent?.({ phase: "failed", error: hooks.createError });
+                throw new Error(hooks.createError);
+              }
               created.push({ ...request, workspaceId });
               const agent = {
                 id: request.agentId,
@@ -856,7 +903,7 @@ describe("forking to the other provider", () => {
                 status: hooks.createdStatus ?? "idle",
                 currentModeId: request.config.modeId,
                 title: request.title,
-                workspaceId: "ws-1",
+                workspaceId,
                 archivedAt: null,
                 labels: request.labels,
               };
@@ -871,6 +918,7 @@ describe("forking to the other provider", () => {
         ref: (id: string) => ({
           refresh: async () => {
             hooks.onRefresh?.(id);
+            if (hooks.unknownThrows && !byId.has(id)) throw new Error(`Agent not found: ${id}`);
             return { agent: byId.get(id) ?? null };
           },
           send: async (text: string, options: { messageId?: string } = {}) => {
@@ -996,6 +1044,31 @@ describe("forking to the other provider", () => {
     expect(prompt).toContain("User: Now run the linter");
   });
 
+  it("carries an orchestrator's agent_message instructions when forking a sub-agent", async () => {
+    const lead = { id: "lead", provider: "claude", status: "idle", title: "Lead the release", workspaceId: "ws-1", archivedAt: null, labels: {} };
+    const agentPrompt = (id: string, text: string): AgentTimelineItem =>
+      ({
+        type: "tool_call",
+        callId: `paseo-agent-message:${id}`,
+        name: "agent_message",
+        status: "completed",
+        error: null,
+        agentMessage: { event: "message", sender: { id: "lead", title: "Lead the release" }, text },
+        detail: { type: "plain_text", text, icon: "bot" },
+      }) as AgentTimelineItem;
+    const conversation = [
+      ...inTurn("t0", agentPrompt("m1", "Implement the parser"), { type: "assistant_message", text: "Parser skeleton ready." }),
+      ...inTurn("t", agentPrompt("m2", "Now run the linter"), { type: "assistant_message", text: "You've hit your session limit · resets 3pm (UTC)" }),
+    ];
+    const { created, limitTurn } = await setUpFork("bypassPermissions", conversation, { "paseo.parent-agent-id": "lead" }, [lead]);
+    await limitTurn();
+    const prompt = created[0]?.prompt ?? "";
+    expect(prompt).toContain("From Lead the release (lead): Implement the parser");
+    expect(prompt).toContain("Assistant: Parser skeleton ready.");
+    expect(prompt).toContain("From Lead the release (lead): Now run the linter");
+    expect(prompt).not.toContain("[agent_message]");
+  });
+
   describe("forking to OpenCode", () => {
       const PREFS = {
       forkOtherProvider: true,
@@ -1003,6 +1076,16 @@ describe("forking to the other provider", () => {
       forkOpenCodeModel: "opencode/glm-5p3-flash",
       forkOpenCodeThinking: "high",
     };
+
+    it("treats a saved Paseo 0.16 Default thinking option as the model default", async () => {
+      const catalog = [
+        { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "default", label: "Default", isDefault: true }, { id: "high", label: "High" }] },
+      ];
+      const { created, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: { ...PREFS, forkOpenCodeThinking: "default" }, catalog });
+      await limitTurn();
+      expect(created).toHaveLength(1);
+      expect(created[0]?.config).toEqual({ provider: "opencode/opencode/glm-5p3-flash", modeId: "build" });
+    });
 
     it("continues a stopped Claude chat on OpenCode with the saved model, thinking, and no account", async () => {
       const { store, created, notes, sends, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
@@ -1122,6 +1205,28 @@ describe("forking to the other provider", () => {
         detail: "No update was sent: the OpenCode continuation already has everything from this agent.",
         continuedIn: { agentId: forkId },
       });
+    });
+
+    it("sends an agent's or a schedule's prompt after the fork as an instruction, not as progress", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      const toolPrompt = (callId: string, name: string, text: string, agentMessage?: object) =>
+        ({ type: "tool_call", callId, name, status: "completed", error: null, ...(agentMessage ? { agentMessage } : {}), detail: { type: "plain_text", text, icon: "bot" } }) as AgentTimelineItem;
+      setup.addTurn(AGENT, toolPrompt("paseo-agent-message:m9", "agent_message", "STOP: do not push anything", {
+        event: "message",
+        sender: { id: "lead", title: "Lead" },
+        text: "STOP: do not push anything",
+      }));
+      setup.addTurn(AGENT, toolPrompt("paseo-system:nightly", "heartbeat", "Run the nightly regression check"));
+      await setup.limitTurn();
+      const update = setup.sends.at(-1)!.text;
+      const users = update.slice(update.indexOf("<user-updates>"), update.indexOf("</user-updates>"));
+      const progress = update.slice(update.indexOf("<progress-updates>"), update.indexOf("</progress-updates>"));
+      expect(users).toContain("STOP: do not push anything");
+      expect(users).toContain("Run the nightly regression check");
+      expect(progress).not.toContain("STOP: do not push anything");
+      expect(progress).not.toContain("Run the nightly regression check");
     });
 
     /** A settled fork whose source gained only a plugin note, with `act` run once as its watermark is saved. */
@@ -1259,32 +1364,112 @@ describe("forking to the other provider", () => {
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
     });
 
-    it("retries a failed create with a new model pick and a renamed source, under the same target ID", async () => {
-      const catalog = [
-        { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] },
-        { id: "opencode/kimi-k3", label: "Kimi K3", thinkingOptions: [{ id: "high", label: "High" }] },
-      ];
-      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog });
-      const paseo = setup.paseo as { workspaces: { ref: unknown } };
-      const workspaces = paseo.workspaces.ref;
-      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("GLM is down"); } } });
+    it("retries a lost create on Paseo 0.9.1 to 0.10.3, where refreshing the absent target throws", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.unknownThrows = true;
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation();
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends.map((send) => send.messageId)).toEqual([RESERVED.messageId]);
+    });
+
+    const KIMI_CATALOG = [
+      { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] },
+      { id: "opencode/kimi-k3", label: "Kimi K3", thinkingOptions: [{ id: "high", label: "High" }] },
+    ];
+
+    it("starts a failed create again under new IDs once its model or title changed", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog: KIMI_CATALOG });
+      setup.hooks.createError = "GLM is down";
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
-      paseo.workspaces.ref = workspaces;
+      delete setup.hooks.createError;
       const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(reserved.createFailed).toBe(true);
       setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
       setup.byId.get(AGENT)!.title = "Fix the build and the tests";
       const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
       expect(done.delivery).toBe("sent");
+      // Paseo keeps the failed request under its key, so a changed request needs a key of its own.
       expect(setup.created).toHaveLength(1);
-      // The target ID stays the create's idempotency key: a first create that did land can't double.
       expect(setup.created[0]).toMatchObject({
-        agentId: reserved.targetId,
-        idempotencyKey: reserved.targetId,
         title: "Fix the build and the tests (continued on OpenCode)",
         config: { provider: "opencode/opencode/kimi-k3" },
       });
+      expect(setup.created[0]!.agentId).not.toBe(reserved.targetId);
+      expect(setup.created[0]!.idempotencyKey).toBe(setup.created[0]!.agentId);
       expect(setup.sends).toHaveLength(1);
-      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+      expect(setup.sends[0]!.messageId).not.toBe(reserved.messageId);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.forkAgentId).toBe(setup.created[0]!.agentId);
+      expect(record.pending).toBeUndefined();
+    });
+
+    it("retries a failed create unchanged under the same target and message IDs", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createError = "GLM is down";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      delete setup.hooks.createError;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(reserved.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({ agentId: reserved.targetId, idempotencyKey: reserved.targetId });
+      expect(setup.sends.map((send) => send.messageId)).toEqual([reserved.messageId]);
+    });
+
+    it("keeps a create's outcome unknown when the client fails before Paseo answers", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog: KIMI_CATALOG });
+      setup.hooks.clientError = "Daemon client closed";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/Daemon client closed/);
+      delete setup.hooks.clientError;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(reserved.createFailed).toBeUndefined();
+      // The daemon may still finish that create, so a changed pick must not mint new IDs.
+      setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({ agentId: reserved.targetId, config: { provider: "opencode/opencode/glm-5p3-flash" } });
+    });
+
+    it("marks a create failed when Paseo refuses its key for another request", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createError = "GLM is down";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      delete setup.hooks.createError;
+      // An outcome-unknown reservation whose frozen request no longer matches Paseo's record of the key.
+      await setup.store.update((draft) => {
+        const pending = draft.opencodeForks[AGENT]!.pending!;
+        delete pending.createFailed;
+        pending.config!.title = "Another title";
+      });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/agent_request_key_conflict/);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending!.createFailed).toBe(true);
+    });
+
+    it("retries a create interrupted before its outcome was seen with the reserved request, not the new model pick", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog: KIMI_CATALOG });
+      setup.hooks.createError = "GLM is down";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      delete setup.hooks.createError;
+      // The service stopped before it saw the rejection: Paseo has the request, the record doesn't know how it ended.
+      await setup.store.update((draft) => {
+        delete draft.opencodeForks[AGENT]!.pending!.createFailed;
+      });
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({
+        agentId: reserved.targetId,
+        idempotencyKey: reserved.targetId,
+        title: "Fix the build (continued on OpenCode)",
+        config: { provider: "opencode/opencode/glm-5p3-flash", modeId: "build", thinkingOptionId: "high" },
+      });
+      expect(setup.sends.map((send) => send.messageId)).toEqual([reserved.messageId]);
     });
 
     const damage = {
@@ -1399,7 +1584,42 @@ describe("forking to the other provider", () => {
       atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
       expect(setup.created).toHaveLength(0);
-      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending;
+      expect(pending?.stage).toBe("creating");
+      // Its outcome is still unknown: only the frozen request may go out under its key.
+      expect(pending?.createFailed).toBeUndefined();
+    });
+
+    it("starts a fresh create again when the source moved before the create was sent", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(0);
+      const first = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(first.createFailed).toBe(true);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({ workspaceId: "ws-2" });
+      expect(setup.created[0]!.agentId).not.toBe(first.targetId);
+    });
+
+    it("keeps a failed create's reservation retryable when the source moves before it is sent again", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation();
+        draft.opencodeForks[AGENT].pending!.createFailed = true;
+      });
+      atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(0);
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(pending.targetId).toBe(RESERVED.targetId);
+      expect(pending.createFailed).toBe(true);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]!.agentId).not.toBe(RESERVED.targetId);
     });
 
     it.each([
@@ -1722,6 +1942,20 @@ describe("forking to the other provider", () => {
       const record = (await setup.store.read()).opencodeForks[AGENT]!;
       expect(record.forkAgentId).toBe(done.agentId);
       expect(record.pending).toBeUndefined();
+    });
+
+    it("continues on OpenCode again once the fork of an unconfirmed send is gone on Paseo 0.9.1 to 0.10.3", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      setup.hooks.unknownThrows = true;
+      setup.byId.delete(RESERVED.targetId);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(done.agentId).not.toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
     });
 
     it("reuses the same message ID when an update's acknowledgement was lost", async () => {
@@ -2098,6 +2332,20 @@ describe("forking to the other provider", () => {
       expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
       expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's \(“Bypass”\)/);
   });
+
+    it("never picks an OpenCode mode whose colorTier is an agent's color", async () => {
+      // Paseo 0.16 reports a colored OpenCode agent's hex color as its colorTier, in place of the tier.
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], {
+        prefs: PREFS,
+        opencodeModes: [
+          { id: "build", label: "Build", colorTier: "#f97316" },
+          { id: "plan", label: "Plan", colorTier: "#3b82f6" },
+        ],
+      });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's/);
+    });
   });
 
   describe("a continuation of the other kind", () => {
@@ -2143,11 +2391,9 @@ describe("forking to the other provider", () => {
 
     it("never ends with two continuations after a failed OpenCode create, a ChatGPT fork, then Continue on OpenCode", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
-      const paseo = setup.paseo as { workspaces: { ref: unknown } };
-      const workspaces = paseo.workspaces.ref;
-      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      setup.hooks.createError = "OpenCode couldn't start";
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
-      paseo.workspaces.ref = workspaces;
+      delete setup.hooks.createError;
       expect((await setup.store.read()).opencodeForks[AGENT]?.pending?.stage).toBe("creating");
       await setup.service.forkAgent(setup.paseo, AGENT);
       expect(setup.created.map((agent) => agent.config.provider.split("/")[0])).toEqual(["codex"]);
@@ -2158,13 +2404,22 @@ describe("forking to the other provider", () => {
       expect(setup.sends).toHaveLength(0);
     });
 
+    it("forks to ChatGPT after a failed OpenCode create on Paseo 0.9.1 to 0.10.3, where refreshing the absent target throws", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
+      setup.hooks.unknownThrows = true;
+      setup.hooks.createError = "OpenCode couldn't start";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
+      delete setup.hooks.createError;
+      await setup.service.forkAgent(setup.paseo, AGENT);
+      expect(setup.created.map((agent) => agent.config.provider.split("/")[0])).toEqual(["codex"]);
+      expect((await setup.store.read()).opencodeForks[AGENT]).toBeUndefined();
+    });
+
     it("keeps an OpenCode reservation when a later ChatGPT fork is refused before it starts", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false }, noChatGPT: true });
-      const paseo = setup.paseo as { workspaces: { ref: unknown } };
-      const workspaces = paseo.workspaces.ref;
-      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      setup.hooks.createError = "OpenCode couldn't start";
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
-      paseo.workspaces.ref = workspaces;
+      delete setup.hooks.createError;
       const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
       await expect(setup.service.forkAgent(setup.paseo, AGENT)).rejects.toThrow();
       expect(setup.created).toHaveLength(0);
@@ -2396,6 +2651,44 @@ describe("usage readings", () => {
     await service.refreshUsage(MAIN, true);
     expect(await limitedUntil(store)).toBeNull();
     expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  const fableFull = (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: 8, resetsAt: inFuture() },
+      { id: "seven_day", label: "Weekly", usedPercent: 73, resetsAt: inFuture() },
+      { id: "weekly_fable", label: "Weekly · Fable", usedPercent: 100, resetsAt: inFuture() },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+  });
+
+  it("clears a limit a reading took once the account's own windows have room, one model's window full or not", async () => {
+    // Saved by a version that took any full window for the account's: the account stayed blocked until Fable reset.
+    const { service, store, paseo } = await setUp(
+      state({ limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast(), limitSource: "reading" }),
+      unused,
+      { usage: fableFull },
+    );
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  it("leaves a limit a turn ran into while one model's window is full", async () => {
+    // The turn may have hit that model's limit: the account's room says nothing about it.
+    const { service, store, limitTurn } = await setUp(
+      state(),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
+      { usage: fableFull },
+    );
+    await limitTurn();
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
   });
 
   it("takes a full window without credits for a limit, whatever the setting", async () => {
@@ -4188,5 +4481,108 @@ describe("pending placements", () => {
     } finally {
       logged.mockRestore();
     }
+  });
+});
+
+describe("an API account's refused key", () => {
+  const API = "claude-api";
+
+  it("marks the account and moves the agent to a subscription account", async () => {
+    const refused = () => "Invalid API key · Fix external API key";
+    const { store, reopened, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), { ...account(API, "gateway", "managed"), auth: "api" }] as never,
+        defaults: { claude: API, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: API, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: refused },
+    );
+    await limitTurn();
+    const state = await store.read();
+    // `claude auth status` would still say "logged in" for any key, so the refusal is what counts.
+    expect(state.accounts.find((a) => a.id === API)?.signedIn).toBe(false);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "gateway", to: "marketing", outcome: "switched" });
+  });
+
+  it("leaves a subscription account alone when its login still checks out", async () => {
+    const { store, reopened, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: () => "Not logged in · Please run /login" },
+    );
+    await limitTurn();
+    expect((await store.read()).accounts.find((a) => a.id === HELLO)?.signedIn).toBe(true);
+    expect(reopened).toEqual([]);
+  });
+});
+
+describe("forking to the other provider by hand", () => {
+  /** A ChatGPT agent out of room, and Claude accounts as given; the fork never gets as far as starting an agent. */
+  async function refusal(claude: Array<Record<string, unknown>>) {
+    const CODEX_MAIN = MAIN_ACCOUNT_ID.codex;
+    const store = new StateStore(join(root, "state.json"));
+    await store.update((draft) =>
+      Object.assign(draft, {
+        accounts: [{ ...account(CODEX_MAIN, "hello", "main"), family: "codex", limitedUntil: inFuture(), limitKind: "window" }, ...claude],
+        defaults: { claude: MAIN, codex: CODEX_MAIN, pi: null },
+      }),
+    );
+    const agent = { id: AGENT, provider: "codex", status: "idle", title: "Fix the build", archivedAt: null, labels: {} };
+    const paseo = {
+      config: { get: async () => ({ config: { providers: {} } }) },
+      providers: { listAvailable: async () => ({ providers: [{ provider: "claude", available: true }, { provider: "codex", available: true }] }) },
+      agents: {
+        list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
+        ref: () => ({ refresh: async () => ({ agent }) }),
+      },
+    };
+    const service = new Service(
+      {
+        claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "" })),
+        codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        pi: absentPi(),
+      },
+      store,
+      { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
+      { locate: async () => "/usr/local/bin/paseo", reopen: async () => ({ ok: true as const }) } as unknown as Reopener,
+    );
+    return service.forkAgent(paseo as never, AGENT);
+  }
+
+  it("says an API account won't take the work over, rather than that every account is at its limit", async () => {
+    const limited = { ...account(MAIN, "marketing", "main"), limitedUntil: inFuture(), limitKind: "window" };
+    const api = { ...account("claude-api", "gateway", "managed"), auth: "api" };
+    await expect(refusal([limited, api])).rejects.toThrow(/only Claude accounts with room use an API key/);
+    await expect(refusal([limited])).rejects.toThrow("Every Claude account is at its limit too.");
+  });
+});
+
+describe("an API account at a limit with every other account out", () => {
+  it("is never spent a banked reset on automatically, which it doesn't have", async () => {
+    const redeemed: Array<string | null> = [];
+    const api = { ...account("claude-api", "Gateway", "managed"), auth: "api" as const };
+    const main = { ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window" as const };
+    const { service, limitTurn } = await setUp(
+      {
+        accounts: [main as never, api as never],
+        defaults: { claude: "claude-api", codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: "claude-api", family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "429 from the gateway" }),
+      { claude: { redeemReset: async (home: string | null) => (redeemed.push(home), { outcome: "reset", message: "Limits reset.", left: 0 }) } },
+    );
+    service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
+    await limitTurn();
+    expect(redeemed).toEqual([]);
   });
 });

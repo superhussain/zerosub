@@ -46,6 +46,11 @@ export const SwitchRowSchema = z.object({
   outcome: z.enum(["switched", "pending", "continued", "stayed", "reset"]).default("switched"),
   /** Delivery state for a fork row. Undefined retains the pre-delivery-status rendering. */
   delivery: z.enum(["sent", "up-to-date", "found", "uncertain"]).optional(),
+  /**
+   * The agent reloaded on `to` and kept this conversation. Absent on older rows, and on a new-tab
+   * handoff, so a client that does not know the field still parses the row.
+   */
+  sameConversation: z.boolean().optional(),
   detail: z.string().nullable().default(null),
   at: z.string(),
 });

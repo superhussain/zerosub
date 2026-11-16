@@ -3,8 +3,8 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, describeReopen, formatAge, formatCredits, formatExtraUsage, formatPlan, staleNotice, usageSummary } from "../shared/format";
-import { FAMILIES, FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
+import { accountSubtitle, describeReopen, egressText, formatAge, formatCredits, formatExtraUsage, formatPlan, staleNotice, usageSummary } from "../shared/format";
+import { FAMILY_LABEL, HAND_OFF, shownFamilies, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
   clearAccountLimit,
@@ -15,8 +15,9 @@ import {
   setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { ApiAccountModal } from "./api-account";
 import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
-import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
+import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -45,8 +46,9 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   // Keep usage moving while the screen is open.
   useEffect(() => store.watch(VISIBLE_POLL_MS), [store]);
 
-  // Pi shows once its CLI login is registered (Pi is installed where the daemon runs) or an account of it was added.
-  const families = FAMILIES.filter((family) => family !== "pi" || state?.accounts.some((account) => account.family === "pi"));
+  // An optional provider (Pi, Grok, Cursor) shows once its CLI login is registered (its CLI is there,
+  // and for Grok and Cursor a Paseo provider runs it) or an account of it was added.
+  const families = shownFamilies(state?.accounts ?? []);
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
       <ScrollView
@@ -77,8 +79,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ) : null}
           </View>
           <Text style={text.muted}>
-            Keep several Claude and ChatGPT accounts signed in, and run Pi on several Anthropic API keys. Each
-            agent uses one; when an account hits its limit, agents move to another and keep going.
+            Keep several Claude, ChatGPT, Grok and Cursor accounts signed in, and run Pi on several Anthropic API keys.
+            Each agent uses one; when a Claude or ChatGPT account hits its limit, agents move to another and keep going.
           </Text>
         </View>
 
@@ -218,7 +220,7 @@ function HostScope({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
-const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi" };
+const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi", grok: "Grok", cursor: "Cursor" };
 
 function FamilySection({
   family,
@@ -260,6 +262,22 @@ function FamilySection({
         <Text style={text.muted}>No {FAMILY_LABEL[family]} accounts yet.</Text>
       ) : null}
       {family === "pi" ? <PiSectionNotes theme={theme} state={state} accounts={accounts} store={store} /> : null}
+      {family === "claude" && state.launchers ? (
+        <ShellHint
+          theme={theme}
+          directory={state.launchers}
+          accounts={accounts}
+          example="claude-<account>.sh"
+          note="Each runs claude on its account, with its settings and proxy, whatever your shell exports."
+        />
+      ) : null}
+      {family === "claude" && state.claudeHomes ? <HomesHint theme={theme} family="claude" homes={state.claudeHomes} store={store} /> : null}
+      {!HAND_OFF[family] ? (
+        <Text style={text.small}>
+          A {FAMILY_LABEL[family]} conversation stays on the account it started on. New agents use the default account, or the
+          one you pick for them.
+        </Text>
+      ) : null}
       {chunk(accounts, compact ? 1 : 2).map((row) => (
         <View key={row.map((account) => account.id).join()} style={{ flexDirection: "row", gap: 10 }}>
           {row.map((account) => (
@@ -296,7 +314,7 @@ function AccountCard({
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
   const api = account.auth === "api";
-  const details = piCardDetails(account);
+  const details = piCardDetails(account) ?? claudeCardDetails(account);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
@@ -321,7 +339,7 @@ function AccountCard({
       const message = describeReopen(`${account.label} is ${enabling ? "enabled" : "disabled"}`, result);
       const stayed =
         result.stayed > 0
-          ? ` · ${result.stayed} ChatGPT conversation${result.stayed === 1 ? " stays" : "s stay"} on it (they can't change accounts)`
+          ? ` · ${result.stayed} ${FAMILY_LABEL[account.family]} conversation${result.stayed === 1 ? " stays" : "s stay"} on it (they can't change accounts)`
           : "";
       toast.show(`${message}${stayed}`, { variant: result.failed.length > 0 ? "warning" : "success", durationMs: 5_000 });
     } catch (error) {
@@ -613,7 +631,13 @@ function AccountCard({
       {renaming ? (
         <RenameModal theme={theme} account={account} store={store} onClose={() => setRenaming(false)} />
       ) : null}
-      {editingApi ? <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} /> : null}
+      {editingApi ? (
+        account.family === "claude" ? (
+          <ApiAccountModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} />
+        ) : (
+          <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} />
+        )
+      ) : null}
       {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
@@ -624,7 +648,7 @@ function AccountCard({
                 ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
                 : account.family === "claude"
                   ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
-                  : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
+                  : `This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ${FAMILY_LABEL[account.family]} conversations on it can't move, so start new agents for them.`}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
@@ -811,6 +835,13 @@ function AutomationSettings({ theme }: { theme: Theme }) {
           onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
         />
         <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
+        <SettingsSwitch
+          label="Keep a Codex chat in the same conversation"
+          hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
+          value={settings.values.codexSameConversation}
+          disabled={settings.saving || !settings.values.autoSwitch}
+          onValueChange={(codexSameConversation) => save({ codexSameConversation })}
+        />
       </SettingsCard>
       <Text style={text.heading} accessibilityRole="header">
         Continue on OpenCode
@@ -824,6 +855,22 @@ function AutomationSettings({ theme }: { theme: Theme }) {
 }
 
 /** Paseo stopped waiting for a change that moves agents; the daemon carries on with it. */
+/**
+ * A Claude card's line about its key (an API account's) and its network: its own proxy and the
+ * address Anthropic sees its requests come from.
+ */
+function claudeCardDetails(account: AccountView): string | null {
+  if (account.family !== "claude") return null;
+  const api = account.api;
+  const parts = [
+    api ? `${api.keyKind === "api_key" ? "Key" : "Token"}${api.keyHint ? ` …${api.keyHint}` : ""} · ${api.baseUrl ?? "Anthropic API"}` : null,
+    account.proxy ? `Via ${account.proxy}` : null,
+    egressText(account.egress),
+    account.launcher ? `Terminal: ${account.launcher}` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 function stillMoving(label: string): string {
   return `Still moving agents for ${label}. Their timelines say when each has switched.`;
 }

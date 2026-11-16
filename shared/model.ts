@@ -1,10 +1,10 @@
 import { z } from "zod";
 
 /**
- * The provider families this plugin manages: the two subscription CLIs, and Pi, whose added accounts
- * are Anthropic API keys. Custom provider profiles map onto one of them.
+ * The provider families this plugin manages: the subscription CLIs (Claude Code, Codex, Grok Build,
+ * Cursor), and Pi, whose added accounts are Anthropic API keys. Custom provider profiles map onto one of them.
  */
-export const FamilySchema = z.enum(["claude", "codex", "pi"]);
+export const FamilySchema = z.enum(["claude", "codex", "pi", "grok", "cursor"]);
 export type Family = z.infer<typeof FamilySchema>;
 export const FAMILIES: readonly Family[] = FamilySchema.options;
 
@@ -12,6 +12,8 @@ export const FAMILY_LABEL: Record<Family, string> = {
   claude: "Claude",
   codex: "ChatGPT",
   pi: "Pi",
+  grok: "Grok",
+  cursor: "Cursor",
 };
 
 /** Paseo's OpenCode harness provider. It runs on the host itself, so a fork to it uses no account. */
@@ -19,9 +21,29 @@ export const OPENCODE_PROVIDER = "opencode";
 export const OPENCODE_LABEL = "OpenCode";
 /**
  * The provider a stopped chat can carry on with when every account of its own is out (Claude ↔
- * ChatGPT); null for Pi, whose added accounts are billed per use and never take work over by themselves.
+ * ChatGPT); null for Pi, whose added accounts are billed per use and never take work over by themselves,
+ * and for Grok and Cursor, whose chats don't fork to another provider.
  */
-export const OTHER_FAMILY: Record<Family, Family | null> = { claude: "codex", codex: "claude", pi: null };
+export const OTHER_FAMILY: Record<Family, Family | null> = { claude: "codex", codex: "claude", pi: null, grok: null, cursor: null };
+
+/**
+ * Families not every Paseo user runs: one shows once its CLI login is registered (its CLI is there,
+ * and for Grok and Cursor a Paseo provider runs it) or an account of it was added, and its CLI is only
+ * missed once an account of it was added.
+ */
+export const OPTIONAL: Record<Family, boolean> = { claude: false, codex: false, pi: true, grok: true, cursor: true };
+
+/** The families the Accounts screen shows, given the accounts there are (the CLI logins registered included). */
+export function shownFamilies(accounts: readonly { family: Family }[]): Family[] {
+  return FAMILIES.filter((family) => !OPTIONAL[family] || accounts.some((account) => account.family === family));
+}
+
+/**
+ * For a provider whose conversations can't change accounts in place: one with history carries on in a
+ * new agent on the account picked for it (Codex's). False for Grok's and Cursor's, which stay on their
+ * account until moving them is known to work; only new agents follow a pick or the default.
+ */
+export const HAND_OFF: Record<Family, boolean> = { claude: true, codex: true, pi: true, grok: false, cursor: false };
 
 /** Stands for a proxy's password (or a user name with none) wherever the proxy is shown. */
 export const HIDDEN = "•••";
@@ -66,8 +88,8 @@ export type Credits = z.infer<typeof CreditsSchema>;
 /**
  * Pay-as-you-go usage past the plan's limits (Claude "extra usage"), as the usage response reports it.
  * `spend` and `limit` are Claude's `used_credits` and `monthly_limit`, in minor units of `currency`
- * (cents for USD); `null` when the response leaves them out, or when Anthropic's spend lookup failed
- * and ZeroSub fell back to the read without spend (the last known value is then kept).
+ * (cents for USD); `null` when the response leaves those amounts out. A read without spend omits
+ * `extraUsage`, keeping the last known value; a successful spend read can clear it with `null`.
  */
 export const ExtraUsageSchema = z.object({
   enabled: z.boolean(),
@@ -104,19 +126,44 @@ export type AccountKind = z.infer<typeof AccountKindSchema>;
 export const AuthKindSchema = z.enum([
   /** Signed in with a Claude or ChatGPT subscription (or, for Pi's own login, whatever Pi is signed in to). */
   "subscription",
-  /** An added Pi account: an Anthropic API key, billed per use, so never picked automatically. */
+  /**
+   * An API key or token (a Claude account's, optionally against another base URL; an added Pi
+   * account's Anthropic key), billed per use, so never picked automatically.
+   */
   "api",
 ]);
 export type AuthKind = z.infer<typeof AuthKindSchema>;
 
+export const ApiKeyKindSchema = z.enum([
+  /** `ANTHROPIC_API_KEY`, sent as `x-api-key`. */
+  "api_key",
+  /** `ANTHROPIC_AUTH_TOKEN`, sent as `Authorization: Bearer`. */
+  "auth_token",
+]);
+export type ApiKeyKind = z.infer<typeof ApiKeyKindSchema>;
+
+/** Claude Code's own switches for a Claude API account; each is off unless the user turns it on. */
+export const TrafficSwitchesSchema = z.object({
+  /** `DISABLE_TELEMETRY`. */
+  disableTelemetry: z.boolean().default(false),
+  /** `DISABLE_ERROR_REPORTING`. */
+  disableErrorReporting: z.boolean().default(false),
+  /** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: everything not needed to talk to the model. */
+  disableNonessentialTraffic: z.boolean().default(false),
+});
+export type TrafficSwitches = z.infer<typeof TrafficSwitchesSchema>;
+
 /** An API key's settings as shown in the app; the key itself never leaves the host. */
-export const ApiSummarySchema = z.object({
+export const ApiSummarySchema = TrafficSwitchesSchema.extend({
+  /** Left out by providers whose accounts only take an API key (Pi's). */
+  keyKind: ApiKeyKindSchema.default("api_key"),
   /** The key's last four characters, or empty for a key too short to show any of it. */
   keyHint: z.string(),
   /** Where Anthropic's requests go, or null for Anthropic's own API. */
   baseUrl: z.string().nullable(),
 });
-export type ApiSummary = z.infer<typeof ApiSummarySchema>;
+/** As an adapter gives it: the kind and switches may be left out, and are filled in for the client. */
+export type ApiSummary = z.input<typeof ApiSummarySchema>;
 
 /** The address an account's requests come from, as the provider's edge sees it. */
 export const EgressSchema = z.object({
@@ -154,19 +201,24 @@ export const AccountViewSchema = z.object({
   auth: AuthKindSchema.default("subscription"),
   /** An added Pi account's key (reduced to a hint) and base URL, and Pi's own login's while it keeps an Anthropic key. */
   api: ApiSummarySchema.nullable().default(null),
-  /** Its Anthropic key and base URL can be changed from its card (Pi accounts, Pi's own login included). */
+  /** Its key and base URL can be changed from its card (API accounts, and Pi's own login). */
   apiEditable: z.boolean().default(false),
   /** The account's own proxy, password hidden (as `HIDDEN`). Null when it uses whatever it inherits. */
   proxy: z.string().nullable().default(null),
-  /** A proxy can be set for this account here (Pi accounts, Pi's own login included). */
+  /** A proxy can be set for this account here (Claude and Pi accounts, their CLI logins included). */
   proxyEditable: z.boolean().default(false),
+  /** Why a proxy can't be set for it just now (the CLI login's, while main's settings would outrank it); null when one can. */
+  proxyBlocked: z.string().nullable().default(null),
   /** The proxy it goes through without one of its own, password hidden, and where that's set. */
   inheritedProxy: z.object({ proxy: z.string(), from: z.string() }).nullable().default(null),
-  /** The user's file its own proxy is kept in (Pi's own login: `httpProxy` in `~/.pi/agent/settings.json`). */
+  /**
+   * The user's file its own proxy is kept in (Pi's own login: `httpProxy` in `~/.pi/agent/settings.json`;
+   * Claude's CLI login: `env` in `~/.claude/settings.json`, when that sets one).
+   */
   proxyFile: z.string().nullable().default(null),
   /** Added accounts that go through the same proxy, having none of their own, while it's kept in `proxyFile`. */
   proxyFollowers: z.array(z.string()).default([]),
-  /** Command (a script in `StateView.piLaunchers`) that starts the CLI on this account. */
+  /** Command (a script in `StateView.launchers` or `StateView.piLaunchers`) that starts the CLI on this account. */
   launcher: z.string().nullable().default(null),
   /** Where the account's requests come from, as Anthropic sees them; null when unknown or not Anthropic. */
   egress: EgressSchema.nullable().default(null),
@@ -257,10 +309,14 @@ export const StateViewSchema = z.object({
    * and daemons started over SSH, where only the code sign-in works.
    */
   browserSignIn: z.boolean().default(true),
+  /** Directory with a `claude-<account>.sh` script per added Claude account, to put on `PATH`. */
+  launchers: z.string().nullable().default(null),
   /** Directory with a `pi-<account>.sh` script per added Pi account, to put on `PATH`. */
   piLaunchers: z.string().nullable().default(null),
   /** The folder added Pi accounts' homes are kept in (`~/.pi-config`, say), and whether it's the default. */
   piHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
+  /** The folder added Claude accounts' homes are kept in (`~/.claude-config`, say), and whether it's the default. */
+  claudeHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
   /** This host's Paseo lists OpenCode as available, so "Continue on OpenCode" can work. */
   openCodeAvailable: z.boolean().default(false),
