@@ -238,7 +238,7 @@ export const forkAgent = defineRpc({
      * or `uncertain` (a previous handoff has no trustworthy receipt; nothing more was sent).
      */
     delivery: z.enum(["sent", "up-to-date", "found", "uncertain"]).default("sent"),
-    /** Why the result differs from what settings suggest, such as the model a resent reservation used. */
+    /** Context for the result: why nothing was sent, or the model a resent reservation used. */
     detail: z.string().nullable().default(null),
   }),
 });
