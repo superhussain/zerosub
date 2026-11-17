@@ -93,7 +93,10 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
             durationMs: 5_000,
           });
         } else {
-          toast.show(`Continuing on OpenCode in “${fork.title}”.${fork.detail ? ` ${fork.detail}` : ""}`, { variant: "success", durationMs: 5_000 });
+          toast.show(`Continuing on OpenCode in “${fork.title}”.${fork.detail ? ` ${fork.detail}` : ""}`, {
+            variant: "success",
+            durationMs: fork.detail ? 12_000 : 5_000,
+          });
         }
       } catch (failure) {
         setError(describe(failure));
