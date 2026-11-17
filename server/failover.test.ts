@@ -1526,6 +1526,45 @@ describe("forking to the other provider", () => {
         config: { provider: "opencode/opencode/glm-5p3-flash", modeId: "build", thinkingOptionId: "high" },
       });
       expect(setup.sends.map((send) => send.messageId)).toEqual([reserved.messageId]);
+      expect(done.detail).toBe(
+        "ZeroSub finished the OpenCode request it reserved before a restart, so this continuation uses “GLM 5.3 Flash” with the “High” thinking option. ZeroSub's settings apply to the next new continuation.",
+      );
+    });
+
+    /** A create interrupted before its outcome was seen, as after a restart: the reservation, and the setup to retry it. */
+    const interruptedCreate = async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createError = "GLM is down";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      delete setup.hooks.createError;
+      await setup.store.update((draft) => {
+        delete draft.opencodeForks[AGENT]!.pending!.createFailed;
+      });
+      return { setup, reserved: (await setup.store.read()).opencodeForks[AGENT]!.pending! };
+    };
+    const RESERVED_MODE_REFUSAL =
+      "This agent's mode changed after ZeroSub reserved its OpenCode continuation in “Build” mode before a restart. That request may already be in Paseo, so ZeroSub can't change it. Nothing was sent. To finish it, set this agent back to a mode that allows “Build”, then choose Continue on OpenCode again.";
+
+    it("refuses an outcome-unknown resend once the source's mode is more careful", async () => {
+      const { setup, reserved } = await interruptedCreate();
+      setup.byId.get(AGENT)!.currentModeId = "plan";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(RESERVED_MODE_REFUSAL);
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toEqual(reserved);
+      // Back in Bypass, the frozen request goes out under its reserved key, once.
+      setup.byId.get(AGENT)!.currentModeId = "bypassPermissions";
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]?.agentId).toBe(reserved.targetId);
+    });
+
+    it("refuses an outcome-unknown resend from an unknown mode", async () => {
+      const { setup, reserved } = await interruptedCreate();
+      setup.byId.get(AGENT)!.currentModeId = "mystery";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(RESERVED_MODE_REFUSAL);
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toEqual(reserved);
     });
 
     const damage = {
@@ -2574,7 +2613,7 @@ describe("forking to the other provider", () => {
       const { store, created, notes, sends, fork } = await manually({ prefs: PREFS, noChatGPT: true });
       const done = await fork();
       expect(created).toHaveLength(1);
-      expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)", delivery: "sent" });
+      expect(done).toEqual({ agentId: created[0]?.agentId, title: "Fix the build (continued on OpenCode)", delivery: "sent", detail: null });
       expect(created[0]?.config).toEqual({
         provider: "opencode/opencode/glm-5p3-flash",
         modeId: "build", // Bypass is as loose as Build gets
