@@ -264,6 +264,8 @@ const HOLD_REFUSAL =
 const OPENCODE_IN_FLIGHT = "A continuation of this agent on OpenCode is being set up. Wait for it to finish, then check that chat.";
 const SOURCE_BUSY_REFUSAL = "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode.";
 const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
+const reservedModeRefusal = (label: string): string =>
+  `This agent's mode changed after ZeroSub reserved its OpenCode continuation in “${label}” mode before a restart. That request may already be in Paseo, so ZeroSub can't change it. Nothing was sent. To finish it, set this agent back to a mode that allows “${label}”, then choose Continue on OpenCode again.`;
 
 /** The conversation a handoff carries: no plugin rows, and none of our own handoff prompts. */
 function meaningful<T extends { item: AgentTimelineItem }>(entries: readonly T[]): T[] {
@@ -2502,7 +2504,16 @@ export class Service {
       if (!reserved?.title || reserved.workspaceId === undefined || reserved.cwd === undefined || reserved.parentId === undefined) {
         return this.openCodeUncertain(retry.targetId, null, retry.messageId);
       }
-      return this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title }, true);
+      // The frozen request can't change, so a source made more careful meanwhile refuses it.
+      const [sourceModes, targetModes] = await Promise.all([
+        paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
+        paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
+      ]);
+      if (!withinMode(sourceModes, original.currentModeId, targetModes, reserved.modeId)) {
+        return { skipped: reservedModeRefusal(targetModes.find((mode) => mode.id === reserved.modeId)?.label ?? reserved.modeId) };
+      }
+      const result = await this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title }, true);
+      return "delivery" in result && result.delivery === "sent" ? { ...result, detail: await this.reservedModelDetail(paseo, reserved) } : result;
     }
     const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
@@ -2564,6 +2575,20 @@ export class Service {
       };
     });
     return this.sendReservedCreate(paseo, agentId, targetId, messageId, config, false);
+  }
+
+  /** Names the model and thinking option a resent reservation used, by catalog label when the host still lists them. */
+  private async reservedModelDetail(paseo: PaseoApi, config: OpenCodeCreateConfig): Promise<string> {
+    const modelId = config.provider.slice(`${OPENCODE_PROVIDER}/`.length);
+    const model = await paseo.providers.listModels(OPENCODE_PROVIDER).then(
+      (result) => result.models?.find((entry) => entry.id === modelId),
+      () => undefined,
+    );
+    const thinkingId = config.thinkingOptionId;
+    const thinking = thinkingId
+      ? ` with the “${model?.thinkingOptions?.find((option) => option.id === thinkingId)?.label ?? thinkingId}” thinking option`
+      : "";
+    return `ZeroSub finished the OpenCode request it reserved before a restart, so this continuation uses “${model?.label ?? modelId}”${thinking}. ZeroSub's settings apply to the next new continuation.`;
   }
 
   /**
@@ -2700,7 +2725,7 @@ export class Service {
   }
 
   /** "Continue on …" from an agent's account button: the same fork, asked for by the user. */
-  async forkAgent(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery }> {
+  async forkAgent(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery; detail: string | null }> {
     return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId, destination));
   }
 
@@ -2735,7 +2760,7 @@ export class Service {
     }
   }
 
-  private async forkAgentNow(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery }> {
+  private async forkAgentNow(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery; detail: string | null }> {
     this.attach(paseo);
     const info = await lookUpAgent(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
@@ -2768,7 +2793,7 @@ export class Service {
       detail: result.detail ?? null,
       at: new Date().toISOString(),
     });
-    return { ...result.fork, delivery: result.delivery };
+    return { ...result.fork, delivery: result.delivery, detail: result.detail ?? null };
   }
 
   /**
