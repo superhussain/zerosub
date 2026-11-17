@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PiAdapter } from "./pi";
-import { homesInEnvironment, parseTrace } from "./processes";
+import { heldBy, homesInEnvironment, parsePsLine, parseTrace } from "./processes";
 
 describe("which homes a process runs on", () => {
   const homes = ["/Users/me/.pi-config/pi-work", "/Users/me/.pi-config/pi work"];
@@ -24,6 +24,25 @@ describe("which homes a process runs on", () => {
     ]);
   });
 
+  it("reads the PID and command name from a ps line", () => {
+    expect(parsePsLine("  4242 /opt/homebrew/bin/puma 6.4 CLAUDE_CONFIG_DIR=/h")).toEqual({
+      pid: 4242,
+      command: "puma",
+      line: "/opt/homebrew/bin/puma 6.4 CLAUDE_CONFIG_DIR=/h",
+    });
+    expect(parsePsLine("garbage")).toBeNull();
+  });
+
+  it("names holders by PID, at most three", () => {
+    const puma = { pid: 4242, command: "puma" };
+    const node = { pid: 4250, command: "node" };
+    expect(heldBy([puma])).toBe("puma (PID 4242)");
+    expect(heldBy([node, puma])).toBe("puma (PID 4242) and node (PID 4250)");
+    expect(
+      heldBy([{ pid: 4400, command: "zsh" }, node, { pid: 4301, command: "ruby" }, puma, { pid: 4100, command: "" }]),
+    ).toBe("a process (PID 4100), puma (PID 4242), node (PID 4250) and 2 more");
+  });
+
   it.runIf(process.platform === "darwin" || process.platform === "linux")("sees a running process started on a home", async () => {
     const root = await mkdtemp(join(tmpdir(), "zerosub-processes-"));
     const home = join(root, "pi-work");
@@ -34,10 +53,12 @@ describe("which homes a process runs on", () => {
     try {
       await new Promise((resolve) => child.once("spawn", resolve));
       const adapter = new PiAdapter();
-      expect(await adapter.homesInUse([home, join(root, "pi-other")])).toEqual(new Set([home]));
+      const found = await adapter.homesInUse([home, join(root, "pi-other")]);
+      expect([...found.keys()]).toEqual([home]);
+      expect(found.get(home)?.[0]?.pid).toBe(child.pid);
       child.kill();
       await new Promise((resolve) => child.once("exit", resolve));
-      expect(await adapter.homesInUse([home])).toEqual(new Set());
+      expect(await adapter.homesInUse([home])).toEqual(new Map());
     } finally {
       child.kill();
       await rm(root, { recursive: true, force: true });

@@ -585,7 +585,7 @@ class InstalledPi extends PiAdapter {
   // Tests never list the machine's processes.
   override async homesInUse(homes: readonly string[]) {
     await this.onScan?.(homes);
-    return new Set(homes.filter((home) => this.inUse.has(home)));
+    return new Map(homes.filter((home) => this.inUse.has(home)).map((home) => [home, []]));
   }
 }
 
@@ -769,7 +769,7 @@ describe("Pi accounts in the service", () => {
       // A terminal runs Pi on every home in homes/, so a new account stays there for now.
       pi.inUse.add("*");
       const scan = pi.homesInUse.bind(pi);
-      pi.homesInUse = async (homes) => (pi.inUse.has("*") ? new Set(homes.filter((home) => home.includes("/homes/"))) : scan(homes));
+      pi.homesInUse = async (homes) => (pi.inUse.has("*") ? new Map(homes.filter((home) => home.includes("/homes/")).map((home) => [home, []])) : scan(homes));
       const id = await service.addApiAccount({ label: "Work key", key: KEY });
       const from = join(root, "paseo", "zerosub", "homes", id);
       const to = join(root, "pi-config", "pi-work-key");
@@ -812,7 +812,7 @@ describe("Pi accounts in the service", () => {
       await service.start();
       pi.inUse.add("held");
       const scan = pi.homesInUse.bind(pi);
-      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
+      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Map(homes.map((home) => [home, []])) : scan(homes));
       const proxy = "http://127.0.0.1:7890";
       const id = await service.addApiAccount({ label: "Work key", key: KEY, proxy });
       await service.setDefault(paseo as never, id);
@@ -860,7 +860,7 @@ describe("Pi accounts in the service", () => {
       await service.start();
       pi.inUse.add("held");
       const scan = pi.homesInUse.bind(pi);
-      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
+      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Map(homes.map((home) => [home, []])) : scan(homes));
       const id = await service.addApiAccount({ label: "Work key", key: KEY });
       const from = join(root, "paseo", "zerosub", "homes", id);
       const to = join(root, "pi-config", "pi-work-key");
@@ -963,7 +963,7 @@ describe("Pi accounts in the service", () => {
       await service.start();
       pi.inUse.add("held");
       const scan = pi.homesInUse.bind(pi);
-      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
+      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Map(homes.map((home) => [home, []])) : scan(homes));
       await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
       const to = join(root, "pi-config", "pi-gateway");
       pi.inUse.clear();
@@ -993,7 +993,7 @@ describe("Pi accounts in the service", () => {
     const pi = new InstalledPi();
     pi.inUse.add("held");
     const scan = pi.homesInUse.bind(pi);
-    pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
+    pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Map(homes.map((home) => [home, []])) : scan(homes));
     const first = piService(pi, store);
     const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
     first.attach(paseo as never);

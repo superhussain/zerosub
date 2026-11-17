@@ -2,7 +2,7 @@ import { mkdir, readdir, readFile, realpath, rename, rm, rmdir, stat, writeFile 
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ApiSummary, LoginMethod } from "../shared/model";
-import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
+import type { EnvPatch, FamilyAdapter, HomeHolder, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
 import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piHomeHoldsAccount, piLiteral, preparePiHome, readPiAccount, readPiOwnJson, readPiAccountApi, readPiAccountForAgents, writePiAccountApi, writePiAccountProxy } from "./homes";
 import { PI_LAUNCH_ENV } from "./launchers";
@@ -436,11 +436,11 @@ export class PiAdapter implements FamilyAdapter {
    * Which of `homes` a Pi process runs on right now (started with that `PI_CODING_AGENT_DIR`: by
    * Paseo, or its script in a terminal), so its home isn't moved under it (see `Service.placeHomes`).
    */
-  async homesInUse(homes: readonly string[]): Promise<Set<string>> {
-    const found = new Set<string>();
+  async homesInUse(homes: readonly string[]): Promise<Map<string, HomeHolder[]>> {
+    const found = new Map<string, HomeHolder[]>();
     if (homes.length === 0) return found;
-    await eachProcessEnvironment((line) => {
-      for (const home of homesInEnvironment(line, homes, ["PI_CODING_AGENT_DIR"])) found.add(home);
+    await eachProcessEnvironment(({ pid, command, line }) => {
+      for (const home of homesInEnvironment(line, homes, ["PI_CODING_AGENT_DIR"])) found.set(home, [...(found.get(home) ?? []), { pid, command }]);
     });
     return found;
   }

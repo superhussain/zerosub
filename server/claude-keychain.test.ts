@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Moving a home moves its Keychain entry: Claude Code names the entry after the folder's path. These
@@ -27,7 +28,9 @@ vi.mock("./process", async (original) => ({
 const processLines: string[] = [];
 vi.mock("./processes", async (original) => ({
   ...(await original<typeof import("./processes")>()),
-  eachProcessEnvironment: vi.fn(async (visit: (line: string) => void) => processLines.forEach(visit)),
+  eachProcessEnvironment: vi.fn(async (visit: (entry: { pid: number; command: string; line: string }) => void) =>
+    processLines.forEach((line, index) => visit({ pid: 4000 + index, command: basename(line.split(" ")[0]!), line })),
+  ),
 }));
 
 const { ClaudeAdapter, homesInEnvironment, keychainService } = await import("./claude");
@@ -129,9 +132,9 @@ describe("which homes Claude Code runs on", () => {
   it("doesn't count git's file watcher, which outlives the agent that started it", async () => {
     const home = "/Users/ada/.paseo/zerosub/homes/claude-aaaaaaaaaaaa";
     processLines.splice(0, processLines.length, `/opt/homebrew/opt/git/libexec/git-core/git fsmonitor--daemon run --detach PWD=/repo CLAUDE_CONFIG_DIR=${home}`);
-    expect(await new ClaudeAdapter().homesInUse([home])).toEqual(new Set());
+    expect(await new ClaudeAdapter().homesInUse([home])).toEqual(new Map());
     processLines.push(`/Users/ada/.local/bin/claude --output-format stream-json CLAUDE_CONFIG_DIR=${home}`);
-    expect(await new ClaudeAdapter().homesInUse([home])).toEqual(new Set([home]));
+    expect(await new ClaudeAdapter().homesInUse([home])).toEqual(new Map([[home, [{ pid: 4001, command: "claude" }]]]));
     processLines.length = 0;
   });
 

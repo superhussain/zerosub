@@ -19,6 +19,11 @@ export function formatResetIn(resetsAt: string | null, now: number = Date.now())
   return restHours === 0 ? `in ${days}d` : `in ${days}d ${restHours}h`;
 }
 
+/** How long a toast stays up: 300 ms a word (about 200 words a minute), held between 5 and 12 seconds. */
+export function toastDurationMs(text: string): number {
+  return Math.min(12_000, Math.max(5_000, text.trim().split(/\s+/).length * 300));
+}
+
 export function formatPercent(value: number): string {
   return `${Math.round(Math.min(100, Math.max(0, value)))}%`;
 }
