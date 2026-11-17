@@ -47,6 +47,7 @@ function account(id: string, fields: Partial<AccountView> = {}): AccountView {
     egress: null,
     externalHome: false,
     moving: null,
+    pace: null,
     azure: null,
     ...fields,
   };
