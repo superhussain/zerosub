@@ -9,6 +9,7 @@ import {
   spawnEnv,
   type EnvPatch,
   type FamilyAdapter,
+  type HomeHolder,
   type Identity,
   type LoginHandle,
   type ProxyState,
@@ -318,13 +319,13 @@ export class ClaudeAdapter implements FamilyAdapter {
    * Which of `homes` a Claude process runs on right now (started with that `CLAUDE_CONFIG_DIR`: by
    * Paseo, or its script in a terminal), so its home isn't moved under it (see `Service.placeHomes`).
    */
-  async homesInUse(homes: readonly string[]): Promise<Set<string>> {
-    const found = new Set<string>();
+  async homesInUse(homes: readonly string[]): Promise<Map<string, HomeHolder[]>> {
+    const found = new Map<string, HomeHolder[]>();
     if (homes.length === 0) return found;
-    await eachProcessEnvironment((line) => {
+    await eachProcessEnvironment(({ pid, command, line }) => {
       // Git's file watcher keeps the environment of the agent that ran git, and outlives it.
       if (GIT_FILE_WATCHER.test(line)) return;
-      for (const home of homesInEnvironment(line, homes)) found.add(home);
+      for (const home of homesInEnvironment(line, homes)) found.set(home, [...(found.get(home) ?? []), { pid, command }]);
     });
     return found;
   }
