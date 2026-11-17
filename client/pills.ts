@@ -4,7 +4,7 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, moveProblem, paceLine, pillText } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover, openCodeForkPopover } from "./fork-confirm";
@@ -188,7 +188,7 @@ function buttonFor(
   const items: PluginButtonMenuEntry[] = accounts.map((account, index) => ({
     kind: "item",
     id: `account-${index}`,
-    title: account.id === current.id || movable || stays ? menuTitle(account) : `Continue on ${account.label}`,
+    title: account.id === current.id || movable || stays ? menuTitle(state, account) : `Continue on ${account.label}`,
     icon: account.id === current.id ? "CircleCheck" : movable || stays ? "Circle" : "ArrowRightLeft",
     // With automatic switching on, an account at its limit would only pass the agent on (the server refuses it too).
     disabled:
@@ -277,10 +277,14 @@ function buttonFor(
   };
 }
 
-function menuTitle(account: AccountView): string {
+function menuTitle(state: StateView, account: AccountView): string {
   if (account.status === "signed_out") return `${account.label} — signed out`;
   if (account.status === "disabled") return `${account.label} — disabled`;
   if (account.status === "limited") return `${account.label} — limit reached`;
+  if (account.pace) {
+    const mark = account.pace.gated ? "Held back" : state.pacedNext?.[account.family] === account.id ? "Next" : undefined;
+    return `${account.label} — ${paceLine(account.pace, mark)}`;
+  }
   // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
   const peak = account.usage ? accountPeak(account.usage.windows) : null;
   if (!peak) return account.label;

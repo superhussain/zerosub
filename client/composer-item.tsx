@@ -2,9 +2,8 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import * as paseoClient from "@getpaseo/plugin/client";
 import * as paseoUi from "@getpaseo/plugin/client/ui";
 import type { ComponentType } from "react";
-import { accountPeak, formatCredits, formatPercent } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, paceLine } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, type AccountView, type StateView } from "../shared/model";
-import { describePace, type Segment } from "./pace";
 import { useStore, type ZeroSubStore } from "./store";
 
 /**
@@ -81,21 +80,13 @@ export function accountChoices(state: StateView, provider: string | null, chosen
   return { value, options };
 }
 
-const plain = (parts: Segment[]) => parts.map((part) => part.text).join("");
-
 function detail(state: StateView, account: AccountView, lead?: string): string | undefined {
-  const parts = lead ? [lead] : [];
+  const parts = lead && !account.pace ? [lead] : [];
   const pace = account.pace;
   if (account.status === "limited") parts.push("Limit reached");
   else if (pace) {
-    const copy = describePace(pace);
-    if (state.pacedNext?.[account.family] === account.id) parts.push("Pacing picks next");
-    if (pace.gated) parts.push("Held back by pacing");
-    if (pace.fiveHourUsed !== null) parts.push(`5h ${plain(copy.fiveHour)}`);
-    if (copy.weekly) parts.push(`week ${plain(copy.weekly)}`);
-    if (copy.pending) parts.push(copy.pending);
-    const credits = account.usage?.credits;
-    if (credits) parts.push(formatCredits(credits));
+    const mark = lead ? "Picked" : pace.gated ? "Held back" : state.pacedNext?.[account.family] === account.id ? "Next" : undefined;
+    return paceLine(pace, mark);
   } else {
     // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
     const peak = account.usage ? accountPeak(account.usage.windows) : null;

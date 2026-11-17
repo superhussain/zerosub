@@ -1,4 +1,4 @@
-import { estimateApiCost, totalTokens, type AccountView, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
+import { estimateApiCost, totalTokens, type AccountView, type PaceView, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
 import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
@@ -245,4 +245,24 @@ export function apiUsageLines(account: Pick<AzureSummary, "prices" | "usage">, n
   const uncounted = month?.uncounted ?? 0;
   const note = uncounted > 0 ? `${uncounted} turn${uncounted === 1 ? "" : "s"} couldn't be counted (no session file found), so these totals are short.` : null;
   return { tokens, cost, note };
+}
+
+/** The longest a menu row's pacing line runs; the weekly part goes first when it would pass this. */
+export const PACE_LINE_MAX = 45;
+
+/** One short line of pacing for a menu row: "Next · 41→54% hr · 30% wk behind". `mark` leads when it applies. */
+export function paceLine(pace: PaceView, mark?: string): string {
+  const r = Math.round;
+  const hourly = pace.fiveHourUsed === null ? null : `${r(pace.fiveHourUsed)}→${r(pace.fiveHourProjected)}% hr`;
+  let weekly: string | null = null;
+  if (pace.weeklyUsed !== null) {
+    const standing =
+      pace.weekElapsed === null
+        ? ""
+        : ` ${r(pace.weeklyUsed + pace.pendingWeekly) > r(pace.weekElapsed) ? "ahead" : r(pace.weeklyUsed + pace.pendingWeekly) < r(pace.weekElapsed) ? "behind" : "on pace"}`;
+    weekly = `${r(pace.weeklyUsed)}% wk${standing}`;
+  }
+  const join = (parts: Array<string | null | undefined>) => parts.filter(Boolean).join(" · ");
+  const full = join([mark, hourly, weekly]);
+  return full.length > PACE_LINE_MAX ? join([mark, hourly]) : full;
 }

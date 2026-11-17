@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  paceLine,
   accountSubtitle,
   apiUsageLines,
   describeReopen,
@@ -217,5 +218,16 @@ describe("Azure usage on the card", () => {
 
   it("says when some turns couldn't be counted", () => {
     expect(apiUsageLines({ ...azure, usage: { ...azure.usage, uncounted: 2 } }, NOW).note).toMatch(/^2 turns couldn't be counted/);
+  });
+});
+
+describe("paceLine", () => {
+  const pace = { fiveHourUsed: 41, fiveHourProjected: 54, pendingFiveHour: 0, weeklyUsed: 30, pendingWeekly: 0, weekElapsed: 50, pending: 0, gated: false };
+  it("leads with the mark, then the hourly and weekly parts", () => {
+    expect(paceLine(pace, "Next")).toBe("Next · 41→54% hr · 30% wk behind");
+    expect(paceLine({ ...pace, fiveHourUsed: 8, fiveHourProjected: 9, weeklyUsed: 77 })).toBe("8→9% hr · 77% wk ahead");
+  });
+  it("leaves out the hourly part without a 5-hour reading, and the standing without a week", () => {
+    expect(paceLine({ ...pace, fiveHourUsed: null, weekElapsed: null })).toBe("30% wk");
   });
 });
