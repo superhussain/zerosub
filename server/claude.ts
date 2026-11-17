@@ -322,6 +322,8 @@ export class ClaudeAdapter implements FamilyAdapter {
     const found = new Set<string>();
     if (homes.length === 0) return found;
     await eachProcessEnvironment((line) => {
+      // Git's file watcher keeps the environment of the agent that ran git, and outlives it.
+      if (GIT_FILE_WATCHER.test(line)) return;
       for (const home of homesInEnvironment(line, homes)) found.add(home);
     });
     return found;
@@ -339,15 +341,16 @@ export class ClaudeAdapter implements FamilyAdapter {
     if (!secret.trimStart().startsWith("{") || !parseJsonObject(secret)) {
       throw new Error(`the Keychain entry "${keychainService(from)}" isn't what Claude Code writes, so ZeroSub left it where it is`);
     }
+    const copy = keychainCopy(secret);
     const there = await readKeychainEntry(to);
-    if (there === secret) return;
+    if (there === copy) return;
     if (there !== null) {
       throw new Error(
         `the Keychain entry "${keychainService(to)}", where Claude Code looks for ${to}'s sign-in, already holds another one. Delete it if nothing uses it any more, or pick another folder.`,
       );
     }
-    await writeKeychainEntry(to, secret);
-    if ((await readKeychainEntry(to)) !== secret) {
+    await writeKeychainEntry(to, copy);
+    if ((await readKeychainEntry(to)) !== copy) {
       await deleteKeychainEntry(to).catch(() => undefined);
       throw new Error(`copying the Keychain entry "${keychainService(from)}" to "${keychainService(to)}" didn't read back the same`);
     }
@@ -356,7 +359,8 @@ export class ClaudeAdapter implements FamilyAdapter {
   async dropCopiedCredentials(from: string, to: string): Promise<void> {
     if (process.platform !== "darwin") return;
     const copy = await readKeychainEntry(to);
-    if (copy !== null && copy === (await readKeychainEntry(from))) await deleteKeychainEntry(to);
+    const original = await readKeychainEntry(from);
+    if (copy !== null && original !== null && copy === keychainCopy(original)) await deleteKeychainEntry(to);
   }
 
   async dropOldCredentials(from: string, to: string): Promise<boolean> {
@@ -564,6 +568,9 @@ export function keychainService(home: string | null): string {
   return `Claude Code-credentials-${createHash("sha256").update(path.normalize("NFC")).digest("hex").slice(0, 8)}`;
 }
 
+/** The line `ps` gives for `git fsmonitor--daemon`, started by any git command in a repo that has it on. */
+const GIT_FILE_WATCHER = /^\S*\bgit fsmonitor--daemon(\s|$)/;
+
 /** `security`'s exit code when there's no such keychain item (errSecItemNotFound). */
 const KEYCHAIN_ITEM_NOT_FOUND = 44;
 
@@ -585,6 +592,24 @@ async function readKeychainEntry(home: string): Promise<string | null> {
 
 /** Longest command `security -i` takes on one line. */
 const SECURITY_LINE_MAX = 4_000;
+
+/** Whether `secret` fits on the one line `security -i` takes (see `writeKeychainEntry`). */
+function fitsSecurityLine(secret: string): boolean {
+  return Buffer.byteLength(secret, "utf8") * 2 + 200 <= SECURITY_LINE_MAX;
+}
+
+/**
+ * What a home's Keychain entry is copied as: the whole entry when it fits on `security -i`'s line,
+ * else without the MCP servers' sign-ins (`mcpOAuth`), which can run to many kilobytes. Those
+ * servers then ask to be signed in again in the new folder; the Claude sign-in carries over.
+ */
+function keychainCopy(secret: string): string {
+  if (fitsSecurityLine(secret)) return secret;
+  const parsed = parseJsonObject(secret);
+  if (!parsed || !("mcpOAuth" in parsed)) return secret;
+  const { mcpOAuth: _dropped, ...rest } = parsed;
+  return JSON.stringify(rest);
+}
 
 /**
  * Writes the home's Keychain entry the way Claude Code does: through `security -i`'s standard

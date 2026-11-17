@@ -24,6 +24,12 @@ vi.mock("./process", async (original) => ({
   }),
 }));
 
+const processLines: string[] = [];
+vi.mock("./processes", async (original) => ({
+  ...(await original<typeof import("./processes")>()),
+  eachProcessEnvironment: vi.fn(async (visit: (line: string) => void) => processLines.forEach(visit)),
+}));
+
 const { ClaudeAdapter, homesInEnvironment, keychainService } = await import("./claude");
 
 afterEach(() => {
@@ -60,6 +66,22 @@ describe.runIf(process.platform === "darwin")("moving a home's Keychain entry", 
     keychain.set(keychainService(FROM), "not json");
     keychain.delete(keychainService(TO));
     await expect(new ClaudeAdapter().copyCredentials(FROM, TO)).rejects.toThrow("isn't what Claude Code writes");
+    expect(keychain.has(keychainService(TO))).toBe(false);
+  });
+
+  it("leaves the MCP servers' sign-ins behind when the entry is too long for security's line", async () => {
+    const mcpOAuth = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`server-${i}`, { accessToken: "x".repeat(400) }]));
+    const big = JSON.stringify({ ...JSON.parse(SIGN_IN), mcpOAuth });
+    keychain.set(keychainService(FROM), big);
+    await new ClaudeAdapter().copyCredentials(FROM, TO);
+    expect(JSON.parse(keychain.get(keychainService(TO))!)).toEqual(JSON.parse(SIGN_IN));
+    expect(keychain.get(keychainService(FROM))).toBe(big);
+
+    // Done twice, the second time changes nothing; given way, the copy goes.
+    commands.length = 0;
+    await new ClaudeAdapter().copyCredentials(FROM, TO);
+    expect(commands.filter((command) => command.startsWith("-i"))).toEqual([]);
+    await new ClaudeAdapter().dropCopiedCredentials(FROM, TO);
     expect(keychain.has(keychainService(TO))).toBe(false);
   });
 
@@ -102,6 +124,15 @@ describe("which homes Claude Code runs on", () => {
     expect(homesInEnvironment(line("CLAUDE_CONFIG_DIR=/Users/ada/.claude"), homes)).toEqual([]);
     expect(homesInEnvironment(line(`CLAUDE_CONFIG_DIR=${homes[0]}/sub`), homes)).toEqual([]);
     expect(homesInEnvironment(line(`XCLAUDE_CONFIG_DIR=${homes[0]}`), homes)).toEqual([]);
+  });
+
+  it("doesn't count git's file watcher, which outlives the agent that started it", async () => {
+    const home = "/Users/ada/.paseo/zerosub/homes/claude-aaaaaaaaaaaa";
+    processLines.splice(0, processLines.length, `/opt/homebrew/opt/git/libexec/git-core/git fsmonitor--daemon run --detach PWD=/repo CLAUDE_CONFIG_DIR=${home}`);
+    expect(await new ClaudeAdapter().homesInUse([home])).toEqual(new Set());
+    processLines.push(`/Users/ada/.local/bin/claude --output-format stream-json CLAUDE_CONFIG_DIR=${home}`);
+    expect(await new ClaudeAdapter().homesInUse([home])).toEqual(new Set([home]));
+    processLines.length = 0;
   });
 
   it("isn't asked where processes can't be listed, so accounts stay in homes/ there", () => {
