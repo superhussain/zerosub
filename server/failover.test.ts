@@ -1559,6 +1559,15 @@ describe("forking to the other provider", () => {
       expect(setup.created[0]?.agentId).toBe(reserved.targetId);
     });
 
+    it("names the reserved model by its ID when the catalog can't be read during the resend", async () => {
+      const { setup } = await interruptedCreate();
+      const providers = (setup.paseo as { providers: { listModels: (provider: string) => Promise<unknown> } }).providers;
+      vi.spyOn(providers, "listModels").mockRejectedValue(new Error("catalog down"));
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(done.detail).toContain("this continuation uses “opencode/glm-5p3-flash” with the “high” thinking option.");
+    });
+
     it("refuses an outcome-unknown resend from an unknown mode", async () => {
       const { setup, reserved } = await interruptedCreate();
       setup.byId.get(AGENT)!.currentModeId = "mystery";
