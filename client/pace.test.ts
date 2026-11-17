@@ -35,7 +35,7 @@ describe("describing pace", () => {
   it("says Main is held back", () => {
     const copy = describePace(main);
     expect(plain(copy.fiveHour)).toBe("30% now · 90% projected");
-    expect(bold(copy.fiveHour)).toEqual(["30%"]);
+    expect(bold(copy.fiveHour)).toEqual(["30%", "90%"]);
     expect(plain(copy.weekly)).toBe("25% used · 50% elapsed");
     expect(bold(copy.weekly)).toEqual(["25%", "50%"]);
     expect(copy).toMatchObject({
@@ -52,16 +52,17 @@ describe("describing pace", () => {
     expect(plain(copy.fiveHour)).toBe("45% now · 76% projected");
     expect(plain(copy.weekly)).toBe("50% used · 86% elapsed");
     expect(copy).toMatchObject({
-      pending: "Counts 2 new agents the reading doesn't show yet (+20% 5-hour, +4% weekly)",
+      pending: "+2 new agents not in the reading yet",
+      pendingDetail: "Counts 2 new agents the reading doesn't show yet (+20% 5-hour, +4% weekly)",
       standingLabel: "behind pace",
       held: null,
     });
   });
 
   it("says one pending agent in the singular", () => {
-    expect(describePace({ ...work, pending: 1, pendingFiveHour: 10, pendingWeekly: 2 }).pending).toBe(
-      "Counts 1 new agent the reading doesn't show yet (+10% 5-hour, +2% weekly)",
-    );
+    const one = describePace({ ...work, pending: 1, pendingFiveHour: 10, pendingWeekly: 2 });
+    expect(one.pending).toBe("+1 new agent not in the reading yet");
+    expect(one.pendingDetail).toBe("Counts 1 new agent the reading doesn't show yet (+10% 5-hour, +2% weekly)");
   });
 
   it("says so when there is no reading", () => {

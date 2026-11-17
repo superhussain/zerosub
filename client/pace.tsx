@@ -12,6 +12,8 @@ export type Segment = { text: string; bold?: boolean };
 export interface PaceCopy {
   fiveHour: Segment[];
   pending: string | null;
+  /** What the short pending line adds up to, for screen readers. */
+  pendingDetail: string | null;
   weekly: Segment[] | null;
   standing: "ahead" | "behind" | "on" | null;
   standingLabel: string | null;
@@ -19,6 +21,8 @@ export interface PaceCopy {
 }
 
 const r = Math.round;
+const PROJECTION_HINT =
+  "Projected up to 1 hour ahead (never past the reset) at this window's average burn rate so far, counted over at least 30 minutes, plus 10% for each agent just placed here.";
 const STANDING_LABEL = { ahead: "ahead of pace", behind: "behind pace", on: "on pace" };
 
 /** The words under an account's pacing bars. */
@@ -34,8 +38,9 @@ export function describePace(pace: PaceView): PaceCopy {
     fiveHour:
       fiveHourUsed === null
         ? [{ text: `No 5-hour reading yet. Pacing counts it as ${r(fiveHourProjected)}%.` }]
-        : [{ text: `${r(fiveHourUsed)}%`, bold: true }, { text: ` now · ${r(fiveHourProjected)}% projected` }],
-    pending:
+        : [{ text: `${r(fiveHourUsed)}%`, bold: true }, { text: " now · " }, { text: `${r(fiveHourProjected)}%`, bold: true }, { text: " projected" }],
+    pending: pending === 0 ? null : `+${pending} new agent${pending === 1 ? "" : "s"} not in the reading yet`,
+    pendingDetail:
       pending === 0
         ? null
         : `Counts ${pending} new agent${pending === 1 ? "" : "s"} the reading doesn't show yet (+${r(pendingFiveHour)}% 5-hour, +${r(pendingWeekly)}% weekly)`,
@@ -135,9 +140,19 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
   const copy = describePace(pace);
   const { fiveHourUsed, fiveHourProjected, pendingFiveHour, weeklyUsed, pendingWeekly, weekElapsed } = pace;
   return (
-    <View style={{ gap: 6 }}>
-      <Text style={[text.small, { fontWeight: "600" }]}>Pacing</Text>
-      <PaceRow theme={theme} left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>5h hourly projection</Text>} right={<Segments theme={theme} parts={copy.fiveHour} />} />
+    // Rows sit 10 apart and a label sits 4 over its bar, as in `UsageBar`; each bar's box has 3 spare above and
+    // below its 6 px track, so the row gap is 7, the label gap 1, and the closing margin -3.
+    <View style={{ gap: 7, marginBottom: copy.held ? 0 : -3 }}>
+      <Text style={[text.small, { fontWeight: "600", marginBottom: 4 }]}>Pacing</Text>
+      <View style={{ gap: 1 }}>
+      <PaceRow theme={theme} left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>5h hourly projection</Text>} right={
+          <Hint theme={theme} text={PROJECTION_HINT} align="end">
+            <View accessible accessibilityLabel={PROJECTION_HINT}>
+              <Segments theme={theme} parts={copy.fiveHour} />
+            </View>
+          </Hint>
+        }
+      />
       <PaceBar
         theme={theme}
         color={pace.gated ? colors.statusWarning : colors.statusSuccess}
@@ -151,9 +166,14 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
         hint={`New agents skip an account projected at ${PACE_GATE_PERCENT}% or more of its 5-hour limit`}
         now={fiveHourProjected}
       />
-      {copy.pending ? <Text style={text.small}>{copy.pending}</Text> : null}
+      </View>
+      {copy.pending ? (
+        <Text accessibilityLabel={copy.pendingDetail ?? undefined} numberOfLines={1} style={text.small}>
+          {copy.pending}
+        </Text>
+      ) : null}
       {copy.weekly && weeklyUsed !== null ? (
-        <>
+        <View style={{ gap: 1 }}>
           <PaceRow
             theme={theme}
             left={
@@ -174,7 +194,7 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
             label="Weekly use against the week gone"
             now={weeklyUsed + pendingWeekly}
           />
-        </>
+        </View>
       ) : null}
       {copy.held ? <Text style={text.warning}>{copy.held}</Text> : null}
     </View>
