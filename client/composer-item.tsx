@@ -2,7 +2,7 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import * as paseoClient from "@getpaseo/plugin/client";
 import * as paseoUi from "@getpaseo/plugin/client/ui";
 import type { ComponentType } from "react";
-import { accountPeak, formatCredits, formatPercent } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, paceVerdict } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, type AccountView, type StateView } from "../shared/model";
 import { useStore, type ZeroSubStore } from "./store";
 
@@ -65,20 +65,26 @@ export function accountChoices(state: StateView, provider: string | null, chosen
   // Without a choice: the one-time pick, else (when spreading) the account with the most room, else the default.
   const picked = offered.find((account) => account.nextAgentUntil);
   const usual = picked ?? (state.balanceNewAgents ? undefined : offered.find((account) => account.isDefault));
+  const pacedId = state.pacedNext?.[family];
+  const pacedLabel = offered.find((account) => account.id === pacedId)?.label;
+  // A one-time pick sends the next agent there, whatever pacing would choose.
+  const picks = (account: AccountView) => !picked && pacedId === account.id;
   const options: AccountOption[] = [
     usual
-      ? { value: FOLLOW, label: usual.label, description: detail(usual, picked ? "Picked for the next new agent" : "Default") }
-      : { value: FOLLOW, label: "Automatic", description: "The account with the most room" },
+      ? { value: FOLLOW, label: usual.label, description: detail(usual, picks(usual), picked ? "Picked for the next new agent" : "Default") }
+      : { value: FOLLOW, label: "Automatic", description: pacedLabel ? `Pacing picks ${pacedLabel}` : "The account with the most room" },
   ];
   for (const account of offered) {
-    if (account !== usual) options.push({ value: account.id, label: account.label, description: detail(account) });
+    if (account !== usual) options.push({ value: account.id, label: account.label, description: detail(account, picks(account)) });
   }
   // A choice that's no longer offered (the provider changed, or its account can't take agents now) reads as none.
   const value = options.some((option) => option.value === chosen) ? (chosen as string) : FOLLOW;
   return { value, options };
 }
 
-function detail(account: AccountView, lead?: string): string | undefined {
+function detail(account: AccountView, next: boolean, lead?: string): string | undefined {
+  // A pace and a lead mean a one-time pick: the pick wins over pacing's verdict.
+  if (account.pace) return lead ?? paceVerdict(account.pace, next);
   const parts = lead ? [lead] : [];
   if (account.status === "limited") parts.push("Limit reached");
   else {
