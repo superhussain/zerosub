@@ -264,6 +264,8 @@ const HOLD_REFUSAL =
 const OPENCODE_IN_FLIGHT = "A continuation of this agent on OpenCode is being set up. Wait for it to finish, then check that chat.";
 const SOURCE_BUSY_REFUSAL = "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode.";
 const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
+const reservedModeRefusal = (label: string): string =>
+  `This agent's mode changed after ZeroSub reserved its OpenCode continuation in “${label}” mode before a restart. That request may already be in Paseo, so ZeroSub can't change it. Nothing was sent. To finish it, set this agent back to a mode that allows “${label}”, then choose Continue on OpenCode again.`;
 
 /** The conversation a handoff carries: no plugin rows, and none of our own handoff prompts. */
 function meaningful<T extends { item: AgentTimelineItem }>(entries: readonly T[]): T[] {
@@ -2501,6 +2503,14 @@ export class Service {
       // A reservation saved before the request was frozen whole can't be repeated exactly.
       if (!reserved?.title || reserved.workspaceId === undefined || reserved.cwd === undefined || reserved.parentId === undefined) {
         return this.openCodeUncertain(retry.targetId, null, retry.messageId);
+      }
+      // The frozen request can't change, so a source made more careful meanwhile refuses it.
+      const [sourceModes, targetModes] = await Promise.all([
+        paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
+        paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
+      ]);
+      if (!withinMode(sourceModes, original.currentModeId, targetModes, reserved.modeId)) {
+        return { skipped: reservedModeRefusal(targetModes.find((mode) => mode.id === reserved.modeId)?.label ?? reserved.modeId) };
       }
       return this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title }, true);
     }
