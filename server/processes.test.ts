@@ -39,8 +39,8 @@ describe("which homes a process runs on", () => {
     expect(heldBy([puma])).toBe("puma (PID 4242)");
     expect(heldBy([node, puma])).toBe("puma (PID 4242) and node (PID 4250)");
     expect(
-      heldBy([{ pid: 4400, command: "zsh" }, node, { pid: 4301, command: "ruby" }, puma, { pid: 4500, command: "" }]),
-    ).toBe("puma (PID 4242), node (PID 4250), ruby (PID 4301) and 2 more");
+      heldBy([{ pid: 4400, command: "zsh" }, node, { pid: 4301, command: "ruby" }, puma, { pid: 4100, command: "" }]),
+    ).toBe("a process (PID 4100), puma (PID 4242), node (PID 4250) and 2 more");
   });
 
   it.runIf(process.platform === "darwin" || process.platform === "linux")("sees a running process started on a home", async () => {
