@@ -2,6 +2,7 @@ import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { useToast } from "@getpaseo/plugin/client/react-native";
 import { useState, type ComponentType } from "react";
 import { Text, View } from "react-native";
+import { toastDurationMs } from "../shared/format";
 import { FAMILY_LABEL, type Family } from "../shared/model";
 import { forkAgent } from "../shared/rpc";
 import { describe, type ZeroSubStore } from "./store";
@@ -77,27 +78,19 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
       try {
         const fork = await store.rpc(forkAgent, { agentId, destination: "opencode" });
         close();
+        let message: string;
+        let variant: "default" | "success" = "default";
         if (fork.delivery === "up-to-date") {
-          toast.show("No update was sent: the OpenCode continuation already has everything from this agent.", {
-            variant: "default",
-            durationMs: 5_000,
-          });
+          message = "No update was sent: the OpenCode continuation already has everything from this agent.";
         } else if (fork.delivery === "found") {
-          toast.show(`Found the existing OpenCode continuation “${fork.title}”. Nothing was sent; open that chat to inspect it.`, {
-            variant: "default",
-            durationMs: 5_000,
-          });
+          message = `Found the existing OpenCode continuation “${fork.title}”. Nothing was sent; open that chat to inspect it.`;
         } else if (fork.delivery === "uncertain") {
-          toast.show(`The last handoff to “${fork.title}” couldn't be confirmed. Nothing more was sent; open that chat before retrying. To continue in a new chat instead, archive that one.`, {
-            variant: "default",
-            durationMs: 5_000,
-          });
+          message = `The last handoff to “${fork.title}” couldn't be confirmed. Nothing more was sent; open that chat before retrying. To continue in a new chat instead, archive that one.`;
         } else {
-          toast.show(`Continuing on OpenCode in “${fork.title}”.${fork.detail ? ` ${fork.detail}` : ""}`, {
-            variant: "success",
-            durationMs: fork.detail ? 12_000 : 5_000,
-          });
+          message = `Continuing on OpenCode in “${fork.title}”.${fork.detail ? ` ${fork.detail}` : ""}`;
+          variant = "success";
         }
+        toast.show(message, { variant, durationMs: toastDurationMs(message) });
       } catch (failure) {
         setError(describe(failure));
         setBusy(false);
