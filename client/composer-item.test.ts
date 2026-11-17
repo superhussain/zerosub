@@ -202,11 +202,11 @@ describe("pacing in the menu", () => {
     expect(accountChoices(spreading([pacedMain, out, third]), "claude", undefined)?.options[0]?.description).toBe("The account with the most room");
   });
 
-  it("keeps the one-time pick first, with its pacing verdict, and Picks next on the paced account's row", () => {
+  it("keeps the one-time pick first, as the pick, and doesn't say Picks next on another account", () => {
     const picked = account("main", { isDefault: true, nextAgentUntil: "2026-11-09T12:10:00Z", pace: paced({ fiveHourUsed: 5, fiveHourProjected: 6 }) });
     const options = accountChoices(spreading([picked, pacedWork]), "claude", undefined)?.options;
-    expect(options?.[0]).toMatchObject({ label: "main", description: "Room to spare" });
-    expect(options?.[1]?.description).toBe("Picks next");
+    expect(options?.[0]).toMatchObject({ label: "main", description: "Picked for the next new agent" });
+    expect(options?.[1]?.description).toBe("Room to spare");
   });
 });
 

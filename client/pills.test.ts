@@ -91,7 +91,7 @@ describe("the account button", () => {
     const pace = { fiveHourUsed: 61, fiveHourProjected: 78, pendingFiveHour: 0, weeklyUsed: 30, pendingWeekly: 0, weekElapsed: 50, pending: 0, gated: true };
     const items = await menu({ movable: true }, "codex", [account("work", true, { pace }), account("home", false)]);
     const titles = items.flatMap((entry) => (entry.kind === "item" ? [entry.title] : []));
-    expect(titles[0]).toBe("work — Held back: busy hour");
+    expect(titles[0]).toBe("work — held back: busy hour");
     expect(titles[1]).toBe("home");
   });
 

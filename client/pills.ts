@@ -282,7 +282,8 @@ function menuTitle(state: StateView, account: AccountView): string {
   if (account.status === "disabled") return `${account.label} — disabled`;
   if (account.status === "limited") return `${account.label} — limit reached`;
   if (account.pace) {
-    return `${account.label} — ${paceVerdict(account.pace, state.pacedNext?.[account.family] === account.id)}`;
+    const verdict = paceVerdict(account.pace, state.pacedNext?.[account.family] === account.id);
+    return `${account.label} — ${verdict[0]!.toLowerCase()}${verdict.slice(1)}`;
   }
   // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
   const peak = account.usage ? accountPeak(account.usage.windows) : null;

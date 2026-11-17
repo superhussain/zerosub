@@ -67,25 +67,29 @@ export function accountChoices(state: StateView, provider: string | null, chosen
   const usual = picked ?? (state.balanceNewAgents ? undefined : offered.find((account) => account.isDefault));
   const pacedId = state.pacedNext?.[family];
   const pacedLabel = offered.find((account) => account.id === pacedId)?.label;
+  // A one-time pick sends the next agent there, whatever pacing would choose.
+  const picks = (account: AccountView) => !picked && pacedId === account.id;
   const options: AccountOption[] = [
     usual
-      ? { value: FOLLOW, label: usual.label, description: detail(state, usual, picked ? "Picked for the next new agent" : "Default") }
+      ? { value: FOLLOW, label: usual.label, description: detail(usual, picks(usual), picked ? "Picked for the next new agent" : "Default") }
       : { value: FOLLOW, label: "Automatic", description: pacedLabel ? `Pacing picks ${pacedLabel}` : "The account with the most room" },
   ];
   for (const account of offered) {
-    if (account !== usual) options.push({ value: account.id, label: account.label, description: detail(state, account) });
+    if (account !== usual) options.push({ value: account.id, label: account.label, description: detail(account, picks(account)) });
   }
   // A choice that's no longer offered (the provider changed, or its account can't take agents now) reads as none.
   const value = options.some((option) => option.value === chosen) ? (chosen as string) : FOLLOW;
   return { value, options };
 }
 
-function detail(state: StateView, account: AccountView, lead?: string): string | undefined {
-  const parts = lead && !account.pace ? [lead] : [];
+function detail(account: AccountView, next: boolean, lead?: string): string | undefined {
   const pace = account.pace;
+  // With a pace and a lead, the lead is the one-time pick: it wins over pacing's verdict.
+  if (pace && lead) return lead;
+  const parts = lead ? [lead] : [];
   if (account.status === "limited") parts.push("Limit reached");
   else if (pace) {
-    return paceVerdict(pace, state.pacedNext?.[account.family] === account.id);
+    return paceVerdict(pace, next);
   } else {
     // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
     const peak = account.usage ? accountPeak(account.usage.windows) : null;
