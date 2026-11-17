@@ -181,23 +181,9 @@ describe("pacing in the menu", () => {
   it("shows pacing on each account while spreading", () => {
     expect(accountChoices(spreading([pacedMain, pacedWork]), "claude", undefined)?.options).toEqual([
       { value: FOLLOW, label: "Automatic", description: "Pacing picks work" },
-      { value: "main", label: "main", description: "Held back · 72→91% hr · 60% wk ahead" },
-      { value: "work", label: "work", description: "Next · 7→12% hr · 20% wk behind" },
+      { value: "main", label: "main", description: "Held back: busy hour" },
+      { value: "work", label: "work", description: "Picks next" },
     ]);
-  });
-
-  it("keeps the longest pacing line within 45 characters", () => {
-    const longest = account("main", { pace: paced({ fiveHourUsed: 100, fiveHourProjected: 100, weeklyUsed: 100, weekElapsed: 50, pending: 3, gated: true }) });
-    const lines = accountChoices(spreading([longest, pacedWork]), "claude", undefined)?.options.map((option) => option.description ?? "") ?? [];
-    expect(lines[1]).toBe("Held back · 100→100% hr · 100% wk ahead");
-    for (const line of lines.slice(1)) expect(line.length).toBeLessThanOrEqual(45);
-  });
-
-  it("leaves out the 5-hour part without a 5-hour reading", () => {
-    const noReading = account("work", { pace: paced({ fiveHourUsed: null, fiveHourProjected: 50, weeklyUsed: 20 }) });
-    expect(accountChoices(spreading([pacedMain, noReading]), "claude", undefined)?.options.at(-1)?.description).toBe(
-      "Next · 20% wk behind",
-    );
   });
 
   it("keeps the usual text without a pace, and says Limit reached for a limited account", () => {
@@ -216,11 +202,11 @@ describe("pacing in the menu", () => {
     expect(accountChoices(spreading([pacedMain, out, third]), "claude", undefined)?.options[0]?.description).toBe("The account with the most room");
   });
 
-  it("keeps the one-time pick first and Pacing picks next on the paced account's row", () => {
+  it("keeps the one-time pick first, with its pacing verdict, and Picks next on the paced account's row", () => {
     const picked = account("main", { isDefault: true, nextAgentUntil: "2026-11-09T12:10:00Z", pace: paced({ fiveHourUsed: 5, fiveHourProjected: 6 }) });
     const options = accountChoices(spreading([picked, pacedWork]), "claude", undefined)?.options;
-    expect(options?.[0]?.description).toMatch(/^Picked · 5→6% hr/);
-    expect(options?.[1]?.description).toMatch(/^Next · /);
+    expect(options?.[0]).toMatchObject({ label: "main", description: "Room to spare" });
+    expect(options?.[1]?.description).toBe("Picks next");
   });
 });
 

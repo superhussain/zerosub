@@ -4,7 +4,7 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { accountPeak, formatCredits, formatPercent, moveProblem, paceLine, pillText } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, moveProblem, paceVerdict, pillText } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover, openCodeForkPopover } from "./fork-confirm";
@@ -282,8 +282,7 @@ function menuTitle(state: StateView, account: AccountView): string {
   if (account.status === "disabled") return `${account.label} — disabled`;
   if (account.status === "limited") return `${account.label} — limit reached`;
   if (account.pace) {
-    const mark = account.pace.gated ? "Held back" : state.pacedNext?.[account.family] === account.id ? "Next" : undefined;
-    return `${account.label} — ${paceLine(account.pace, mark)}`;
+    return `${account.label} — ${paceVerdict(account.pace, state.pacedNext?.[account.family] === account.id)}`;
   }
   // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
   const peak = account.usage ? accountPeak(account.usage.windows) : null;

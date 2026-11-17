@@ -2,7 +2,7 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import * as paseoClient from "@getpaseo/plugin/client";
 import * as paseoUi from "@getpaseo/plugin/client/ui";
 import type { ComponentType } from "react";
-import { accountPeak, formatCredits, formatPercent, paceLine } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, paceVerdict } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, type AccountView, type StateView } from "../shared/model";
 import { useStore, type ZeroSubStore } from "./store";
 
@@ -85,8 +85,7 @@ function detail(state: StateView, account: AccountView, lead?: string): string |
   const pace = account.pace;
   if (account.status === "limited") parts.push("Limit reached");
   else if (pace) {
-    const mark = lead ? "Picked" : pace.gated ? "Held back" : state.pacedNext?.[account.family] === account.id ? "Next" : undefined;
-    return paceLine(pace, mark);
+    return paceVerdict(pace, state.pacedNext?.[account.family] === account.id);
   } else {
     // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
     const peak = account.usage ? accountPeak(account.usage.windows) : null;

@@ -247,22 +247,17 @@ export function apiUsageLines(account: Pick<AzureSummary, "prices" | "usage">, n
   return { tokens, cost, note };
 }
 
-/** The longest a menu row's pacing line runs; the weekly part goes first when it would pass this. */
-export const PACE_LINE_MAX = 45;
+/** Weekly use at which an account counts as nearly used up. */
+const WEEK_NEARLY_USED = 90;
 
-/** One short line of pacing for a menu row: "Next · 41→54% hr · 30% wk behind". `mark` leads when it applies. */
-export function paceLine(pace: PaceView, mark?: string): string {
-  const r = Math.round;
-  const hourly = pace.fiveHourUsed === null || (r(pace.fiveHourUsed) === 0 && r(pace.fiveHourProjected) === 0) ? null : `${r(pace.fiveHourUsed)}→${r(pace.fiveHourProjected)}% hr`;
-  let weekly: string | null = null;
-  if (pace.weeklyUsed !== null) {
-    const standing =
-      pace.weekElapsed === null
-        ? ""
-        : ` ${r(pace.weeklyUsed + pace.pendingWeekly) > r(pace.weekElapsed) ? "ahead" : r(pace.weeklyUsed + pace.pendingWeekly) < r(pace.weekElapsed) ? "behind" : "on pace"}`;
-    weekly = `${r(pace.weeklyUsed)}% wk${standing}`;
+/** What pacing makes of an account, in a few words for a menu row. `next`: pacing picks it for the next new agent. */
+export function paceVerdict(pace: PaceView, next: boolean): string {
+  if (next) return "Picks next";
+  if (pace.gated) return "Held back: busy hour";
+  if (pace.weeklyUsed !== null && pace.weeklyUsed >= WEEK_NEARLY_USED) return "Week nearly used";
+  // The same standing as the account card's `describePace`.
+  if (pace.weeklyUsed !== null && pace.weekElapsed !== null && Math.round(pace.weeklyUsed + pace.pendingWeekly) > Math.round(pace.weekElapsed)) {
+    return "Using week fast";
   }
-  const join = (parts: Array<string | null | undefined>) => parts.filter(Boolean).join(" · ");
-  const full = join([mark, hourly, weekly]);
-  return full.length > PACE_LINE_MAX ? join([mark, hourly]) : full;
+  return "Room to spare";
 }

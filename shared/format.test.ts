@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  paceLine,
+  paceVerdict,
   accountSubtitle,
   apiUsageLines,
   describeReopen,
@@ -221,17 +221,21 @@ describe("Azure usage on the card", () => {
   });
 });
 
-describe("paceLine", () => {
+describe("paceVerdict", () => {
   const pace = { fiveHourUsed: 41, fiveHourProjected: 54, pendingFiveHour: 0, weeklyUsed: 30, pendingWeekly: 0, weekElapsed: 50, pending: 0, gated: false };
-  it("leads with the mark, then the hourly and weekly parts", () => {
-    expect(paceLine(pace, "Next")).toBe("Next · 41→54% hr · 30% wk behind");
-    expect(paceLine({ ...pace, fiveHourUsed: 8, fiveHourProjected: 9, weeklyUsed: 77 })).toBe("8→9% hr · 77% wk ahead");
+  it("gives each verdict", () => {
+    expect(paceVerdict(pace, true)).toBe("Picks next");
+    expect(paceVerdict({ ...pace, gated: true }, false)).toBe("Held back: busy hour");
+    expect(paceVerdict({ ...pace, weeklyUsed: 90, weekElapsed: 95 }, false)).toBe("Week nearly used");
+    expect(paceVerdict({ ...pace, weeklyUsed: 77 }, false)).toBe("Using week fast");
+    expect(paceVerdict({ ...pace, weeklyUsed: 40, pendingWeekly: 15 }, false)).toBe("Using week fast");
+    expect(paceVerdict(pace, false)).toBe("Room to spare");
+    expect(paceVerdict({ ...pace, weeklyUsed: null, weekElapsed: null }, false)).toBe("Room to spare");
   });
-  it("leaves out the hourly part when now and projected both round to 0%", () => {
-    expect(paceLine({ ...pace, fiveHourUsed: 0.2, fiveHourProjected: 0.4, weeklyUsed: 31 }, "Next")).toBe("Next · 31% wk behind");
-    expect(paceLine({ ...pace, fiveHourUsed: 0, fiveHourProjected: 3 })).toBe("0→3% hr · 30% wk behind");
-  });
-  it("leaves out the hourly part without a 5-hour reading, and the standing without a week", () => {
-    expect(paceLine({ ...pace, fiveHourUsed: null, weekElapsed: null })).toBe("30% wk");
+  it("lets the earlier verdict win", () => {
+    const busy = { ...pace, gated: true, weeklyUsed: 95 };
+    expect(paceVerdict(busy, true)).toBe("Picks next");
+    expect(paceVerdict(busy, false)).toBe("Held back: busy hour");
+    expect(paceVerdict({ ...busy, gated: false }, false)).toBe("Week nearly used");
   });
 });
