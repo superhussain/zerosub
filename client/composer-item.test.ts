@@ -1,7 +1,7 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ACCOUNT_METADATA_KEY, type AccountView, type StateView } from "../shared/model";
+import { ACCOUNT_METADATA_KEY, type AccountView, type PaceView, type StateView } from "../shared/model";
 import { FOLLOW, accountChoices, contributeComposerItem } from "./composer-item";
 import type { ZeroSubStore } from "./store";
 
@@ -17,6 +17,8 @@ vi.mock("@getpaseo/plugin/client/ui", () => ({
     return app.Select;
   },
 }));
+vi.mock("react-native", () => ({ Text: () => null, View: () => null }));
+vi.mock("./ui", () => ({ useText: () => ({}) }));
 vi.mock("./store", () => ({ useStore: (store: { state: StateView | null }) => ({ state: store.state }) }));
 
 function account(id: string, fields: Partial<AccountView> = {}): AccountView {
@@ -82,6 +84,18 @@ function view(accounts: AccountView[], fields: Partial<StateView> = {}): StateVi
     ...fields,
   };
 }
+
+const paced = (fields: Partial<PaceView>): PaceView => ({
+  fiveHourUsed: 0,
+  fiveHourProjected: 0,
+  pendingFiveHour: 0,
+  weeklyUsed: 0,
+  pendingWeekly: 0,
+  weekElapsed: 50,
+  pending: 0,
+  gated: false,
+  ...fields,
+});
 
 const main = account("main", { isDefault: true, usage: used(42) });
 const work = account("work", { usage: used(7) });
@@ -153,6 +167,59 @@ describe("the accounts a composer without an agent offers", () => {
         { value: "main", label: "main", description: "42% used" },
       ]);
     }
+  });
+});
+
+describe("pacing in the menu", () => {
+  const pacedMain = account("main", {
+    isDefault: true,
+    usage: used(72),
+    pace: paced({ fiveHourUsed: 72, fiveHourProjected: 91, weeklyUsed: 60, pending: 1, pendingFiveHour: 10, gated: true }),
+  });
+  const pacedWork = account("work", { usage: used(7), pace: paced({ fiveHourUsed: 7, fiveHourProjected: 12, weeklyUsed: 20 }) });
+  const spreading = (accounts: AccountView[], fields: Partial<StateView> = {}) =>
+    view(accounts, { balanceNewAgents: true, pacedNext: { claude: "work" }, ...fields });
+
+  it("shows pacing on each account while spreading", () => {
+    expect(accountChoices(spreading([pacedMain, pacedWork]), "claude", undefined)?.options).toEqual([
+      { value: FOLLOW, label: "Automatic", description: "Pacing picks work" },
+      {
+        value: "main",
+        label: "main",
+        description: "Held back by pacing · 5h 72% now · 91% projected · week 60% used · 50% elapsed · ahead of pace · +1 new agent not in the reading yet",
+      },
+      { value: "work", label: "work", description: "Pacing picks next · 5h 7% now · 12% projected · week 20% used · 50% elapsed · behind pace" },
+    ]);
+  });
+
+  it("leaves out the 5-hour part without a 5-hour reading", () => {
+    const noReading = account("work", { pace: paced({ fiveHourUsed: null, fiveHourProjected: 50, weeklyUsed: 20 }) });
+    expect(accountChoices(spreading([pacedMain, noReading]), "claude", undefined)?.options.at(-1)?.description).toBe(
+      "Pacing picks next · week 20% used · 50% elapsed · behind pace",
+    );
+  });
+
+  it("keeps the usual text without a pace, and says Limit reached for a limited account", () => {
+    expect(accountChoices(spreading([main, work], { pacedNext: undefined }), "claude", undefined)?.options.map((option) => option.description)).toEqual([
+      "The account with the most room",
+      "42% used",
+      "7% used",
+    ]);
+    const full = account("work", { status: "limited" });
+    expect(accountChoices(spreading([pacedMain, full], { autoSwitch: false }), "claude", undefined)?.options.at(-1)?.description).toBe("Limit reached");
+  });
+
+  it("keeps Automatic's usual text when the paced account isn't offered", () => {
+    const out = account("work", { status: "signed_out" });
+    const third = account("home");
+    expect(accountChoices(spreading([pacedMain, out, third]), "claude", undefined)?.options[0]?.description).toBe("The account with the most room");
+  });
+
+  it("keeps the one-time pick first and Pacing picks next on the paced account's row", () => {
+    const picked = account("main", { isDefault: true, nextAgentUntil: "2026-11-09T12:10:00Z", pace: paced({ fiveHourUsed: 5, fiveHourProjected: 6 }) });
+    const options = accountChoices(spreading([picked, pacedWork]), "claude", undefined)?.options;
+    expect(options?.[0]?.description).toMatch(/^Picked for the next new agent · 5h /);
+    expect(options?.[1]?.description).toMatch(/^Pacing picks next · /);
   });
 });
 

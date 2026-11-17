@@ -473,6 +473,8 @@ export const StateViewSchema = z.object({
   autoSwitch: z.boolean().default(true),
   /** New agents without an account of their own start on the one with the most room, not on the default. */
   balanceNewAgents: z.boolean().optional(),
+  /** While spreading is on: per family, the account a new agent naming none would start on. */
+  pacedNext: z.record(z.string(), z.string()).optional(),
   /**
    * This host's Paseo keeps agent metadata (0.16 and later), which carries the Account control's
    * choice. Without it the control isn't shown: an app from 0.16 would take the choice and then fail

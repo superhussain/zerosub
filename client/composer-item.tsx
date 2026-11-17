@@ -4,6 +4,7 @@ import * as paseoUi from "@getpaseo/plugin/client/ui";
 import type { ComponentType } from "react";
 import { accountPeak, formatCredits, formatPercent } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, type AccountView, type StateView } from "../shared/model";
+import { describePace, type Segment } from "./pace";
 import { useStore, type ZeroSubStore } from "./store";
 
 /**
@@ -65,23 +66,37 @@ export function accountChoices(state: StateView, provider: string | null, chosen
   // Without a choice: the one-time pick, else (when spreading) the account with the most room, else the default.
   const picked = offered.find((account) => account.nextAgentUntil);
   const usual = picked ?? (state.balanceNewAgents ? undefined : offered.find((account) => account.isDefault));
+  const pacedId = state.pacedNext?.[family];
+  const pacedLabel = offered.find((account) => account.id === pacedId)?.label;
   const options: AccountOption[] = [
     usual
-      ? { value: FOLLOW, label: usual.label, description: detail(usual, picked ? "Picked for the next new agent" : "Default") }
-      : { value: FOLLOW, label: "Automatic", description: "The account with the most room" },
+      ? { value: FOLLOW, label: usual.label, description: detail(state, usual, picked ? "Picked for the next new agent" : "Default") }
+      : { value: FOLLOW, label: "Automatic", description: pacedLabel ? `Pacing picks ${pacedLabel}` : "The account with the most room" },
   ];
   for (const account of offered) {
-    if (account !== usual) options.push({ value: account.id, label: account.label, description: detail(account) });
+    if (account !== usual) options.push({ value: account.id, label: account.label, description: detail(state, account) });
   }
   // A choice that's no longer offered (the provider changed, or its account can't take agents now) reads as none.
   const value = options.some((option) => option.value === chosen) ? (chosen as string) : FOLLOW;
   return { value, options };
 }
 
-function detail(account: AccountView, lead?: string): string | undefined {
+const plain = (parts: Segment[]) => parts.map((part) => part.text).join("");
+
+function detail(state: StateView, account: AccountView, lead?: string): string | undefined {
   const parts = lead ? [lead] : [];
+  const pace = account.pace;
   if (account.status === "limited") parts.push("Limit reached");
-  else {
+  else if (pace) {
+    const copy = describePace(pace);
+    if (state.pacedNext?.[account.family] === account.id) parts.push("Pacing picks next");
+    if (pace.gated) parts.push("Held back by pacing");
+    if (pace.fiveHourUsed !== null) parts.push(`5h ${plain(copy.fiveHour)}`);
+    if (copy.weekly) parts.push(`week ${plain(copy.weekly)}`);
+    if (copy.pending) parts.push(copy.pending);
+    const credits = account.usage?.credits;
+    if (credits) parts.push(formatCredits(credits));
+  } else {
     // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
     const peak = account.usage ? accountPeak(account.usage.windows) : null;
     if (peak) parts.push(`${formatPercent(peak.usedPercent)} used`);
