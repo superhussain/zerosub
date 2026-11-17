@@ -40,6 +40,7 @@ import {
   missingAdapter,
   type AgentTimelineItem,
   type FamilyAdapter,
+  type HomeHolder,
   type Identity,
   type LimitHit,
   type LimitKind,
@@ -71,8 +72,9 @@ import { Mutex } from "./json-file";
 import { reapLeftovers, type AgentLookup } from "./leftovers";
 import { detectAzureLimit, detectAzureSignOut, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
-import { equivalentMode, withinMode } from "./modes";
+import { equivalentMode, withinMode, type ModeInfo } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
+import { heldBy } from "./processes";
 import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, PLACED, placeFor, type PlacedFamily } from "./placement";
 import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
@@ -324,6 +326,13 @@ type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 /** Why a conversation of a provider without hand-off (Grok's, Cursor's) can't be given another account. */
 function stays(family: Family, on: string | null): string {
   return `${FAMILY_LABEL[family]} conversations stay on the account they started on${on ? ` (${on})` : ""}. Start a new agent to use another account; new agents follow your pick and the default.`;
+}
+
+/** Why a home waits: the processes that run on it (`started`: once its folder was moved), or the CLI when none are named. */
+function inUseNote(family: Family, holders: readonly HomeHolder[], started: boolean): string {
+  if (holders.length === 0) return `${PROVIDER_NAME[family]} ${started ? "started" : "runs"} on it (an agent or a terminal); it moves once that stops`;
+  const one = holders.length === 1;
+  return `${heldBy(holders)} ${started ? "started" : one ? "runs" : "run"} on it; it moves once ${one ? "that stops" : "they stop"}`;
 }
 
 /** What a same-conversation reload has to put back if the other account cannot read the thread. */
@@ -2326,10 +2335,9 @@ export class Service {
     }
     const source = await this.openCodeSource(paseo, agentId, config);
     if (!source) return { refused: MOVED_REFUSAL };
-    const [sourceModes, targetModes] = await Promise.all([
-      paseo.providers.listModes(source.original.provider).then((result) => result.modes ?? []),
-      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
-    ]);
+    const read = await readOpenCodeModes(paseo, source.original.provider);
+    if ("unreadable" in read) return { refused: read.unreadable };
+    const { sourceModes, targetModes } = read;
     // The parent is resolved again after the catalog reads, then the snapshots come last.
     const parentId = await this.continuations.parentFor(paseo, agentId);
     const [original, fork] = await Promise.all([
@@ -2505,10 +2513,9 @@ export class Service {
         return this.openCodeUncertain(retry.targetId, null, retry.messageId);
       }
       // The frozen request can't change, so a source made more careful meanwhile refuses it.
-      const [sourceModes, targetModes] = await Promise.all([
-        paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
-        paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
-      ]);
+      const read = await readOpenCodeModes(paseo, original.provider);
+      if ("unreadable" in read) return { skipped: read.unreadable };
+      const { sourceModes, targetModes } = read;
       if (!withinMode(sourceModes, original.currentModeId, targetModes, reserved.modeId)) {
         return { skipped: reservedModeRefusal(targetModes.find((mode) => mode.id === reserved.modeId)?.label ?? reserved.modeId) };
       }
@@ -2529,10 +2536,9 @@ export class Service {
       return { skipped: `“${model.label}” no longer offers the saved thinking option. Pick one in ZeroSub's settings.` };
     }
 
-    const [sourceModes, targetModes] = await Promise.all([
-      paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
-      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
-    ]);
+    const read = await readOpenCodeModes(paseo, original.provider);
+    if ("unreadable" in read) return { skipped: read.unreadable };
+    const { sourceModes, targetModes } = read;
     const modeId = equivalentMode(sourceModes, original.currentModeId, targetModes);
     if (!modeId) {
       const current = sourceModes.find((mode) => mode.id === original.currentModeId)?.label;
@@ -4708,13 +4714,13 @@ export class Service {
       if (!due.some((account) => account.id === accountId) && !state.moves[accountId]) this.moveNotes.delete(accountId);
     }
     if (due.length === 0) return this.forgetEmptiedFolders(state);
-    const inUse = new Set<string>();
+    const inUse = new Map<string, HomeHolder[]>();
     const unknown = new Set<string>();
     for (const family of PLACED) {
       const homes = due.filter((account) => account.family === family).map((account) => account.home);
       if (homes.length === 0) continue;
       try {
-        for (const home of await this.adapters[family].homesInUse!(homes)) inUse.add(home);
+        for (const [home, holders] of await this.adapters[family].homesInUse!(homes)) inUse.set(home, holders);
       } catch (error) {
         for (const account of due.filter((entry) => entry.family === family)) {
           unknown.add(account.id);
@@ -4768,11 +4774,12 @@ export class Service {
   }
 
   /** Why an account's home can't move just now, or null when it can. */
-  private moveBlocker(account: StoredAccount & { home: string }, inUse: ReadonlySet<string>): string | null {
+  private moveBlocker(account: StoredAccount & { home: string }, inUse: ReadonlyMap<string, readonly HomeHolder[]>): string | null {
     const { home } = account;
     if ([...this.logins.values()].some((login) => login.home === home && (!login.finishedAt || login.saving))) return "it's being signed in";
     if (this.creatingHomes.has(home)) return "it's being set up";
-    if (inUse.has(home)) return `${PROVIDER_NAME[account.family]} runs on it (an agent or a terminal); it moves once that stops`;
+    const holders = inUse.get(home);
+    if (holders) return inUseNote(account.family, holders, false);
     if ((this.homeCalls.get(home) ?? 0) > 0) return "ZeroSub is working on it";
     if (Date.now() - (this.routedAt.get(account.id) ?? 0) < ROUTED_SETTLE_MS) return "an agent has just started on it";
     return null;
@@ -4808,8 +4815,9 @@ export class Service {
         copied = true;
         await moveHome(from, to, async () => {
           // Checked again once the folder is there: anything that started on it meanwhile keeps it.
-          const started = (await homesInUse([from])).has(from)
-            ? `${PROVIDER_NAME[account.family]} started on it (an agent or a terminal); it moves once that stops`
+          const holders = (await homesInUse([from])).get(from);
+          const started = holders
+            ? inUseNote(account.family, holders, true)
             : [...this.logins.values()].some((login) => login.home === from && !login.finishedAt)
               ? "it's being signed in"
               : (this.homeCalls.get(from) ?? 0) > 0
@@ -5247,6 +5255,18 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     updatedAt: Date.parse(agent.updatedAt) || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
   };
+}
+
+/** The source's and OpenCode's modes, or why nothing was sent when Paseo answers either read with an error. */
+async function readOpenCodeModes(
+  paseo: PaseoApi,
+  sourceProvider: string,
+): Promise<{ sourceModes: ModeInfo[]; targetModes: ModeInfo[] } | { unreadable: string }> {
+  const [source, target] = await Promise.all([paseo.providers.listModes(sourceProvider), paseo.providers.listModes(OPENCODE_PROVIDER)]);
+  const unreadable = (whose: string, error: string) => ({ unreadable: `Couldn't read ${whose} modes: ${error.replace(/\.$/, "")}. Nothing was sent; try again.` });
+  if (source.error) return unreadable("this agent's", source.error);
+  if (target.error) return unreadable(`this host's ${OPENCODE_LABEL}`, target.error);
+  return { sourceModes: source.modes ?? [], targetModes: target.modes ?? [] };
 }
 
 /** The agent, or null once Paseo says it doesn't know it. A lookup that fails throws. */

@@ -90,6 +90,9 @@ export interface ProxyState {
  */
 export type EnvPatch = Record<string, string | null>;
 
+/** A process that runs on an account's home: what `homesInUse` names to say why the home waits. */
+export type HomeHolder = { pid: number; command: string };
+
 /** Everything provider-specific. The service only talks to accounts through this. */
 export interface FamilyAdapter {
   readonly family: Family;
@@ -152,10 +155,11 @@ export interface FamilyAdapter {
   /** The address Anthropic sees the account's requests come from; null when they go somewhere else first. */
   egress?(home: string | null): Promise<{ ip: string; country: string | null } | null>;
   /**
-   * Which of `homes` a process of the provider's CLI runs on right now, so a home isn't moved under
-   * it (see `Service.placeHomes`). Providers that have it keep added accounts' homes outside `homes/`.
+   * Which of `homes` a process of the provider's CLI runs on right now, with those processes, so a
+   * home isn't moved under it (see `Service.placeHomes`). Providers that have it keep added accounts'
+   * homes outside `homes/`.
    */
-  homesInUse?(homes: readonly string[]): Promise<Set<string>>;
+  homesInUse?(homes: readonly string[]): Promise<Map<string, HomeHolder[]>>;
   /**
    * Whether `home` holds an account's sign-in or key: what a folder made again by a sync, or by the
    * CLI started on it, lacks. Tells which of two folders an interrupted move left is the account.

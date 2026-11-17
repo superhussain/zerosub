@@ -772,6 +772,10 @@ describe("forking to the other provider", () => {
       catalog?: Array<Record<string, unknown>>;
       /** A failed `listModels` answer, which carries `error` instead of throwing. */
       catalogError?: string;
+      /** A failed OpenCode `listModes` answer, which carries `error` instead of throwing. */
+      modesError?: string;
+      /** A failed `listModes` answer for the source agent's provider. */
+      sourceModesError?: string;
       /** OpenCode's modes. */
       opencodeModes?: Array<{ id: string; label: string; colorTier?: string }>;
       /** No ChatGPT account is configured at all. */
@@ -875,6 +879,8 @@ describe("forking to the other provider", () => {
         listAvailable: async () => ({ providers: available }),
         listModes: async (provider: string) => {
           hooks.onModes?.(provider);
+          if (provider === "opencode" && options.modesError) return { error: options.modesError };
+          if (provider === source.provider && options.sourceModesError) return { error: options.sourceModesError };
           return { modes: modes[provider] };
         },
         listModels: async (provider: string) => (provider === "opencode" && options.catalogError ? { error: options.catalogError } : { models: models[provider] }),
@@ -1412,6 +1418,52 @@ describe("forking to the other provider", () => {
       expect(done.agentId).toBe(RESERVED.targetId);
       expect(setup.created).toHaveLength(1);
       expect(setup.sends.map((send) => send.messageId)).toEqual([RESERVED.messageId]);
+    });
+
+    describe("unreadable modes", () => {
+      const UNREADABLE = "Couldn't read this host's OpenCode modes: daemon unreachable. Nothing was sent; try again.";
+      const setUp = () => setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, modesError: "daemon unreachable" });
+
+      it("refuses a new create", async () => {
+        const setup = await setUp();
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(UNREADABLE);
+        expect(setup.created).toHaveLength(0);
+        expect(setup.sends).toHaveLength(0);
+        expect((await setup.store.read()).opencodeForks[AGENT]).toBeUndefined();
+      });
+
+      it("refuses a reserved retry", async () => {
+        const setup = await setUp();
+        await setup.store.update((draft) => {
+          draft.opencodeForks[AGENT] = reservedCreation();
+        });
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(UNREADABLE);
+        expect(setup.created).toHaveLength(0);
+        expect(setup.sends).toHaveLength(0);
+        expect((await setup.store.read()).opencodeForks[AGENT]).toEqual(reservedCreation());
+      });
+
+      it("names the source's modes, without doubling a period the error ends with", async () => {
+        const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, sourceModesError: "agent gone." });
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(
+          "Couldn't read this agent's modes: agent gone. Nothing was sent; try again.",
+        );
+        expect(setup.created).toHaveLength(0);
+        expect(setup.sends).toHaveLength(0);
+      });
+
+      it("refuses a reused fork", async () => {
+        const setup = await setUp();
+        await setup.store.update((draft) => {
+          draft.opencodeForks[AGENT] = { forkAgentId: RESERVED.targetId, seen: MARK };
+        });
+        setup.byId.set(RESERVED.targetId, opencodeAgent(RESERVED.targetId));
+        setup.addTurn(AGENT, { type: "user_message", text: "Now also update the CHANGELOG" }, "user-2");
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(UNREADABLE);
+        expect(setup.created).toHaveLength(0);
+        expect(setup.sends).toHaveLength(0);
+        expect((await setup.store.read()).opencodeForks[AGENT]).toEqual({ forkAgentId: RESERVED.targetId, seen: MARK });
+      });
     });
 
     const KIMI_CATALOG = [

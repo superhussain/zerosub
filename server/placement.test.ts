@@ -2,7 +2,7 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { FamilyAdapter, Identity, LoginHandle } from "./adapter";
+import type { FamilyAdapter, HomeHolder, Identity, LoginHandle } from "./adapter";
 import type { FamilyResolver } from "./families";
 import { claudeHomeHoldsAccount } from "./homes";
 import { chooseHomesDir } from "./placement";
@@ -55,6 +55,8 @@ interface Fake {
   keychain: Map<string, string>;
   /** Homes Claude Code runs on. */
   inUse: Set<string>;
+  /** The processes named as running on a home in `inUse`; none when unset. */
+  holders: Map<string, HomeHolder[]>;
   signedIn: Set<string>;
   /** Who a signed-in home is signed in as, when not ada@example.com; null for an API key. */
   emails: Map<string, string | null>;
@@ -65,7 +67,7 @@ interface Fake {
 }
 
 function newFake(): Fake {
-  return { calls: [], keychain: new Map(), inUse: new Set(), signedIn: new Set(), emails: new Map(), holdCopy: null, copying: () => undefined, finish: () => undefined };
+  return { calls: [], keychain: new Map(), inUse: new Set(), holders: new Map(), signedIn: new Set(), emails: new Map(), holdCopy: null, copying: () => undefined, finish: () => undefined };
 }
 
 /** A Claude adapter with the real one's rules for moving a sign-in, over an in-memory Keychain. */
@@ -103,7 +105,8 @@ function fakeAdapter(fake: Fake): FamilyAdapter {
       await mkdir(home, { recursive: true });
       await writeFile(join(home, "settings.account.json"), '{"env":{"ANTHROPIC_API_KEY":"sk-test"}}');
     },
-    homesInUse: async (list: readonly string[]) => new Set(list.filter((home) => fake.inUse.has(home))),
+    homesInUse: async (list: readonly string[]) =>
+      new Map(list.filter((home) => fake.inUse.has(home)).map((home) => [home, fake.holders.get(home) ?? []])),
     copyCredentials: async (from: string, to: string) => {
       fake.calls.push(`copy ${from} ${to}`);
       fake.copying();
@@ -234,6 +237,22 @@ describe("moving an account's home", () => {
     await service.placeHomes();
     expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(join(kept(), "claude-work"));
     expect((await service.view(paseo)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.moving).toBeNull();
+  });
+
+  it("names the processes that hold a home", async () => {
+    const { service, fake } = start();
+    const home = join(homes(), "claude-aaaaaaaaaaaa");
+    await makeHome(home);
+    await seed({ accounts: [main, managed("claude-aaaaaaaaaaaa", "Work", home)] });
+    fake.inUse.add(home);
+    fake.holders.set(home, [
+      { pid: 4250, command: "node" },
+      { pid: 4242, command: "puma" },
+    ]);
+
+    await service.placeHomes();
+    const waiting = (await service.view(paseo)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.moving;
+    expect(waiting).toEqual({ to: kept(), waiting: "puma (PID 4242) and node (PID 4250) run on it; it moves once they stop", error: null });
   });
 
   it("leaves Grok and Cursor accounts in homes/, with no move, script or outside folder", async () => {

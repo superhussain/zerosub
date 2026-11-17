@@ -14,6 +14,7 @@ import {
   pillText,
   shortLabel,
   staleNotice,
+  toastDurationMs,
   usageSummary,
 } from "./format";
 import type { AccountView } from "./model";
@@ -217,5 +218,18 @@ describe("Azure usage on the card", () => {
 
   it("says when some turns couldn't be counted", () => {
     expect(apiUsageLines({ ...azure, usage: { ...azure.usage, uncounted: 2 } }, NOW).note).toMatch(/^2 turns couldn't be counted/);
+  });
+});
+
+describe("toast durations", () => {
+  it("sizes toasts by word count", () => {
+    expect(toastDurationMs("No update was sent: the OpenCode continuation already has everything from this agent.")).toBe(5_000);
+    expect(toastDurationMs("Found the existing OpenCode continuation “Fix the build”. Nothing was sent; open that chat to inspect it.")).toBe(5_100);
+    expect(
+      toastDurationMs(
+        "The last handoff to “Fix the build” couldn't be confirmed. Nothing more was sent; open that chat before retrying. To continue in a new chat instead, archive that one.",
+      ),
+    ).toBe(8_700);
+    expect(toastDurationMs(" word".repeat(60))).toBe(12_000);
   });
 });
