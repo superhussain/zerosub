@@ -28,10 +28,17 @@ const STANDING_LABEL = { ahead: "ahead of pace", behind: "behind pace", on: "on 
 export function describePace(pace: PaceView): PaceCopy {
   const { fiveHourUsed, fiveHourProjected, pendingFiveHour, weeklyUsed, pendingWeekly, weekElapsed, pending, gated } = pace;
   let standing: PaceCopy["standing"] = null;
+  let weekly: Segment[] | null = weeklyUsed === null ? null : [{ text: `${r(weeklyUsed)}%`, bold: true }, { text: " used" }];
   if (weeklyUsed !== null && weekElapsed !== null) {
     const used = r(weeklyUsed + pendingWeekly);
     const gone = r(weekElapsed);
     standing = used > gone ? "ahead" : used < gone ? "behind" : "on";
+    weekly = [
+      { text: `${r(weeklyUsed)}%`, bold: true },
+      { text: " used · " },
+      { text: `${r(weekElapsed)}%`, bold: true },
+      { text: ` elapsed · ${STANDING_LABEL[standing]}` },
+    ];
   }
   return {
     fiveHour:
@@ -43,17 +50,7 @@ export function describePace(pace: PaceView): PaceCopy {
       pending === 0
         ? null
         : `Counts ${pending} new agent${pending === 1 ? "" : "s"} the reading doesn't show yet (+${r(pendingFiveHour)}% 5-hour, +${r(pendingWeekly)}% weekly)`,
-    weekly:
-      weeklyUsed === null
-        ? null
-        : weekElapsed === null
-          ? [{ text: `${r(weeklyUsed)}%`, bold: true }, { text: " used" }]
-          : [
-              { text: `${r(weeklyUsed)}%`, bold: true },
-              { text: " used · " },
-              { text: `${r(weekElapsed)}%`, bold: true },
-              { text: ` elapsed · ${STANDING_LABEL[standing!]}` },
-            ],
+    weekly,
     standing,
     held: gated
       ? `Pacing holds it back: new agents start on other accounts first while it is projected at or past ${PACE_GATE_PERCENT}% of its 5-hour limit.`
@@ -143,27 +140,30 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
     <View style={{ gap: 7, marginBottom: copy.held ? 0 : -3 }}>
       <Text style={[text.small, { fontWeight: "600", marginBottom: 4 }]}>Pacing</Text>
       <View style={{ gap: 1 }}>
-      <PaceRow theme={theme} left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>Hourly projection</Text>} right={
-          <Hint theme={theme} text={PROJECTION_HINT} align="end">
-            <View accessible accessibilityLabel={PROJECTION_HINT}>
-              <Segments theme={theme} parts={copy.fiveHour} />
-            </View>
-          </Hint>
-        }
-      />
-      <PaceBar
-        theme={theme}
-        color={pace.gated ? colors.statusWarning : colors.statusSuccess}
-        fills={[
-          [fiveHourProjected, 0.2],
-          [fiveHourProjected - pendingFiveHour, 0.45],
-          [fiveHourUsed ?? 0, 1],
-        ]}
-        tick={PACE_GATE_PERCENT}
-        label={`5-hour use projected an hour ahead, gate ${PACE_GATE_PERCENT}%`}
-        hint={`New agents skip an account projected at ${PACE_GATE_PERCENT}% or more of its 5-hour limit`}
-        now={fiveHourProjected}
-      />
+        <PaceRow
+          theme={theme}
+          left={<Text style={text.small}>Hourly projection</Text>}
+          right={
+            <Hint theme={theme} text={PROJECTION_HINT} align="end">
+              <View accessible accessibilityLabel={copy.fiveHour.map((part) => part.text).join("")} accessibilityHint={PROJECTION_HINT}>
+                <Segments theme={theme} parts={copy.fiveHour} />
+              </View>
+            </Hint>
+          }
+        />
+        <PaceBar
+          theme={theme}
+          color={pace.gated ? colors.statusWarning : colors.statusSuccess}
+          fills={[
+            [fiveHourProjected, 0.2],
+            [fiveHourProjected - pendingFiveHour, 0.45],
+            [fiveHourUsed ?? 0, 1],
+          ]}
+          tick={PACE_GATE_PERCENT}
+          label={`5-hour use projected an hour ahead, gate ${PACE_GATE_PERCENT}%`}
+          hint={`New agents skip an account projected at ${PACE_GATE_PERCENT}% or more of its 5-hour limit`}
+          now={fiveHourProjected}
+        />
       </View>
       {copy.pending ? (
         <Text accessibilityLabel={copy.pendingDetail ?? undefined} numberOfLines={1} style={text.small}>
@@ -174,7 +174,7 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
         <View style={{ gap: 1 }}>
           <PaceRow
             theme={theme}
-            left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>Weekly pace</Text>}
+            left={<Text style={text.small}>Weekly pace</Text>}
             right={<Segments theme={theme} parts={copy.weekly} />}
           />
           <PaceBar
