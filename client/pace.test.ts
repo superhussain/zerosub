@@ -36,12 +36,11 @@ describe("describing pace", () => {
     const copy = describePace(main);
     expect(plain(copy.fiveHour)).toBe("30% now · 90% projected");
     expect(bold(copy.fiveHour)).toEqual(["30%", "90%"]);
-    expect(plain(copy.weekly)).toBe("25% used · 50% elapsed");
+    expect(plain(copy.weekly)).toBe("25% used · 50% elapsed · behind pace");
     expect(bold(copy.weekly)).toEqual(["25%", "50%"]);
     expect(copy).toMatchObject({
       pending: null,
       standing: "behind",
-      standingLabel: "behind pace",
       held:
         "Pacing holds it back: new agents start on other accounts first while it is projected at or past 80% of its 5-hour limit.",
     });
@@ -50,11 +49,10 @@ describe("describing pace", () => {
   it("counts the agents pending on Work", () => {
     const copy = describePace(work);
     expect(plain(copy.fiveHour)).toBe("45% now · 76% projected");
-    expect(plain(copy.weekly)).toBe("50% used · 86% elapsed");
+    expect(plain(copy.weekly)).toBe("50% used · 86% elapsed · behind pace");
     expect(copy).toMatchObject({
       pending: "+2 new agents not in the reading yet",
       pendingDetail: "Counts 2 new agents the reading doesn't show yet (+20% 5-hour, +4% weekly)",
-      standingLabel: "behind pace",
       held: null,
     });
   });
@@ -69,13 +67,12 @@ describe("describing pace", () => {
     const empty: PaceView = { ...main, fiveHourUsed: null, fiveHourProjected: 50, weeklyUsed: null, weekElapsed: null, gated: false };
     const copy = describePace(empty);
     expect(plain(copy.fiveHour)).toBe("No 5-hour reading yet. Pacing counts it as 50%.");
-    expect(copy).toMatchObject({ weekly: null, standing: null, standingLabel: null });
+    expect(copy).toMatchObject({ weekly: null, standing: null });
   });
 
   it("calls weekly use ahead of pace when it is past the week gone", () => {
     const ahead = describePace({ ...main, weeklyUsed: 60, weekElapsed: 40 });
     expect(ahead.standing).toBe("ahead");
-    expect(ahead.standingLabel).toBe("ahead of pace");
-    expect(plain(ahead.weekly)).toBe("60% used · 40% elapsed");
+    expect(plain(ahead.weekly)).toBe("60% used · 40% elapsed · ahead of pace");
   });
 });

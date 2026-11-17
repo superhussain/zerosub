@@ -16,7 +16,6 @@ export interface PaceCopy {
   pendingDetail: string | null;
   weekly: Segment[] | null;
   standing: "ahead" | "behind" | "on" | null;
-  standingLabel: string | null;
   held: string | null;
 }
 
@@ -53,10 +52,9 @@ export function describePace(pace: PaceView): PaceCopy {
               { text: `${r(weeklyUsed)}%`, bold: true },
               { text: " used · " },
               { text: `${r(weekElapsed)}%`, bold: true },
-              { text: " elapsed" },
+              { text: ` elapsed · ${STANDING_LABEL[standing!]}` },
             ],
     standing,
-    standingLabel: standing && STANDING_LABEL[standing],
     held: gated
       ? `Pacing holds it back: new agents start on other accounts first while it is projected at or past ${PACE_GATE_PERCENT}% of its 5-hour limit.`
       : null,
@@ -145,7 +143,7 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
     <View style={{ gap: 7, marginBottom: copy.held ? 0 : -3 }}>
       <Text style={[text.small, { fontWeight: "600", marginBottom: 4 }]}>Pacing</Text>
       <View style={{ gap: 1 }}>
-      <PaceRow theme={theme} left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>5h hourly projection</Text>} right={
+      <PaceRow theme={theme} left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>Hourly projection</Text>} right={
           <Hint theme={theme} text={PROJECTION_HINT} align="end">
             <View accessible accessibilityLabel={PROJECTION_HINT}>
               <Segments theme={theme} parts={copy.fiveHour} />
@@ -176,12 +174,8 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
         <View style={{ gap: 1 }}>
           <PaceRow
             theme={theme}
-            left={
-              <Text style={{ color: colors.foregroundMuted, fontSize: 12, flexShrink: 1 }}>
-                Weekly pace · <Segments theme={theme} parts={copy.weekly} />
-              </Text>
-            }
-            right={copy.standingLabel ? <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>{copy.standingLabel}</Text> : null}
+            left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>Weekly pace</Text>}
+            right={<Segments theme={theme} parts={copy.weekly} />}
           />
           <PaceBar
             theme={theme}
