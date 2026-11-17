@@ -72,7 +72,7 @@ import { Mutex } from "./json-file";
 import { reapLeftovers, type AgentLookup } from "./leftovers";
 import { detectAzureLimit, detectAzureSignOut, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
-import { equivalentMode, withinMode } from "./modes";
+import { equivalentMode, withinMode, type ModeInfo } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
 import { heldBy } from "./processes";
 import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, PLACED, placeFor, type PlacedFamily } from "./placement";
@@ -2335,10 +2335,9 @@ export class Service {
     }
     const source = await this.openCodeSource(paseo, agentId, config);
     if (!source) return { refused: MOVED_REFUSAL };
-    const [sourceModes, targetModes] = await Promise.all([
-      paseo.providers.listModes(source.original.provider).then((result) => result.modes ?? []),
-      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
-    ]);
+    const read = await readOpenCodeModes(paseo, source.original.provider);
+    if ("unreadable" in read) return { refused: read.unreadable };
+    const { sourceModes, targetModes } = read;
     // The parent is resolved again after the catalog reads, then the snapshots come last.
     const parentId = await this.continuations.parentFor(paseo, agentId);
     const [original, fork] = await Promise.all([
@@ -2514,10 +2513,9 @@ export class Service {
         return this.openCodeUncertain(retry.targetId, null, retry.messageId);
       }
       // The frozen request can't change, so a source made more careful meanwhile refuses it.
-      const [sourceModes, targetModes] = await Promise.all([
-        paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
-        paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
-      ]);
+      const read = await readOpenCodeModes(paseo, original.provider);
+      if ("unreadable" in read) return { skipped: read.unreadable };
+      const { sourceModes, targetModes } = read;
       if (!withinMode(sourceModes, original.currentModeId, targetModes, reserved.modeId)) {
         return { skipped: reservedModeRefusal(targetModes.find((mode) => mode.id === reserved.modeId)?.label ?? reserved.modeId) };
       }
@@ -2538,10 +2536,9 @@ export class Service {
       return { skipped: `“${model.label}” no longer offers the saved thinking option. Pick one in ZeroSub's settings.` };
     }
 
-    const [sourceModes, targetModes] = await Promise.all([
-      paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
-      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
-    ]);
+    const read = await readOpenCodeModes(paseo, original.provider);
+    if ("unreadable" in read) return { skipped: read.unreadable };
+    const { sourceModes, targetModes } = read;
     const modeId = equivalentMode(sourceModes, original.currentModeId, targetModes);
     if (!modeId) {
       const current = sourceModes.find((mode) => mode.id === original.currentModeId)?.label;
@@ -5258,6 +5255,18 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     updatedAt: Date.parse(agent.updatedAt) || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
   };
+}
+
+/** The source's and OpenCode's modes, or why nothing was sent when Paseo answers either read with an error. */
+async function readOpenCodeModes(
+  paseo: PaseoApi,
+  sourceProvider: string,
+): Promise<{ sourceModes: ModeInfo[]; targetModes: ModeInfo[] } | { unreadable: string }> {
+  const [source, target] = await Promise.all([paseo.providers.listModes(sourceProvider), paseo.providers.listModes(OPENCODE_PROVIDER)]);
+  const unreadable = (whose: string, error: string) => ({ unreadable: `Couldn't read ${whose} modes: ${error}. Nothing was sent; try again.` });
+  if (source.error) return unreadable("this agent's", source.error);
+  if (target.error) return unreadable(`this host's ${OPENCODE_LABEL}`, target.error);
+  return { sourceModes: source.modes ?? [], targetModes: target.modes ?? [] };
 }
 
 /** The agent, or null once Paseo says it doesn't know it. A lookup that fails throws. */
