@@ -569,7 +569,11 @@ function AccountCard({
         ) : (
           <Text style={text.small}>{account.usage?.error ?? summary ?? "Checking usage…"}</Text>
         )}
-        {account.pace ? <PaceSection theme={theme} pace={account.pace} /> : null}
+        {account.pace ? (
+          <View style={{ borderTopWidth: 1, borderTopColor: theme.colors.border, paddingTop: 10 }}>
+            <PaceSection theme={theme} pace={account.pace} />
+          </View>
+        ) : null}
         {!signedOut && credits ? <Text style={text.small}>{formatCredits(credits)}</Text> : null}
         {!signedOut && extraUsage ? <Text style={text.small}>{extraUsage}</Text> : null}
         {!signedOut && windows.length > 0 && account.usage?.error ? <Text style={text.small}>{account.usage.error}</Text> : null}

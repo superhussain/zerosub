@@ -4,7 +4,11 @@ import type { PaceView } from "../shared/model";
 // The copy is pure text, but it lives beside react-native views a Node test can't load.
 vi.mock("react-native", () => ({ Text: () => null, View: () => null }));
 
-import { describePace } from "./pace";
+import { describePace, type PaceCopy } from "./pace";
+
+/** The copy as one string, plus which runs are bold. */
+const plain = (parts: PaceCopy["fiveHour"] | null) => parts?.map((part) => part.text).join("") ?? null;
+const bold = (parts: PaceCopy["fiveHour"] | null) => parts?.filter((part) => part.bold).map((part) => part.text) ?? null;
 
 const main: PaceView = {
   fiveHourUsed: 30,
@@ -29,21 +33,27 @@ const work: PaceView = {
 
 describe("describing pace", () => {
   it("says Main is held back", () => {
-    expect(describePace(main)).toEqual({
-      fiveHour: "30% now · 90% in an hour",
+    const copy = describePace(main);
+    expect(plain(copy.fiveHour)).toBe("30% now · 90% projected");
+    expect(bold(copy.fiveHour)).toEqual(["30%"]);
+    expect(plain(copy.weekly)).toBe("25% used · 50% elapsed");
+    expect(bold(copy.weekly)).toEqual(["25%", "50%"]);
+    expect(copy).toMatchObject({
       pending: null,
-      weekly: "25% used · 50% of the week gone · behind pace",
       standing: "behind",
+      standingLabel: "behind pace",
       held:
         "Pacing holds it back: new agents start on other accounts first while it is projected at or past 80% of its 5-hour limit.",
     });
   });
 
   it("counts the agents pending on Work", () => {
-    expect(describePace(work)).toMatchObject({
-      fiveHour: "45% now · 76% in an hour",
+    const copy = describePace(work);
+    expect(plain(copy.fiveHour)).toBe("45% now · 76% projected");
+    expect(plain(copy.weekly)).toBe("50% used · 86% elapsed");
+    expect(copy).toMatchObject({
       pending: "Counts 2 new agents the reading doesn't show yet (+20% 5-hour, +4% weekly)",
-      weekly: "50% used · 86% of the week gone · behind pace",
+      standingLabel: "behind pace",
       held: null,
     });
   });
@@ -56,16 +66,15 @@ describe("describing pace", () => {
 
   it("says so when there is no reading", () => {
     const empty: PaceView = { ...main, fiveHourUsed: null, fiveHourProjected: 50, weeklyUsed: null, weekElapsed: null, gated: false };
-    expect(describePace(empty)).toMatchObject({
-      fiveHour: "No 5-hour reading yet. Pacing counts it as 50%.",
-      weekly: null,
-      standing: null,
-    });
+    const copy = describePace(empty);
+    expect(plain(copy.fiveHour)).toBe("No 5-hour reading yet. Pacing counts it as 50%.");
+    expect(copy).toMatchObject({ weekly: null, standing: null, standingLabel: null });
   });
 
   it("calls weekly use ahead of pace when it is past the week gone", () => {
     const ahead = describePace({ ...main, weeklyUsed: 60, weekElapsed: 40 });
     expect(ahead.standing).toBe("ahead");
-    expect(ahead.weekly).toMatch(/ahead of pace$/);
+    expect(ahead.standingLabel).toBe("ahead of pace");
+    expect(plain(ahead.weekly)).toBe("60% used · 40% elapsed");
   });
 });

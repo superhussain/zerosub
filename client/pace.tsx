@@ -1,19 +1,25 @@
 import type { PluginHostProps } from "@getpaseo/plugin/client";
+import type { ReactNode } from "react";
 import { Text, View } from "react-native";
 import { PACE_GATE_PERCENT, type PaceView } from "../shared/model";
-import { useText } from "./ui";
+import { Hint, useText } from "./ui";
 
 type Theme = PluginHostProps["theme"];
 
+/** A run of text; the bold ones are the numbers, as in the usage rows above. */
+export type Segment = { text: string; bold?: boolean };
+
 export interface PaceCopy {
-  fiveHour: string;
+  fiveHour: Segment[];
   pending: string | null;
-  weekly: string | null;
+  weekly: Segment[] | null;
   standing: "ahead" | "behind" | "on" | null;
+  standingLabel: string | null;
   held: string | null;
 }
 
 const r = Math.round;
+const STANDING_LABEL = { ahead: "ahead of pace", behind: "behind pace", on: "on pace" };
 
 /** The words under an account's pacing bars. */
 export function describePace(pace: PaceView): PaceCopy {
@@ -27,8 +33,8 @@ export function describePace(pace: PaceView): PaceCopy {
   return {
     fiveHour:
       fiveHourUsed === null
-        ? `No 5-hour reading yet. Pacing counts it as ${r(fiveHourProjected)}%.`
-        : `${r(fiveHourUsed)}% now · ${r(fiveHourProjected)}% in an hour`,
+        ? [{ text: `No 5-hour reading yet. Pacing counts it as ${r(fiveHourProjected)}%.` }]
+        : [{ text: `${r(fiveHourUsed)}%`, bold: true }, { text: ` now · ${r(fiveHourProjected)}% projected` }],
     pending:
       pending === 0
         ? null
@@ -37,13 +43,37 @@ export function describePace(pace: PaceView): PaceCopy {
       weeklyUsed === null
         ? null
         : weekElapsed === null
-          ? `${r(weeklyUsed)}% used`
-          : `${r(weeklyUsed)}% used · ${r(weekElapsed)}% of the week gone · ${standing === "ahead" ? "ahead of" : standing === "behind" ? "behind" : "on"} pace`,
+          ? [{ text: `${r(weeklyUsed)}%`, bold: true }, { text: " used" }]
+          : [
+              { text: `${r(weeklyUsed)}%`, bold: true },
+              { text: " used · " },
+              { text: `${r(weekElapsed)}%`, bold: true },
+              { text: " elapsed" },
+            ],
     standing,
+    standingLabel: standing && STANDING_LABEL[standing],
     held: gated
       ? `Pacing holds it back: new agents start on other accounts first while it is projected at or past ${PACE_GATE_PERCENT}% of its 5-hour limit.`
       : null,
   };
+}
+
+/** Segments as one Text, bold runs in the foreground color over a muted base, like `UsageBar`. */
+function Segments({ theme, parts }: { theme: Theme; parts: Segment[] }) {
+  const colors = theme.colors;
+  return (
+    <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>
+      {parts.map((part, index) =>
+        part.bold ? (
+          <Text key={index} style={{ color: colors.foreground, fontWeight: "600" }}>
+            {part.text}
+          </Text>
+        ) : (
+          part.text
+        ),
+      )}
+    </Text>
+  );
 }
 
 /** A thin bar of stacked fills, widest first, with an optional tick. */
@@ -54,6 +84,7 @@ function PaceBar({
   tick,
   label,
   now,
+  hint,
 }: {
   theme: Theme;
   color: string;
@@ -61,9 +92,10 @@ function PaceBar({
   tick: number | null;
   label: string;
   now: number;
+  hint?: string;
 }) {
   const colors = theme.colors;
-  return (
+  const bar = (
     <View style={{ height: 12, position: "relative" }}>
       <View
         accessibilityRole="progressbar"
@@ -83,16 +115,17 @@ function PaceBar({
       )}
     </View>
   );
+  return hint ? (
+    <Hint theme={theme} text={hint}>
+      {bar}
+    </Hint>
+  ) : (
+    bar
+  );
 }
 
-function PaceRow({ theme, label, value }: { theme: Theme; label: string; value: string }) {
-  const colors = theme.colors;
-  return (
-    <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", columnGap: 8 }}>
-      <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>{label}</Text>
-      <Text style={{ color: colors.foreground, fontSize: 12 }}>{value}</Text>
-    </View>
-  );
+function PaceRow({ theme, left, right }: { theme: Theme; left: ReactNode; right: ReactNode }) {
+  return <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", columnGap: 8 }}>{left}{right}</View>;
 }
 
 /** How pacing reads an account: the 5-hour projection against the gate, the weekly use, and pending agents. */
@@ -104,7 +137,7 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
   return (
     <View style={{ gap: 6 }}>
       <Text style={[text.small, { fontWeight: "600" }]}>Pacing</Text>
-      <PaceRow theme={theme} label={`5-hour an hour ahead · gate ${PACE_GATE_PERCENT}%`} value={copy.fiveHour} />
+      <PaceRow theme={theme} left={<Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>5h hourly projection</Text>} right={<Segments theme={theme} parts={copy.fiveHour} />} />
       <PaceBar
         theme={theme}
         color={pace.gated ? colors.statusWarning : colors.statusSuccess}
@@ -114,13 +147,22 @@ export function PaceSection({ theme, pace }: { theme: Theme; pace: PaceView }) {
           [fiveHourUsed ?? 0, 1],
         ]}
         tick={PACE_GATE_PERCENT}
-        label="5-hour use projected an hour ahead"
+        label={`5-hour use projected an hour ahead, gate ${PACE_GATE_PERCENT}%`}
+        hint={`New agents skip an account projected at ${PACE_GATE_PERCENT}% or more of its 5-hour limit`}
         now={fiveHourProjected}
       />
       {copy.pending ? <Text style={text.small}>{copy.pending}</Text> : null}
       {copy.weekly && weeklyUsed !== null ? (
         <>
-          <PaceRow theme={theme} label="Weekly pace" value={copy.weekly} />
+          <PaceRow
+            theme={theme}
+            left={
+              <Text style={{ color: colors.foregroundMuted, fontSize: 12, flexShrink: 1 }}>
+                Weekly pace · <Segments theme={theme} parts={copy.weekly} />
+              </Text>
+            }
+            right={copy.standingLabel ? <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>{copy.standingLabel}</Text> : null}
+          />
           <PaceBar
             theme={theme}
             color={copy.standing === "ahead" ? colors.statusWarning : colors.statusSuccess}
