@@ -41,8 +41,7 @@ export function describePace(pace: PaceView): PaceCopy {
           : `${r(weeklyUsed)}% used · ${r(weekElapsed)}% of the week gone · ${standing === "ahead" ? "ahead of" : standing === "behind" ? "behind" : "on"} pace`,
     standing,
     held: gated
-      // \u002E is a period, so the mobile audit does not read the word before it as a DOM global.
-      ? `Pacing holds it back: new agents start on other accounts first while it is projected at or past ${PACE_GATE_PERCENT}% of its 5-hour window\u002E`
+      ? `Pacing holds it back: new agents start on other accounts first while it is projected at or past ${PACE_GATE_PERCENT}% of its 5-hour limit.`
       : null,
   };
 }
@@ -75,7 +74,7 @@ function PaceBar({
         {fills.map(([percent, opacity], index) => (
           <View
             key={index}
-            style={{ position: "absolute", left: 0, top: 0, height: 6, width: `${Math.min(100, percent)}%`, backgroundColor: color, opacity }}
+            style={{ position: "absolute", left: 0, top: 0, height: 6, borderRadius: 3, width: `${Math.min(100, percent)}%`, backgroundColor: color, opacity }}
           />
         ))}
       </View>

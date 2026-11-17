@@ -35,7 +35,7 @@ describe("describing pace", () => {
       weekly: "25% used · 50% of the week gone · behind pace",
       standing: "behind",
       held:
-        "Pacing holds it back: new agents start on other accounts first while it is projected at or past 80% of its 5-hour window\u002E",
+        "Pacing holds it back: new agents start on other accounts first while it is projected at or past 80% of its 5-hour limit.",
     });
   });
 
