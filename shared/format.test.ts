@@ -227,6 +227,10 @@ describe("paceLine", () => {
     expect(paceLine(pace, "Next")).toBe("Next · 41→54% hr · 30% wk behind");
     expect(paceLine({ ...pace, fiveHourUsed: 8, fiveHourProjected: 9, weeklyUsed: 77 })).toBe("8→9% hr · 77% wk ahead");
   });
+  it("leaves out the hourly part when now and projected both round to 0%", () => {
+    expect(paceLine({ ...pace, fiveHourUsed: 0.2, fiveHourProjected: 0.4, weeklyUsed: 31 }, "Next")).toBe("Next · 31% wk behind");
+    expect(paceLine({ ...pace, fiveHourUsed: 0, fiveHourProjected: 3 })).toBe("0→3% hr · 30% wk behind");
+  });
   it("leaves out the hourly part without a 5-hour reading, and the standing without a week", () => {
     expect(paceLine({ ...pace, fiveHourUsed: null, weekElapsed: null })).toBe("30% wk");
   });

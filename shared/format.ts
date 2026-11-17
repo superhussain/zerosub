@@ -253,7 +253,7 @@ export const PACE_LINE_MAX = 45;
 /** One short line of pacing for a menu row: "Next · 41→54% hr · 30% wk behind". `mark` leads when it applies. */
 export function paceLine(pace: PaceView, mark?: string): string {
   const r = Math.round;
-  const hourly = pace.fiveHourUsed === null ? null : `${r(pace.fiveHourUsed)}→${r(pace.fiveHourProjected)}% hr`;
+  const hourly = pace.fiveHourUsed === null || (r(pace.fiveHourUsed) === 0 && r(pace.fiveHourProjected) === 0) ? null : `${r(pace.fiveHourUsed)}→${r(pace.fiveHourProjected)}% hr`;
   let weekly: string | null = null;
   if (pace.weeklyUsed !== null) {
     const standing =
