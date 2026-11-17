@@ -83,14 +83,11 @@ export function accountChoices(state: StateView, provider: string | null, chosen
 }
 
 function detail(account: AccountView, next: boolean, lead?: string): string | undefined {
-  const pace = account.pace;
-  // With a pace and a lead, the lead is the one-time pick: it wins over pacing's verdict.
-  if (pace && lead) return lead;
+  // A pace and a lead mean a one-time pick: the pick wins over pacing's verdict.
+  if (account.pace) return lead ?? paceVerdict(account.pace, next);
   const parts = lead ? [lead] : [];
   if (account.status === "limited") parts.push("Limit reached");
-  else if (pace) {
-    return paceVerdict(pace, next);
-  } else {
+  else {
     // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
     const peak = account.usage ? accountPeak(account.usage.windows) : null;
     if (peak) parts.push(`${formatPercent(peak.usedPercent)} used`);
