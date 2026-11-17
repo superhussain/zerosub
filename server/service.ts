@@ -5263,7 +5263,7 @@ async function readOpenCodeModes(
   sourceProvider: string,
 ): Promise<{ sourceModes: ModeInfo[]; targetModes: ModeInfo[] } | { unreadable: string }> {
   const [source, target] = await Promise.all([paseo.providers.listModes(sourceProvider), paseo.providers.listModes(OPENCODE_PROVIDER)]);
-  const unreadable = (whose: string, error: string) => ({ unreadable: `Couldn't read ${whose} modes: ${error}. Nothing was sent; try again.` });
+  const unreadable = (whose: string, error: string) => ({ unreadable: `Couldn't read ${whose} modes: ${error.replace(/\.$/, "")}. Nothing was sent; try again.` });
   if (source.error) return unreadable("this agent's", source.error);
   if (target.error) return unreadable(`this host's ${OPENCODE_LABEL}`, target.error);
   return { sourceModes: source.modes ?? [], targetModes: target.modes ?? [] };
