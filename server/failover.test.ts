@@ -1443,6 +1443,39 @@ describe("forking to the other provider", () => {
         expect((await setup.store.read()).opencodeForks[AGENT]).toEqual(reservedCreation());
       });
 
+      it("refuses delivery to a reserved fork it already created", async () => {
+        const setup = await setUp();
+        await setup.store.update((draft) => {
+          draft.opencodeForks[AGENT] = reservedCreation();
+        });
+        setup.byId.set(RESERVED.targetId, opencodeAgent(RESERVED.targetId));
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(UNREADABLE);
+        expect(setup.created).toHaveLength(0);
+        expect(setup.sends).toHaveLength(0);
+        expect((await setup.store.read()).opencodeForks[AGENT]).toEqual(reservedCreation());
+      });
+
+      it("refuses after a fresh create, then delivers once on retry", async () => {
+        const options: { prefs: Record<string, unknown>; modesError?: string } = { prefs: PREFS };
+        const setup = await setUpFork("bypassPermissions", [], {}, [], options);
+        // Calls 1-2 are the create's own; call 3 starts the check before the reserved send.
+        let reads = 0;
+        setup.hooks.onModes = () => {
+          if (++reads === 3) options.modesError = "daemon unreachable";
+        };
+        await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(UNREADABLE);
+        expect(setup.created).toHaveLength(1);
+        expect(setup.sends).toHaveLength(0);
+        const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+        expect(pending.stage).toBe("creating");
+        const { messageId } = pending;
+        delete options.modesError;
+        delete setup.hooks.onModes;
+        await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+        expect(setup.created).toHaveLength(1);
+        expect(setup.sends.map((send) => send.messageId)).toEqual([messageId]);
+      });
+
       it("names the source's modes, without doubling a period the error ends with", async () => {
         const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, sourceModesError: "agent gone." });
         await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(
