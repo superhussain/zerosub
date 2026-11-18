@@ -9,6 +9,7 @@ import { preferences } from "./shared/preferences";
 import {
   addApiAccount,
   addAzureAccount,
+  addBedrockAccount,
   cancelLogin,
   clearAccountLimit,
   getState,
@@ -29,6 +30,8 @@ import {
   submitLoginCode,
   updateApiAccount,
   updateAzureAccount,
+  updateBedrockAccount,
+  detectBedrockRegion,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
@@ -66,6 +69,17 @@ export default function contribute(server: PluginServerContext) {
     }
   });
 
+  // A new Claude agent's mode is carried to its first session, where Paseo can't say it yet. Creating
+  // the agent never fails for this: on any error the request goes on unchanged.
+  server.before("agent.create", async ({ request }, context) => {
+    try {
+      return await service.onAgentCreate(request, context);
+    } catch (error) {
+      console.error("[ZeroSub] could not note a new agent's mode", describe(error));
+      return undefined;
+    }
+  });
+
   server.on("agent.turn_started", (event, context) => {
     void service.onTurnStarted(event.agent, context).catch(() => undefined);
   });
@@ -75,6 +89,10 @@ export default function contribute(server: PluginServerContext) {
     void service.onTurnEnded(event, context).catch((error: unknown) => {
       console.error(`[ZeroSub] failover for ${event.agent.id} failed`, describe(error));
     });
+  });
+  // A new agent is in the next state the app reads, so its composer has its account at once.
+  server.on("agent.created", () => {
+    service.onAgentCreated();
   });
   server.on("agent.archived", (event) => {
     void service.onAgentArchived(event.agent.id).catch(() => undefined);
@@ -119,6 +137,9 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(addAzureAccount, (input) => service.addAzureAccount(input));
   server.handle(updateAzureAccount, async ({ accountId, ...input }) => ({ ok: true as const, ...(await service.updateAzureAccount(accountId, input)) }));
+  server.handle(addBedrockAccount, (input) => service.addBedrockAccount(input));
+  server.handle(updateBedrockAccount, async ({ accountId, ...input }) => ({ ok: true as const, ...(await service.updateBedrockAccount(accountId, input)) }));
+  server.handle(detectBedrockRegion, () => service.detectBedrockRegion());
   server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
   server.handle(setClaudeHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setClaudeHomesDir(dir)) }));
   server.handle(importAccount, async ({ path }) => ({ accountId: await service.importAccount(path) }));

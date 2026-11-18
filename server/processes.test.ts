@@ -43,7 +43,8 @@ describe("which homes a process runs on", () => {
     ).toBe("a process (PID 4100), puma (PID 4242), node (PID 4250) and 2 more");
   });
 
-  it.runIf(process.platform === "darwin" || process.platform === "linux")("sees a running process started on a home", async () => {
+  // ZeroSub: reads every process's environment through the real `ps`, so only when asked for.
+  it.runIf(Boolean(process.env.ZEROSUB_REAL_PS) && (process.platform === "darwin" || process.platform === "linux"))("sees a running process started on a home", async () => {
     const root = await mkdtemp(join(tmpdir(), "zerosub-processes-"));
     const home = join(root, "pi-work");
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {

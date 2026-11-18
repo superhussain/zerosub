@@ -453,7 +453,7 @@ describe("pacing on account cards", () => {
   const spread = async (hello: Partial<StoredAccount> = {}, balanceNewAgents = true) => {
     const { service, paseo, open } = setUp(
       await storeWith({
-        accounts: [stored(MAIN, "marketing", "main"), stored(HELLO, "hello", "managed", hello)] as never,
+        accounts: [stored(MAIN, "work", "main"), stored(HELLO, "personal", "managed", hello)] as never,
         defaults: { claude: MAIN, codex: null, pi: null },
       }),
       { usage: (home) => reading(home === null ? 70 : 10) },

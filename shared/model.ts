@@ -128,8 +128,9 @@ export const AuthKindSchema = z.enum([
   "subscription",
   /**
    * An API key or token (a Claude account's, optionally against another base URL; an added Pi
-   * account's Anthropic key; an Azure OpenAI account's), billed per use, so never picked
-   * automatically. An Azure OpenAI account can be, as a last resort, once `paidApiFallback` is on.
+   * account's Anthropic key; an Azure OpenAI or AWS Bedrock account's), billed per use, so never
+   * picked automatically. An Azure OpenAI or Bedrock account can be, as a last resort, once
+   * `paidApiFallback` is on.
    */
   "api",
 ]);
@@ -142,12 +143,22 @@ export type AuthKind = z.infer<typeof AuthKindSchema>;
 export const ApiProviderSchema = z.enum([
   /** An Azure OpenAI resource, under ChatGPT (Codex). */
   "azure",
+  /** Amazon Bedrock with AWS credentials, under Claude. */
+  "bedrock",
 ]);
 export type ApiProvider = z.infer<typeof ApiProviderSchema>;
 
 /** An Azure OpenAI account: a ChatGPT (Codex) account added as one, marked `provider: "azure"`. */
 export function isAzureAccount(account: { family: Family; provider?: ApiProvider }): boolean {
   return account.family === "codex" && account.provider === "azure";
+}
+
+/**
+ * An AWS Bedrock account: a Claude account added as one, marked `provider: "bedrock"`. A Claude
+ * account on an API key or token without the marker (#65's) is never one.
+ */
+export function isBedrockAccount(account: { family: Family; provider?: ApiProvider }): boolean {
+  return account.family === "claude" && account.provider === "bedrock";
 }
 
 export const ApiKeyKindSchema = z.enum([
@@ -279,6 +290,48 @@ export const AzureSummarySchema = z.object({
 });
 export type AzureSummary = z.infer<typeof AzureSummarySchema>;
 
+/** Where an AWS Bedrock account's AWS credentials come from. */
+export const BedrockSourceSchema = z.enum([
+  /** The host's own: the AWS default chain (environment, ~/.aws, an instance or task role). Nothing is stored. */
+  "host",
+  /** A named profile in the host's ~/.aws config. Only its name is stored. */
+  "profile",
+  /** An access key (secret, optional session token) kept in the account's home. */
+  "keys",
+]);
+export type BedrockSource = z.infer<typeof BedrockSourceSchema>;
+
+/** Model overrides for a Bedrock account (model or inference-profile IDs); empty keeps Claude Code's own. */
+export const BedrockModelsSchema = z.object({
+  /** `ANTHROPIC_MODEL`. */
+  model: z.string().default(""),
+  /** `ANTHROPIC_DEFAULT_OPUS_MODEL`. */
+  opus: z.string().default(""),
+  /** `ANTHROPIC_DEFAULT_SONNET_MODEL`. */
+  sonnet: z.string().default(""),
+  /** `ANTHROPIC_DEFAULT_HAIKU_MODEL`. */
+  haiku: z.string().default(""),
+});
+export type BedrockModels = z.infer<typeof BedrockModelsSchema>;
+
+/** An AWS Bedrock account (a Claude account on AWS) as the app sees it. Secrets never leave the host. */
+export const BedrockSummarySchema = z.object({
+  region: z.string(),
+  source: BedrockSourceSchema,
+  /** The profile's name, for `profile`. */
+  profile: z.string().nullable(),
+  /** The access key ID's last four characters, for `keys`. */
+  keyHint: z.string().nullable(),
+  /** Whether a session token is kept with the access key. */
+  sessionToken: z.boolean().default(false),
+  models: BedrockModelsSchema,
+  /** USD per million tokens, by model as Claude Code names it. */
+  prices: z.record(z.string(), ApiPriceSchema).default({}),
+  /** This month's tokens; null before the first counted turn. */
+  usage: ApiMonthSchema.nullable().default(null),
+});
+export type BedrockSummary = z.infer<typeof BedrockSummarySchema>;
+
 /** The address an account's requests come from, as the provider's edge sees it. */
 export const EgressSchema = z.object({
   /** From the last check that worked. */
@@ -367,6 +420,10 @@ export const AccountViewSchema = z.object({
   externalHome: z.boolean().default(false),
   /** Set for an Azure OpenAI account (a ChatGPT/Codex account on an API key); null for any other. */
   azure: AzureSummarySchema.nullable().default(null),
+  /** Set for an AWS Bedrock account (a Claude account on AWS); null for any other. */
+  bedrock: BedrockSummarySchema.nullable().default(null),
+  /** What the provider said when it last refused an Azure or Bedrock account, while it's signed out for it. */
+  apiError: z.string().nullable().default(null),
   /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
   /** How pacing reads this account; null unless spreading is on and it's one of two or more accounts that can stand in. */
@@ -398,6 +455,12 @@ export const AgentRouteSchema = z.object({
   movable: z.boolean(),
   /** The agent started on this account because its weekly reset was near, and is still on it. */
   selectionReason: z.literal("weekly_reset").optional(),
+  /**
+   * Whether the Account control can show in this agent's composer: its metadata holds its ID (see
+   * `AGENT_METADATA_KEY`), or is being given it. False for an agent from before the control that
+   * hasn't opened a session since, and for one that couldn't be given it: the account button stands in.
+   */
+  inComposer: z.boolean().optional(),
 });
 export type AgentRoute = z.infer<typeof AgentRouteSchema>;
 
@@ -445,6 +508,13 @@ export type LoginView = z.infer<typeof LoginViewSchema>;
  */
 export const ACCOUNT_METADATA_KEY = "zerosub.account";
 
+/**
+ * Agent metadata holding the agent's own ID. Paseo doesn't tell a composer item which agent's
+ * composer it sits in, only that agent's metadata, so the daemon writes the ID there and the
+ * Account control reads it back to find the agent's account.
+ */
+export const AGENT_METADATA_KEY = "zerosub.agent";
+
 export const StateViewSchema = z.object({
   accounts: z.array(AccountViewSchema),
   agents: z.array(AgentRouteSchema),
@@ -477,11 +547,12 @@ export const StateViewSchema = z.object({
   pacedNext: z.record(z.string(), z.string()).optional(),
   /**
    * This host's Paseo keeps agent metadata (0.16 and later), which carries the Account control's
-   * choice. Without it the control isn't shown: an app from 0.16 would take the choice and then fail
+   * choice for a new agent and tells it which running agent it belongs to. Without it the control
+   * isn't shown, and the account button stays: an app from 0.16 would take the choice and then fail
    * to create the agent on an older host.
    */
   agentMetadata: z.boolean().optional(),
-  /** Paid API accounts (Azure OpenAI) may take work over by themselves once every subscription is out. */
+  /** Paid API accounts (Azure OpenAI, AWS Bedrock) may take work over by themselves once every subscription is out. */
   paidApiFallback: z.boolean().optional(),
   warnings: z.array(z.string()),
 });
