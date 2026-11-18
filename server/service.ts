@@ -2325,7 +2325,7 @@ export class Service {
     forkId: string,
     mark?: TimelineMark,
     config?: OpenCodeCreateConfig,
-  ): Promise<{ original: Agent; fork: Agent } | { refused: string; unreadable?: true }> {
+  ): Promise<{ original: Agent; fork: Agent } | { refused: string; unreadable?: true; modesUnreadable?: true }> {
     if (config) await waitForCreated(paseo, forkId);
     if (mark) {
       const since = await this.sourceSince(paseo, agentId, mark);
@@ -2336,7 +2336,7 @@ export class Service {
     const source = await this.openCodeSource(paseo, agentId, config);
     if (!source) return { refused: MOVED_REFUSAL };
     const read = await readOpenCodeModes(paseo, source.original.provider);
-    if ("unreadable" in read) return { refused: read.unreadable };
+    if ("unreadable" in read) return { refused: read.unreadable, modesUnreadable: true };
     const { sourceModes, targetModes } = read;
     // The parent is resolved again after the catalog reads, then the snapshots come last.
     const parentId = await this.continuations.parentFor(paseo, agentId);
@@ -2650,7 +2650,10 @@ export class Service {
     return this.deliverReservedOpenCode(paseo, agentId, fork);
   }
 
-  /** Sends the reserved initial handoff to a created promptless fork, under its reserved message ID. */
+  /**
+   * Sends the reserved initial handoff to a created promptless fork, under its reserved message ID.
+   * An unreadable mode catalog refuses with nothing sent and the reservation kept for a retry.
+   */
   private async deliverReservedOpenCode(paseo: PaseoApi, agentId: string, fork: Agent): Promise<ForkOutcome> {
     const pending = (await this.store.read()).opencodeForks[agentId]?.pending;
     if (!pending || pending.stage !== "creating") {
@@ -2678,7 +2681,7 @@ export class Service {
     const newer = meaningful(delta.entries.filter((entry) => entry.seqEnd > pending.seen.seq)).length > 0;
     const prompt = newer ? compose(delta.entries) : reserved;
     const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark, config);
-    if ("refused" in checked) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    if ("refused" in checked) return checked.modesUnreadable ? { skipped: checked.refused } : this.openCodeUncertain(fork.id, fork.title, pending.messageId);
     await this.store.update((draft) => {
       const record = draft.opencodeForks[agentId];
       if (record?.pending?.messageId === pending.messageId) {
