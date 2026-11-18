@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
+import { isAzureAccount, isBedrockAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -47,8 +47,33 @@ export function isLimited(account: StoredAccount, now: number): boolean {
   return Number.isFinite(until) && until > now;
 }
 
-export function isUsable(account: StoredAccount, now: number): boolean {
-  return account.signedIn && !account.disabled && !isLimited(account, now);
+function tokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length > 0);
+}
+
+/**
+ * Whether a model limit's scope ("fable") covers a model id ("claude-fable-5-2"): every word of the
+ * scope is a word of the model. An unknown or default model is covered by nothing, so it's never
+ * kept off an account for a limit of one model.
+ */
+export function scopeCoversModel(scope: string, model: string | null | undefined): boolean {
+  if (!model || model.toLowerCase() === "default") return false;
+  const wanted = tokens(scope);
+  if (wanted.length === 0) return false;
+  const have = new Set(tokens(model));
+  return wanted.every((token) => have.has(token));
+}
+
+/** The account is at a limit of its own, or at the limit of a model window that covers `model`. */
+export function isLimitedFor(account: StoredAccount, now: number, model?: string | null): boolean {
+  if (isLimited(account, now)) return true;
+  return Object.entries(account.modelLimits ?? {}).some(
+    ([scope, limit]) => Date.parse(limit.until) > now && scopeCoversModel(scope, model),
+  );
+}
+
+export function isUsable(account: StoredAccount, now: number, model?: string | null): boolean {
+  return account.signedIn && !account.disabled && !isLimitedFor(account, now, model);
 }
 
 /**
@@ -56,18 +81,18 @@ export function isUsable(account: StoredAccount, now: number): boolean {
  * account is ever picked that way: an added one is an API key, and Pi's own login may be one too,
  * so moving work onto either would move it onto a bill nobody chose.
  */
-export function canStandIn(account: StoredAccount, now: number): boolean {
-  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now);
+export function canStandIn(account: StoredAccount, now: number, model?: string | null): boolean {
+  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now, model);
 }
 
 /**
- * A paid API account that stands in for a subscription (an Azure OpenAI account), marked so when it
- * was added. Like any API account it's billed per use, so routing never puts agents on it by itself
+ * A paid API account that stands in for a subscription (an Azure OpenAI account under ChatGPT, an AWS
+ * Bedrock account under Claude), marked so when it was added. Like any API account it's billed per use, so routing never puts agents on it by itself
  * unless `paidApiFallback` is on, and then only as a last resort: once no subscription account of the
  * family can stand in (see `mostAvailable`). It can always be picked by hand, or made the default.
  */
 export function isLastResort(account: StoredAccount): boolean {
-  return isAzureAccount(account);
+  return isAzureAccount(account) || isBedrockAccount(account);
 }
 
 /**
@@ -205,12 +230,13 @@ export function mostAvailable(
   exclude: ReadonlySet<string> = new Set(),
   paidFallback = false,
   pacing?: Pacing,
+  model?: string | null,
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
-  const subscriptions = open.filter((account) => canStandIn(account, now));
+  const subscriptions = open.filter((account) => canStandIn(account, now, model));
   const candidates =
-    subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now));
+    subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now, model));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
     const score = headroomScore(usage, now);
@@ -324,6 +350,11 @@ export interface RouteInput {
   allowNextPick?: boolean;
   /** Agents recently placed on an account; only read while `balanceNewAgents` is on. */
   pendingOf?(accountId: string): number;
+  /**
+   * The model the agent runs, when known. A limit of that model's own window keeps the agent off the
+   * account; without it only limits of the whole account count.
+   */
+  model?: string | null;
 }
 
 export interface RouteDecision {
@@ -362,11 +393,21 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const bound = findAccount(state, binding?.accountId);
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
+  // A paid stand-in (Bedrock) that ZeroSub bound the agent to by itself (a ChatGPT chat continued on
+  // Claude while every subscription was out) only holds it until a subscription account can take it:
+  // one with room, or, with `autoRedeem`, a limited one with a banked reset to spend. Then the agent
+  // routes as an unbound one would, and alignment takes it off the bill. One the user put there stays.
+  if (
+    account && binding?.source === "auto" && input.portable && isLastResort(account) &&
+    (accounts.some((other) => canStandIn(other, input.now, input.model)) || (input.autoRedeem && withBankedReset(state, input.family, input.usageOf, input.now)))
+  ) {
+    account = undefined;
+  }
 
   // The account named for this very agent outranks the pick, which waits for an agent that names
   // none. One that can't take the agent is passed over, and the agent routes as usual.
   const takes = (candidate: StoredAccount | undefined): candidate is StoredAccount =>
-    candidate?.family === input.family && candidate.signedIn && !candidate.disabled && !(input.autoSwitch && isLimited(candidate, input.now));
+    candidate?.family === input.family && candidate.signedIn && !candidate.disabled && !(input.autoSwitch && isLimitedFor(candidate, input.now, input.model));
   const requested = !account && fresh ? findAccount(state, input.requested) : undefined;
   if (takes(requested)) {
     account = requested;
@@ -386,12 +427,16 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback, pacing);
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback, pacing, input.model);
     // A banked reset is free, so it goes before a paid stand-in, as it does when a turn hits a limit.
     if (account && isLastResort(account) && input.autoRedeem) {
       account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
     }
-    if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    // An agent that can move isn't bound to a paid stand-in (Bedrock): it's only there until a
+    // subscription account has room. A thread that can't move (Azure's) is, as it lives there.
+    if (account && !(input.portable && isLastResort(account))) {
+      bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    }
   }
   if (!account) {
     // An existing Codex thread ZeroSub never routed (imported from the user's own CLI, or started
@@ -405,17 +450,18 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (!account) return null;
 
   let skipped: RouteDecision["skipped"] = null;
-  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
+  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimitedFor(account, input.now, input.model) ? "limited" : null;
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
     // A paid stand-in is only kept while no subscription account could take over from it.
     const keeps = (stand: StoredAccount) =>
-      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
+      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now, input.model));
+    const stays = (stand: StoredAccount) => canStandIn(stand, input.now, input.model) || (isLastResort(stand) && isUsable(stand, input.now, input.model));
     let alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keeps(staying)
+      staying && staying.family === input.family && staying.id !== account.id && stays(staying) && keeps(staying)
         ? staying
-        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback, pacing);
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback, pacing, input.model);
     // Before a paid stand-in, a limited subscription with a usable banked reset: the account itself
     // (it stays, and its first turn spends the reset) or another one.
     if (alternative && isLastResort(alternative) && input.autoRedeem) {
@@ -426,11 +472,12 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
       skipped = { account, why };
       account = alternative;
       // A thread that can't move lives where it starts. Otherwise a disabled account keeps its
-      // agents' bindings, so they return when it's enabled again; a limit re-pins them.
+      // agents' bindings, so they return when it's enabled again; a limit re-pins them, except onto
+      // a paid stand-in (Bedrock), which they leave again once a subscription account has room.
       bind =
         !input.portable
           ? { accountId: alternative.id, source: "thread", at }
-          : why === "disabled"
+          : why === "disabled" || isLastResort(alternative)
             ? null
             : { accountId: alternative.id, source: "auto", at };
     }

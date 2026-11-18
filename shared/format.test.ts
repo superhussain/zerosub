@@ -99,6 +99,8 @@ describe("account presentation", () => {
     moving: null,
     pace: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
   };
 
   it("summarises the busiest window", () => {
